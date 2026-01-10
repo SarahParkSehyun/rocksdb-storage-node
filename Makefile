@@ -238,7 +238,7 @@ am__v_AR_ = $(am__v_AR_$(AM_DEFAULT_VERBOSITY))
 am__v_AR_0 = @echo "  AR      " $@;
 am__v_AR_1 =
 
-AM_LINK = $(AM_V_CCLD)$(CXX) -L. $(patsubst lib%.a, -l%, $(patsubst lib%.$(PLATFORM_SHARED_EXT), -l%, $^)) $(EXEC_LDFLAGS) -o $@ $(LDFLAGS) $(COVERAGEFLAGS)
+AM_LINK = $(AM_V_CCLD)$(CXX) -L. $(filter-out lib%.a lib%.$(PLATFORM_SHARED_EXT), $^) $(patsubst lib%.a, -l%, $(patsubst lib%.$(PLATFORM_SHARED_EXT), -l%, $(filter lib%.a lib%.$(PLATFORM_SHARED_EXT), $^))) $(EXEC_LDFLAGS) -o $@ $(LDFLAGS) $(COVERAGEFLAGS)
 AM_SHARE = $(AM_V_CCLD) $(CXX) $(PLATFORM_SHARED_LDFLAGS)$@ -L. $(patsubst lib%.$(PLATFORM_SHARED_EXT), -l%, $^) $(EXEC_LDFLAGS) $(LDFLAGS) -o $@
 
 ROCKSDB_PLUGIN_MKS = $(foreach plugin, $(ROCKSDB_PLUGINS), plugin/$(plugin)/*.mk)
@@ -1289,6 +1289,60 @@ db_sanity_test: $(OBJ_DIR)/tools/db_sanity_test.o $(LIBRARY)
 
 db_repl_stress: $(OBJ_DIR)/tools/db_repl_stress.o $(LIBRARY)
 	$(AM_LINK)
+
+# BloomCheck service (requires gRPC and protobuf)
+# Note: Users need to install gRPC and protobuf libraries
+# Example: sudo apt-get install libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc
+
+# Find grpc_cpp_plugin
+GRPC_CPP_PLUGIN := $(shell which grpc_cpp_plugin 2>/dev/null)
+ifeq ($(GRPC_CPP_PLUGIN),)
+  # Try common installation paths
+  GRPC_CPP_PLUGIN := $(shell find /usr -name grpc_cpp_plugin 2>/dev/null | head -1)
+endif
+ifeq ($(GRPC_CPP_PLUGIN),)
+  $(warning grpc_cpp_plugin not found. Please install gRPC or set GRPC_CPP_PLUGIN variable.)
+  GRPC_CPP_PLUGIN := grpc_cpp_plugin
+endif
+
+# Generate protobuf files from .proto
+tools/bloomcheck.pb.cc tools/bloomcheck.pb.h: tools/bloomcheck.proto
+	@mkdir -p tools
+	protoc --cpp_out=tools --proto_path=tools tools/bloomcheck.proto
+
+tools/bloomcheck.grpc.pb.cc tools/bloomcheck.grpc.pb.h: tools/bloomcheck.proto
+	@mkdir -p tools
+	@if [ ! -f "$(GRPC_CPP_PLUGIN)" ] && [ "$(GRPC_CPP_PLUGIN)" = "grpc_cpp_plugin" ]; then \
+	  echo "Error: grpc_cpp_plugin not found. Please install gRPC:"; \
+	  echo "  sudo apt-get install libgrpc++-dev protobuf-compiler-grpc"; \
+	  echo "  or set GRPC_CPP_PLUGIN=/path/to/grpc_cpp_plugin"; \
+	  exit 1; \
+	fi
+	protoc --grpc_out=tools --cpp_out=tools --proto_path=tools \
+	  --plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN) tools/bloomcheck.proto
+
+bloomd: tools/bloomcheck.pb.cc tools/bloomcheck.grpc.pb.cc $(OBJ_DIR)/tools/bloomd.o
+	@if [ ! -f "$(STATIC_LIBRARY)" ] && [ ! -f "${LIBNAME}.a" ] && [ ! -f "${LIBNAME}_debug.a" ] && [ ! -f "$(SHARED_LIBRARY)" ]; then \
+	  echo "Error: RocksDB library not found. Please build it first:"; \
+	  echo "  make static_lib"; \
+	  echo "  or"; \
+	  echo "  make shared_lib"; \
+	  exit 1; \
+	fi
+	$(AM_V_CCLD)$(shell which g++-13 g++-12 g++-11 g++ 2>/dev/null | head -1) -std=c++20 $(CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) \
+	  -I. -Itools \
+	  $(OBJ_DIR)/tools/bloomd.o \
+	  tools/bloomcheck.pb.cc tools/bloomcheck.grpc.pb.cc \
+	  $(shell if [ -f "$(STATIC_LIBRARY)" ]; then echo "$(STATIC_LIBRARY)"; elif [ -f "${LIBNAME}.a" ]; then echo "${LIBNAME}.a"; elif [ -f "${LIBNAME}_debug.a" ]; then echo "${LIBNAME}_debug.a"; elif [ -f "$(SHARED_LIBRARY)" ]; then echo "-L. -lrocksdb"; else echo ""; fi) $(EXEC_LDFLAGS) \
+	  -Wl,--no-as-needed -lgrpc++ -lgrpc++_reflection -lprotobuf -lgpr -labsl_synchronization -labsl_strings -pthread -o $@ $(LDFLAGS) -Wl,--as-needed
+
+bloomcheck_client: tools/bloomcheck.pb.cc tools/bloomcheck.grpc.pb.cc $(OBJ_DIR)/tools/bloomcheck_client.o
+	$(AM_V_CCLD)$(shell which g++-13 g++-12 g++-11 g++ 2>/dev/null | head -1) -std=c++20 $(CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) \
+	  -I. -Itools \
+	  $(OBJ_DIR)/tools/bloomcheck_client.o \
+	  tools/bloomcheck.pb.cc tools/bloomcheck.grpc.pb.cc \
+	  $(EXEC_LDFLAGS) \
+	  -lgrpc++ -lprotobuf -lgpr -labsl_synchronization -labsl_strings -pthread -o $@ $(LDFLAGS)
 
 define MakeTestRule
 $(notdir $(1:%.cc=%)): $(1:%.cc=$$(OBJ_DIR)/%.o) $$(TEST_LIBRARY) $$(LIBRARY)
@@ -2472,6 +2526,23 @@ $(OBJ_DIR)/util/crc32c_ppc.o: util/crc32c_ppc.c
 $(OBJ_DIR)/util/crc32c_ppc_asm.o: util/crc32c_ppc_asm.S
 	$(AM_V_CC)$(CC) $(CFLAGS) -c $< -o $@
 endif
+# Special rule for bloomd.cc (requires C++20 and g++-11+)
+$(OBJ_DIR)/tools/bloomd.o: tools/bloomd.cc tools/bloomcheck.pb.h tools/bloomcheck.grpc.pb.h
+	$(AM_V_CC)mkdir -p $(@D) && $(shell which g++-13 g++-12 g++-11 g++ 2>/dev/null | head -1) -std=c++20 $(filter-out -std=%,$(CXXFLAGS)) -I. -Itools -c $< -o $@ $(COVERAGEFLAGS)
+
+# Special rules for C++20 files (db_bench related)
+$(OBJ_DIR)/tools/db_bench.o: tools/db_bench.cc
+	$(AM_V_CC)mkdir -p $(@D) && $(shell which g++-13 g++-12 g++-11 g++ 2>/dev/null | head -1) -std=c++20 $(filter-out -std=%,$(CXXFLAGS)) -c $< -o $@ $(COVERAGEFLAGS)
+
+$(OBJ_DIR)/tools/tool_hooks.o: tools/tool_hooks.cc
+	$(AM_V_CC)mkdir -p $(@D) && $(shell which g++-13 g++-12 g++-11 g++ 2>/dev/null | head -1) -std=c++20 $(filter-out -std=%,$(CXXFLAGS)) -c $< -o $@ $(COVERAGEFLAGS)
+
+$(OBJ_DIR)/tools/db_bench_tool.o: tools/db_bench_tool.cc
+	$(AM_V_CC)mkdir -p $(@D) && $(shell which g++-13 g++-12 g++-11 g++ 2>/dev/null | head -1) -std=c++20 $(filter-out -std=%,$(CXXFLAGS)) -c $< -o $@ $(COVERAGEFLAGS)
+
+$(OBJ_DIR)/test_util/testutil.o: test_util/testutil.cc
+	$(AM_V_CC)mkdir -p $(@D) && $(shell which g++-13 g++-12 g++-11 g++ 2>/dev/null | head -1) -std=c++20 $(filter-out -std=%,$(CXXFLAGS)) -c $< -o $@ $(COVERAGEFLAGS)
+
 $(OBJ_DIR)/%.o: %.cc
 	$(AM_V_CC)mkdir -p $(@D) && $(CXX) $(CXXFLAGS) -c $< -o $@ $(COVERAGEFLAGS)
 
