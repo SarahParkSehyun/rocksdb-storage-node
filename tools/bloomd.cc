@@ -21,9 +21,11 @@
 
 #include "db/dbformat.h"
 #include "rocksdb/env.h"
+#include "rocksdb/filter_policy.h"
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/sst_file_reader.h"
+#include "rocksdb/table.h"
 #include "table/block_based/block_based_table_reader.h"
 #include "table/get_context.h"
 #include "table/table_reader.h"
@@ -32,13 +34,129 @@
 
 namespace bloomcheck {
 
+// Reason codes for why CheckKeyInSST returned true/false
+enum class CheckReason {
+  OPEN_FAIL,              // GetOrOpen returned nullptr
+  READER_NULL,            // entry->reader is null
+  BB_TABLE_NULL,          // bb_table is null (shouldn't happen)
+  REP_NULL,               // rep is null
+  FILTER_NULL,            // rep->filter is null
+  WHOLE_KEY_FILTERING_FALSE,  // rep->whole_key_filtering is false
+  UCOMP_NULL,             // ucmp is null (shouldn't happen)
+  KEYMAYMATCH_EXCEPTION,  // Exception during KeyMayMatch
+  KEYMAYMATCH_TRUE,       // KeyMayMatch returned true
+  KEYMAYMATCH_FALSE       // KeyMayMatch returned false
+};
+
+// Statistics counters
+struct Stats {
+  std::atomic<size_t> total_checks{0};
+  std::atomic<size_t> open_fail_getfilesize{0};
+  std::atomic<size_t> open_fail_newfile{0};
+  std::atomic<size_t> open_fail_newreader{0};
+  std::atomic<size_t> reason_open_fail{0};
+  std::atomic<size_t> reason_reader_null{0};
+  std::atomic<size_t> reason_bb_table_null{0};
+  std::atomic<size_t> reason_rep_null{0};
+  std::atomic<size_t> reason_filter_null{0};
+  std::atomic<size_t> reason_whole_key_filtering_false{0};
+  std::atomic<size_t> reason_ucomp_null{0};
+  std::atomic<size_t> reason_keymaymatch_exception{0};
+  std::atomic<size_t> reason_keymaymatch_true{0};
+  std::atomic<size_t> reason_keymaymatch_false{0};
+  std::atomic<size_t> keymaymatch_calls{0};
+  
+  void RecordReason(CheckReason reason) {
+    total_checks++;
+    switch (reason) {
+      case CheckReason::OPEN_FAIL:
+        reason_open_fail++;
+        break;
+      case CheckReason::READER_NULL:
+        reason_reader_null++;
+        break;
+      case CheckReason::BB_TABLE_NULL:
+        reason_bb_table_null++;
+        break;
+      case CheckReason::REP_NULL:
+        reason_rep_null++;
+        break;
+      case CheckReason::FILTER_NULL:
+        reason_filter_null++;
+        break;
+      case CheckReason::WHOLE_KEY_FILTERING_FALSE:
+        reason_whole_key_filtering_false++;
+        break;
+      case CheckReason::UCOMP_NULL:
+        reason_ucomp_null++;
+        break;
+      case CheckReason::KEYMAYMATCH_EXCEPTION:
+        reason_keymaymatch_exception++;
+        break;
+      case CheckReason::KEYMAYMATCH_TRUE:
+        reason_keymaymatch_true++;
+        keymaymatch_calls++;
+        break;
+      case CheckReason::KEYMAYMATCH_FALSE:
+        reason_keymaymatch_false++;
+        keymaymatch_calls++;
+        break;
+    }
+  }
+  
+  void PrintStats(std::mutex& log_mutex) {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    size_t total = total_checks.load();
+    size_t km_calls = keymaymatch_calls.load();
+    size_t fallback_true = reason_open_fail.load() + reason_reader_null.load() +
+                           reason_bb_table_null.load() + reason_rep_null.load() +
+                           reason_filter_null.load() + reason_whole_key_filtering_false.load() +
+                           reason_ucomp_null.load() + reason_keymaymatch_exception.load();
+    
+    double fallback_true_ratio = total > 0 ? (double)fallback_true / total : 0.0;
+    double km_true_ratio = km_calls > 0 ? (double)reason_keymaymatch_true.load() / km_calls : 0.0;
+    double km_false_ratio = km_calls > 0 ? (double)reason_keymaymatch_false.load() / km_calls : 0.0;
+    
+    std::cerr << "[STATS] ===== BloomCheck Statistics =====" << std::endl;
+    std::cerr << "[STATS] total_checks: " << total << std::endl;
+    std::cerr << "[STATS] open_fail_getfilesize: " << open_fail_getfilesize.load() << std::endl;
+    std::cerr << "[STATS] open_fail_newfile: " << open_fail_newfile.load() << std::endl;
+    std::cerr << "[STATS] open_fail_newreader: " << open_fail_newreader.load() << std::endl;
+    std::cerr << "[STATS] reason_open_fail: " << reason_open_fail.load() << std::endl;
+    std::cerr << "[STATS] reason_reader_null: " << reason_reader_null.load() << std::endl;
+    std::cerr << "[STATS] reason_bb_table_null: " << reason_bb_table_null.load() << std::endl;
+    std::cerr << "[STATS] reason_rep_null: " << reason_rep_null.load() << std::endl;
+    std::cerr << "[STATS] reason_filter_null: " << reason_filter_null.load() << std::endl;
+    std::cerr << "[STATS] reason_whole_key_filtering_false: " << reason_whole_key_filtering_false.load() << std::endl;
+    std::cerr << "[STATS] reason_ucomp_null: " << reason_ucomp_null.load() << std::endl;
+    std::cerr << "[STATS] reason_keymaymatch_exception: " << reason_keymaymatch_exception.load() << std::endl;
+    std::cerr << "[STATS] reason_keymaymatch_true: " << reason_keymaymatch_true.load() << std::endl;
+    std::cerr << "[STATS] reason_keymaymatch_false: " << reason_keymaymatch_false.load() << std::endl;
+    std::cerr << "[STATS] keymaymatch_calls: " << km_calls << std::endl;
+    std::cerr << "[STATS] fallback_true_ratio: " << fallback_true_ratio << " (" << fallback_true << "/" << total << ")" << std::endl;
+    std::cerr << "[STATS] km_true_ratio: " << km_true_ratio << " (" << reason_keymaymatch_true.load() << "/" << km_calls << ")" << std::endl;
+    std::cerr << "[STATS] km_false_ratio: " << km_false_ratio << " (" << reason_keymaymatch_false.load() << "/" << km_calls << ")" << std::endl;
+    std::cerr << "[STATS] =================================" << std::endl;
+  }
+};
+
 // LRU cache for TableReader
 class TableReaderCache {
  public:
   struct CacheEntry {
     std::unique_ptr<ROCKSDB_NAMESPACE::TableReader> reader;
+    ROCKSDB_NAMESPACE::InternalKeyComparator internal_comparator;
+    ROCKSDB_NAMESPACE::ImmutableOptions ioptions;
     std::chrono::steady_clock::time_point last_access;
     std::mutex mutex;  // Per-entry lock for thread safety
+    
+    explicit CacheEntry(const ROCKSDB_NAMESPACE::Options& opt)
+        : internal_comparator(opt.comparator),
+          ioptions(opt),
+          last_access(std::chrono::steady_clock::now()) {
+      // ImmutableOptions constructor sets fs from env automatically
+      // (ImmutableDBOptions constructor sets: fs = env->GetFileSystem())
+    }
   };
 
   explicit TableReaderCache(size_t max_size) : max_size_(max_size) {}
@@ -46,7 +164,8 @@ class TableReaderCache {
   // Get or create TableReader for SST file
   // Returns nullptr on error (safe to treat as may_match=true)
   CacheEntry* GetOrOpen(const std::string& sst_path,
-                        const ROCKSDB_NAMESPACE::Options& options) {
+                        const ROCKSDB_NAMESPACE::Options& options,
+                        Stats* stats, std::mutex* log_mutex, std::atomic<size_t>* open_count) {
     std::lock_guard<std::mutex> lock(cache_mutex_);
     
     // 경로 변환: Compute node 경로 → Storage node 경로
@@ -129,12 +248,10 @@ class TableReaderCache {
     }
 
     // Open SST file directly using BlockBasedTable
-    // Create a new entry and open the file
-    auto entry = std::make_unique<CacheEntry>();
-    entry->last_access = std::chrono::steady_clock::now();
+    // Create a new entry with ImmutableOptions and InternalKeyComparator
+    auto entry = std::make_unique<CacheEntry>(options);
 
     // Open using BlockBasedTable directly
-    ROCKSDB_NAMESPACE::ImmutableOptions ioptions(options);
     ROCKSDB_NAMESPACE::EnvOptions env_options;
     ROCKSDB_NAMESPACE::ReadOptions read_options;
     read_options.read_tier = ROCKSDB_NAMESPACE::kReadAllTier;  // Allow file reads
@@ -145,34 +262,38 @@ class TableReaderCache {
     ROCKSDB_NAMESPACE::FileOptions fopts(env_options);
     
     // actual_path 사용 (변환된 경로)
+    size_t open_id = (open_count ? (*open_count)++ : 0);
+    bool cache_hit = false;
+    
     ROCKSDB_NAMESPACE::IOStatus s = fs->GetFileSize(actual_path, fopts.io_options, &file_size, nullptr);
     if (!s.ok()) {
-      // 파일이 없을 때는 정상 동작 (may_match=true 반환)
-      // 에러 로그는 처음 몇 번만 출력하여 로그 폭주 방지
-      static std::atomic<size_t> file_not_found_count{0};
-      size_t count = file_not_found_count.fetch_add(1) + 1;
-      if (count <= 5 || count % 1000 == 0) {
-        std::cerr << "[WARN] GetOrOpen: File not found: " << actual_path 
-                  << " (requested: " << sst_path << ")" << std::flush << std::endl;
-        if (count == 1000) {
-          std::cerr << "[INFO] GetOrOpen: Suppressing further file not found warnings (total: " << count << ")" << std::flush << std::endl;
-        }
+      if (stats) stats->open_fail_getfilesize++;
+      // 샘플 로그 (초기 50회 + 매 1000회)
+      if (open_id <= 50 || open_id % 1000 == 0) {
+        std::lock_guard<std::mutex> log_lock(*log_mutex);
+        std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
+                  << " FAIL: GetFileSize failed" << std::endl;
+        std::cerr << "[SAMPLE]   sst_path: " << sst_path << std::endl;
+        std::cerr << "[SAMPLE]   actual_path: " << actual_path << std::endl;
+        std::cerr << "[SAMPLE]   cache_hit: " << (cache_hit ? "yes" : "no") << std::endl;
+        std::cerr << "[SAMPLE]   error: " << s.ToString() << std::endl;
       }
       return nullptr;
     }
 
     s = fs->NewRandomAccessFile(actual_path, fopts, &file, nullptr);
     if (!s.ok()) {
-      // 파일 열기 실패 시에도 정상 동작 (may_match=true 반환)
-      // 에러 로그는 처음 몇 번만 출력
-      static std::atomic<size_t> file_open_error_count{0};
-      size_t count = file_open_error_count.fetch_add(1) + 1;
-      if (count <= 5 || count % 1000 == 0) {
-        std::cerr << "[WARN] GetOrOpen: Failed to open file: " << actual_path 
-                  << " (requested: " << sst_path << "): " << s.ToString() << std::flush << std::endl;
-        if (count == 1000) {
-          std::cerr << "[INFO] GetOrOpen: Suppressing further file open error warnings (total: " << count << ")" << std::flush << std::endl;
-        }
+      if (stats) stats->open_fail_newfile++;
+      // 샘플 로그
+      if (open_id <= 50 || open_id % 1000 == 0) {
+        std::lock_guard<std::mutex> log_lock(*log_mutex);
+        std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
+                  << " FAIL: NewRandomAccessFile failed" << std::endl;
+        std::cerr << "[SAMPLE]   sst_path: " << sst_path << std::endl;
+        std::cerr << "[SAMPLE]   actual_path: " << actual_path << std::endl;
+        std::cerr << "[SAMPLE]   file_size: " << file_size << std::endl;
+        std::cerr << "[SAMPLE]   cache_hit: " << (cache_hit ? "yes" : "no") << std::endl;
+        std::cerr << "[SAMPLE]   error: " << s.ToString() << std::endl;
       }
       return nullptr;
     }
@@ -180,14 +301,14 @@ class TableReaderCache {
     std::unique_ptr<ROCKSDB_NAMESPACE::RandomAccessFileReader> file_reader(
         new ROCKSDB_NAMESPACE::RandomAccessFileReader(std::move(file), actual_path));
 
-    ROCKSDB_NAMESPACE::InternalKeyComparator internal_comparator(
-        options.comparator);
+    // Use entry->ioptions and entry->internal_comparator to ensure lifetime
+    const auto& ioptions = entry->ioptions;
     
     ROCKSDB_NAMESPACE::TableReaderOptions t_opt(
         ioptions, options.prefix_extractor,
         ROCKSDB_NAMESPACE::UnownedPtr<ROCKSDB_NAMESPACE::CompressionManager>(
             options.compression_manager.get()),
-        env_options, internal_comparator,
+        env_options, entry->internal_comparator,
         options.block_protection_bytes_per_key,
         /*skip_filters*/ false, /*immortal*/ false,
         /*force_direct_prefetch*/ false, /*level*/ -1,
@@ -204,9 +325,57 @@ class TableReaderCache {
         false /* prefetch_index_and_filter_in_cache */);
     
     if (!table_status.ok() || !table_reader) {
-      std::cerr << "[ERROR] GetOrOpen: NewTableReader failed for " << actual_path 
-                << " (requested: " << sst_path << "): " << table_status.ToString() << std::flush << std::endl;
+      if (stats) stats->open_fail_newreader++;
+      // 샘플 로그
+      if (open_id <= 50 || open_id % 1000 == 0) {
+        std::lock_guard<std::mutex> log_lock(*log_mutex);
+        std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
+                  << " FAIL: NewTableReader failed" << std::endl;
+        std::cerr << "[SAMPLE]   sst_path: " << sst_path << std::endl;
+        std::cerr << "[SAMPLE]   actual_path: " << actual_path << std::endl;
+        std::cerr << "[SAMPLE]   file_size: " << file_size << std::endl;
+        std::cerr << "[SAMPLE]   cache_hit: " << (cache_hit ? "yes" : "no") << std::endl;
+        std::cerr << "[SAMPLE]   status: " << table_status.ToString() << std::endl;
+      }
       return nullptr;
+    }
+
+    // 샘플 로그 (성공한 경우) 및 table properties 로그
+    if (open_id <= 50 || open_id % 1000 == 0) {
+      std::lock_guard<std::mutex> log_lock(*log_mutex);
+      std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
+                << " SUCCESS" << std::endl;
+      std::cerr << "[SAMPLE]   sst_path: " << sst_path << std::endl;
+      std::cerr << "[SAMPLE]   actual_path: " << actual_path << std::endl;
+      std::cerr << "[SAMPLE]   file_size: " << file_size << std::endl;
+      std::cerr << "[SAMPLE]   cache_hit: " << (cache_hit ? "yes" : "no") << std::endl;
+      std::cerr << "[SAMPLE]   status: OK" << std::endl;
+      
+      // Table properties 로그
+      auto props = table_reader->GetTableProperties();
+      if (props) {
+        std::cerr << "[SAMPLE]   table_properties.filter_policy_name: " << props->filter_policy_name << std::endl;
+      } else {
+        std::cerr << "[SAMPLE]   table_properties: null" << std::endl;
+      }
+      
+      // BlockBasedTable::Rep 정보 로그
+      ROCKSDB_NAMESPACE::BlockBasedTable* bb_table =
+          static_cast<ROCKSDB_NAMESPACE::BlockBasedTable*>(table_reader.get());
+      if (bb_table) {
+        const ROCKSDB_NAMESPACE::BlockBasedTable::Rep* rep = bb_table->get_rep();
+        if (rep) {
+          std::cerr << "[SAMPLE]   rep->filter_policy: " << (rep->table_options.filter_policy ? rep->table_options.filter_policy.get() : nullptr) << std::endl;
+          if (rep->table_options.filter_policy) {
+            std::cerr << "[SAMPLE]   rep->filter_policy->Name(): " << rep->table_options.filter_policy->Name() << std::endl;
+          }
+          std::cerr << "[SAMPLE]   rep->filter: " << (rep->filter ? rep->filter.get() : nullptr) << std::endl;
+          std::cerr << "[SAMPLE]   rep->whole_key_filtering: " << (rep->whole_key_filtering ? "true" : "false") << std::endl;
+          std::cerr << "[SAMPLE]   rep->index_type: " << static_cast<int>(rep->index_type) << std::endl;
+        } else {
+          std::cerr << "[SAMPLE]   rep: null" << std::endl;
+        }
+      }
     }
 
     entry->reader = std::move(table_reader);
@@ -244,12 +413,27 @@ class TableReaderCache {
 class BloomCheckServiceImpl final : public BloomCheck::Service {
  public:
   explicit BloomCheckServiceImpl(size_t cache_size)
-      : cache_(cache_size), rocksdb_options_() {
+      : cache_(cache_size), rocksdb_options_(),
+        clock_(ROCKSDB_NAMESPACE::SystemClock::Default()),
+        fs_(ROCKSDB_NAMESPACE::Env::Default()->GetFileSystem()) {
     // Configure RocksDB options for filter-only access
     rocksdb_options_.env = ROCKSDB_NAMESPACE::Env::Default();
-    // Use default table factory (BlockBasedTable)
-    // whole_key_filtering should be true (checked by caller)
-    // partitioned_filters should be true (checked by caller)
+    // FileSystem lifetime is maintained by fs_ member
+    // ImmutableOptions constructor will set fs from env->GetFileSystem()
+    
+    // Set BlockBasedTableOptions with filter_policy
+    ROCKSDB_NAMESPACE::BlockBasedTableOptions bbto;
+    bbto.filter_policy.reset(ROCKSDB_NAMESPACE::NewBloomFilterPolicy(10, false));
+    bbto.whole_key_filtering = true;
+    bbto.partition_filters = true;
+    rocksdb_options_.table_factory.reset(
+        ROCKSDB_NAMESPACE::NewBlockBasedTableFactory(bbto));
+    
+    StartStatsThread();
+  }
+  
+  ~BloomCheckServiceImpl() {
+    StopStatsThread();
   }
 
   grpc::Status Check(grpc::ServerContext* /*context*/,
@@ -319,12 +503,14 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
     }
     
     // Get or open TableReader
-    TableReaderCache::CacheEntry* entry = cache_.GetOrOpen(sst_path, rocksdb_options_);
+    TableReaderCache::CacheEntry* entry = cache_.GetOrOpen(sst_path, rocksdb_options_, &stats_, &log_mutex_, &open_count_);
     if (!entry) {
       // Error opening file - safe to return true (may_match)
+      stats_.RecordReason(CheckReason::OPEN_FAIL);
       if (call_id <= 10) {
+        std::lock_guard<std::mutex> log_lock(log_mutex_);
         std::cerr << "[DEBUG] CheckKeyInSST #" << call_id 
-                  << " failed to open SST file, returning true" << std::flush << std::endl;
+                  << " failed to open SST file, returning true (reason=OPEN_FAIL)" << std::flush << std::endl;
       }
       return true;
     }
@@ -335,45 +521,84 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
 
     ROCKSDB_NAMESPACE::TableReader* reader = entry->reader.get();
     if (!reader) {
-      if (call_id <= 10) {
-        std::cerr << "[DEBUG] CheckKeyInSST #" << call_id 
-                  << " reader is null, returning true" << std::flush << std::endl;
-      }
+      stats_.RecordReason(CheckReason::READER_NULL);
       return true;  // Safe default
     }
 
     // Cast to BlockBasedTable to access filter
     // Since we opened the table with BlockBasedTableFactory, it should be BlockBasedTable
-    // Use static_cast instead of dynamic_cast to avoid RTTI dependency
     ROCKSDB_NAMESPACE::BlockBasedTable* bb_table =
         static_cast<ROCKSDB_NAMESPACE::BlockBasedTable*>(reader);
     if (!bb_table) {
       // Safety check - return true (may_match)
-      if (call_id <= 10) {
-        std::cerr << "[DEBUG] CheckKeyInSST #" << call_id 
-                  << " bb_table is null, returning true" << std::flush << std::endl;
-      }
+      stats_.RecordReason(CheckReason::BB_TABLE_NULL);
       return true;
     }
 
     // Get filter from BlockBasedTable
     const ROCKSDB_NAMESPACE::BlockBasedTable::Rep* rep = bb_table->get_rep();
-    if (!rep || !rep->filter) {
-      // No filter - return true (may_match)
+    if (!rep) {
+      stats_.RecordReason(CheckReason::REP_NULL);
+      return true;
+    }
+    
+    // FileSystem 포인터 로그 (call_id <= 20)
+    if (call_id <= 20) {
+      std::lock_guard<std::mutex> log_lock(log_mutex_);
+      std::cerr << "[SAMPLE] CheckKeyInSST #" << call_id << " rep obtained" << std::endl;
+      std::cerr << "[SAMPLE]   rocksdb_options_.env=" << (void*)rocksdb_options_.env << std::endl;
+      if (rocksdb_options_.env) {
+        auto env_fs = rocksdb_options_.env->GetFileSystem();
+        std::cerr << "[SAMPLE]   rocksdb_options_.env->GetFileSystem().get()=" << (void*)env_fs.get() << std::endl;
+      }
+      std::cerr << "[SAMPLE]   rep->ioptions.fs.get()=" << (void*)rep->ioptions.fs.get() << std::endl;
+    }
+    
+    // KeyMayMatch 호출 직전 fs null 체크
+    if (!rep->ioptions.fs || !rep->ioptions.fs.get()) {
+      stats_.RecordReason(CheckReason::FILTER_NULL);  // 임시로 FILTER_NULL 사용
+      if (call_id <= 20) {
+        std::lock_guard<std::mutex> log_lock(log_mutex_);
+        std::cerr << "[ERROR] CheckKeyInSST #" << call_id << " rep->ioptions.fs is null -> fallback true" << std::endl;
+      }
+      return true;
+    }
+    
+    if (!rep->filter) {
+      stats_.RecordReason(CheckReason::FILTER_NULL);
+      
+      // Rate-limited logging (1초에 1번)
+      auto now = std::chrono::steady_clock::now();
+      auto last_log = last_filter_null_log_time_.load();
+      if (now - last_log >= std::chrono::seconds(1)) {
+        if (last_filter_null_log_time_.compare_exchange_strong(last_log, now)) {
+          std::lock_guard<std::mutex> log_lock(log_mutex_);
+          std::cerr << "[WARN] FilterNull: sst_path=" << sst_path << std::endl;
+          
+          // Table properties에서 filter_policy_name 가져오기
+          auto props = bb_table->GetTableProperties();
+          if (props) {
+            std::cerr << "[WARN]   table_properties.filter_policy_name: " << props->filter_policy_name << std::endl;
+          } else {
+            std::cerr << "[WARN]   table_properties: null" << std::endl;
+          }
+          
+          std::cerr << "[WARN]   rep->filter_policy_name: " << (rep->table_options.filter_policy ? rep->table_options.filter_policy->Name() : "null") << std::endl;
+          std::cerr << "[WARN]   rep->filter_policy exists: " << (rep->table_options.filter_policy ? "yes" : "no") << std::endl;
+        }
+      }
+      
       if (call_id <= 10) {
+        std::lock_guard<std::mutex> log_lock(log_mutex_);
         std::cerr << "[DEBUG] CheckKeyInSST #" << call_id 
-                  << " no filter in SST, returning true" << std::flush << std::endl;
+                  << " no filter in SST, returning true (reason=FILTER_NULL)" << std::flush << std::endl;
       }
       return true;
     }
 
     // Check whole_key_filtering
     if (!rep->whole_key_filtering) {
-      // Not whole key filtering - return true (may_match)
-      if (call_id <= 10) {
-        std::cerr << "[DEBUG] CheckKeyInSST #" << call_id 
-                  << " whole_key_filtering is false, returning true" << std::flush << std::endl;
-      }
+      stats_.RecordReason(CheckReason::WHOLE_KEY_FILTERING_FALSE);
       return true;
     }
 
@@ -384,6 +609,10 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
     // Get comparator
     const ROCKSDB_NAMESPACE::Comparator* ucmp =
         rep->internal_comparator.user_comparator();
+    if (!ucmp) {
+      stats_.RecordReason(CheckReason::UCOMP_NULL);
+      return true;
+    }
 
     // Create minimal GetContext
     // We don't need value, just filter check
@@ -392,52 +621,74 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
     ROCKSDB_NAMESPACE::MergeContext dummy_merge_context;
     ROCKSDB_NAMESPACE::SequenceNumber dummy_max_covering_tombstone_seq = 0;
 
+    // Strip timestamp if needed
+    size_t ts_sz = ucmp->timestamp_size();
+    ROCKSDB_NAMESPACE::Slice user_key_without_ts =
+        ROCKSDB_NAMESPACE::StripTimestampFromUserKey(user_key, ts_sz);
+
     ROCKSDB_NAMESPACE::GetContext get_context(
         ucmp, nullptr /* merge_operator */, nullptr /* logger */,
         nullptr /* statistics */, ROCKSDB_NAMESPACE::GetContext::kNotFound,
-        user_key, &dummy_value, nullptr /* columns */, &dummy_value_found,
+        user_key_without_ts, &dummy_value, nullptr /* columns */, &dummy_value_found,
         &dummy_merge_context, false /* do_merge */,
         &dummy_max_covering_tombstone_seq,
-        ROCKSDB_NAMESPACE::SystemClock::Default().get());
+        clock_.get());
 
     // Create BlockCacheLookupContext
     ROCKSDB_NAMESPACE::BlockCacheLookupContext lookup_context(
         ROCKSDB_NAMESPACE::TableReaderCaller::kUserGet, 0 /* tracing_get_id */,
         false /* get_from_user_specified_snapshot */);
 
-    // Strip timestamp if needed
-    size_t ts_sz = ucmp->timestamp_size();
-    ROCKSDB_NAMESPACE::Slice user_key_without_ts =
-        ROCKSDB_NAMESPACE::StripTimestampFromUserKey(user_key, ts_sz);
-
-    if (call_id <= 10) {
-      std::cerr << "[DEBUG] CheckKeyInSST #" << call_id 
-                << " calling KeyMayMatch..." << std::flush << std::endl;
+    // A/B 테스트: const_ikey_ptr=nullptr 모드 (환경변수로 토글)
+    const char* use_null_ikey_env = std::getenv("BLOOMCHECK_USE_NULL_IKEY");
+    bool use_null_ikey = (use_null_ikey_env && strlen(use_null_ikey_env) > 0 && use_null_ikey_env[0] == '1');
+    
+    const ROCKSDB_NAMESPACE::Slice* const_ikey_ptr = nullptr;
+    ROCKSDB_NAMESPACE::InternalKey ikey_for_seek;
+    ROCKSDB_NAMESPACE::Slice ikey_slice;
+    
+    if (!use_null_ikey) {
+      // Generate internal key for partitioned filter lookup
+      ikey_for_seek = ROCKSDB_NAMESPACE::InternalKey(
+          user_key_without_ts, ROCKSDB_NAMESPACE::kMaxSequenceNumber,
+          ROCKSDB_NAMESPACE::kValueTypeForSeek);
+      ikey_slice = ikey_for_seek.Encode();
+      const_ikey_ptr = &ikey_slice;
+    }
+    
+    // 디버깅 로그 (call_id <= 20)
+    if (call_id <= 20) {
+      std::lock_guard<std::mutex> log_lock(log_mutex_);
+      std::cerr << "[SAMPLE] CheckKeyInSST #" << call_id << std::endl;
+      std::cerr << "[SAMPLE]   clock_ptr=" << (void*)clock_.get() << std::endl;
+      if (rocksdb_options_.env) {
+        std::cerr << "[SAMPLE]   fs_ptr=" << (void*)rocksdb_options_.env->GetFileSystem().get() << std::endl;
+      }
+      std::cerr << "[SAMPLE]   filter_ptr=" << (void*)rep->filter.get() << std::endl;
+      std::cerr << "[SAMPLE]   whole_key_filtering=" << (rep->whole_key_filtering ? "true" : "false") << std::endl;
+      std::cerr << "[SAMPLE]   index_key_includes_seq=" << (rep->index_key_includes_seq ? "true" : "false") << std::endl;
     }
     
     // Check filter
-    // For whole_key_filtering, we use KeyMayMatch
-    // const_ikey_ptr can be nullptr for whole key filtering
-    bool may_match = rep->filter->KeyMayMatch(
-        user_key_without_ts, nullptr /* const_ikey_ptr */, &get_context,
-        &lookup_context, read_options);
-
-    // If filter check fails (returns false), may_match is false
-    // If filter check succeeds or errors, may_match is true
-    // This is safe: false negative is prevented (errors return true)
-    
-    // Debug: Log filter result
-    // 처음 10번, 그리고 이후 100번마다, 또는 false일 때 항상 로그
-    if (call_id <= 10 || call_id % 100 == 0 || !may_match) {
-      std::cerr << "[DEBUG] KeyMayMatch #" << call_id 
-                << " for key (hex) " << user_key_without_ts.ToString(true) 
-                << " in SST " << sst_path 
-                << ": " << (may_match ? "MAY_MATCH" : "NOT_MATCH") << std::flush << std::endl;
-    }
-    
-    // 첫 요청 시 서버 시작 로그 출력
-    if (call_id == 1) {
-      std::cerr << "[INFO] First BloomCheck request received and processed" << std::flush << std::endl;
+    bool may_match = false;
+    try {
+      may_match = rep->filter->KeyMayMatch(
+          user_key_without_ts, const_ikey_ptr, &get_context,
+          &lookup_context, read_options);
+      
+      if (call_id <= 20) {
+        std::lock_guard<std::mutex> log_lock(log_mutex_);
+        std::cerr << "[SAMPLE]   KeyMayMatch_result=" << (may_match ? "true" : "false") << std::endl;
+      }
+      
+      if (may_match) {
+        stats_.RecordReason(CheckReason::KEYMAYMATCH_TRUE);
+      } else {
+        stats_.RecordReason(CheckReason::KEYMAYMATCH_FALSE);
+      }
+    } catch (...) {
+      stats_.RecordReason(CheckReason::KEYMAYMATCH_EXCEPTION);
+      return true;  // Safe default on exception
     }
     
     return may_match;
@@ -445,6 +696,35 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
 
   TableReaderCache cache_;
   ROCKSDB_NAMESPACE::Options rocksdb_options_;
+  Stats stats_;
+  std::mutex log_mutex_;
+  std::atomic<size_t> open_count_{0};
+  std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock_;
+  std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs_;
+  
+  // Stats printing thread
+  std::thread stats_thread_;
+  std::atomic<bool> stop_stats_thread_{false};
+  
+  // Rate-limited logging for filter null cases
+  std::atomic<std::chrono::steady_clock::time_point> last_filter_null_log_time_{
+      std::chrono::steady_clock::time_point::min()};
+  
+  void StartStatsThread() {
+    stats_thread_ = std::thread([this]() {
+      while (!stop_stats_thread_.load()) {
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        stats_.PrintStats(log_mutex_);
+      }
+    });
+  }
+  
+  void StopStatsThread() {
+    stop_stats_thread_ = true;
+    if (stats_thread_.joinable()) {
+      stats_thread_.join();
+    }
+  }
 };
 
 }  // namespace bloomcheck
