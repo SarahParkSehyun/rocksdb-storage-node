@@ -484,9 +484,58 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
       }
     }
     
+    // 샘플링 로그: key hex, 입력 sst_paths, 출력 may_match_paths
+    // may_match_count > 0일 때만 출력 (확인을 수월하게 하기 위해)
+    size_t may_match_count = resp->may_match_sst_paths_size();
+    bool should_log = (may_match_count > 0);
+    
+    // 디버깅: CheckKeyInSST가 true를 반환했는데도 추가되지 않는 경우 확인
+    if (key_req_id <= 50) {
+      std::lock_guard<std::mutex> log_lock(log_mutex_);
+      std::cerr << "[DEBUG] ProcessKeyRequest #" << key_req_id 
+                << " after loop: may_match_count=" << may_match_count 
+                << ", input_sst_count=" << req.sst_paths_size() << std::endl;
+    }
+    
+    if (should_log) {
+      std::lock_guard<std::mutex> log_lock(log_mutex_);
+      
+      // key 앞 8바이트 hex (key가 8바이트 이상인 경우)
+      std::string key_hex_prefix;
+      if (user_key.size() >= 8) {
+        key_hex_prefix = ROCKSDB_NAMESPACE::Slice(user_key.data(), 8).ToString(true);
+      } else {
+        key_hex_prefix = ROCKSDB_NAMESPACE::Slice(user_key).ToString(true);
+      }
+      
+      std::cerr << "[SAMPLE] ProcessKeyRequest #" << key_req_id << std::endl;
+      std::cerr << "[SAMPLE]   key_hex_prefix: " << key_hex_prefix << std::endl;
+      std::cerr << "[SAMPLE]   input_sst_paths_count: " << req.sst_paths_size() << std::endl;
+      
+      // 입력 sst_paths 목록 (최대 10개까지만)
+      size_t input_count = std::min(static_cast<size_t>(req.sst_paths_size()), size_t(10));
+      for (size_t i = 0; i < input_count; i++) {
+        std::cerr << "[SAMPLE]   input_sst_paths[" << i << "]: " << req.sst_paths(i) << std::endl;
+      }
+      if (req.sst_paths_size() > 10) {
+        std::cerr << "[SAMPLE]   ... (" << (req.sst_paths_size() - 10) << " more input paths)" << std::endl;
+      }
+      
+      std::cerr << "[SAMPLE]   output_may_match_count: " << may_match_count << std::endl;
+      
+      // 출력 may_match_paths 목록
+      if (may_match_count > 0) {
+        for (size_t i = 0; i < may_match_count; i++) {
+          std::cerr << "[SAMPLE]   may_match_paths[" << i << "]: " << resp->may_match_sst_paths(i) << std::endl;
+        }
+      } else {
+        std::cerr << "[SAMPLE]   may_match_paths: (none)" << std::endl;
+      }
+    }
+    
     if (key_req_id <= 10 || key_req_id % 100 == 0) {
       std::cerr << "[INFO] ProcessKeyRequest #" << key_req_id 
-                << " completed: " << resp->may_match_sst_paths_size() 
+                << " completed: " << may_match_count 
                 << " may_match files" << std::flush << std::endl;
     }
   }
