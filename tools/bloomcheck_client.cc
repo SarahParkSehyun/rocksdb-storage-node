@@ -90,7 +90,7 @@ void PrintUsage(const char* prog_name) {
             << "  -s <server>     Server address (default: localhost:50051)\n"
             << "  -k <key>        Key to check (required for single check)\n"
             << "  -x <hex_key>    Key in hex format (required for single check)\n"
-            << "                  Note: -x takes Internal Key hex, extracts user_key\n"
+            << "                  Note: -x takes user_key hex (as output by sst_dump --output_hex)\n"
             << "  -f <sst_path>   SST file path (required for single check)\n"
             << "  -t              Performance test (64-256 keys, 1-5 SSTs)\n"
             << "  -h              Show this help\n";
@@ -121,16 +121,9 @@ int main(int argc, char** argv) {
         hex_key = hex_key.substr(0, hex_key.length() - 1);
       }
       
-      // Convert hex to bytes (this is Internal Key)
-      std::string internal_key = HexToBytes(hex_key);
-      
-      // Extract user_key by removing last 8 bytes (sequence + type)
-      // Internal Key = user_key + sequence(7 bytes) + type(1 byte)
-      if (internal_key.length() >= 8) {
-        key = internal_key.substr(0, internal_key.length() - 8);
-      } else {
-        key = internal_key;
-      }
+      // Convert hex to bytes (this is user_key hex from sst_dump --output_hex)
+      // sst_dump outputs user_key hex, not Internal Key hex
+      key = HexToBytes(hex_key);
       use_hex_key = true;
     } else if (arg == "-f" && i + 1 < argc) {
       sst_path = argv[++i];
