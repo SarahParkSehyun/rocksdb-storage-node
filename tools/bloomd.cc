@@ -169,8 +169,8 @@ class TableReaderCache {
     std::lock_guard<std::mutex> lock(cache_mutex_);
     
     // 경로 변환: Compute node 경로 → Storage node 경로
-    // Compute node는 NVMe-oF 마운트 경로(/mnt/kvafa/db_bench/)를 전송하지만,
-    // Storage node는 로컬 경로(/work/tmp/db_bench/)에서 파일을 읽어야 함
+    // Compute node와 Storage node 모두 NVMe-oF 마운트 경로(/mnt/kvafa/db_bench/)를 사용
+    // 환경 변수 BLOOMCHECK_STORAGE_PATH로 다른 경로 지정 가능
     std::string actual_path = sst_path;
     
     // 경로에서 파일 번호 추출
