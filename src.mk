@@ -447,6 +447,8 @@ TOOLS_MAIN_SOURCES =                                                    \
   tools/dump/rocksdb_undump.cc                                          \
   tools/trace_analyzer.cc                                               \
   tools/io_tracer_parser_tool.cc                                        \
+  tools/bloomd.cc                                                        \
+  tools/bloomcheck_client.cc                                             \
 
 BENCH_MAIN_SOURCES =                                                    \
   cache/cache_bench.cc                                                  \
