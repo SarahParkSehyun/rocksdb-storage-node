@@ -465,9 +465,25 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
     
     if (req_id <= 10 || req_id % 100 == 0) {
       std::cerr << "[INFO] Check request #" << req_id << " completed" << std::flush << std::endl;
+      std::cerr << "[INFO] Check request #" << req_id 
+                << " response size: " << response->resps_size() << std::flush << std::endl;
+    }
+    
+    // 응답 전송 전 로그 (처음 10개)
+    if (req_id <= 10) {
+      std::cerr << "[INFO] Check request #" << req_id 
+                << " about to return grpc::Status::OK" << std::flush << std::endl;
     }
 
-    return grpc::Status::OK;
+    grpc::Status status = grpc::Status::OK;
+    
+    // 응답 반환 후 로그 (처음 10개)
+    if (req_id <= 10) {
+      std::cerr << "[INFO] Check request #" << req_id 
+                << " returned grpc::Status::OK" << std::flush << std::endl;
+    }
+    
+    return status;
   }
 
  private:
