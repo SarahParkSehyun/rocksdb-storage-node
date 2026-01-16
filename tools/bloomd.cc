@@ -7,6 +7,7 @@
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
 
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -193,6 +194,7 @@ static std::string TryOpenSstPath(uint64_t file_number,
 }
 
 // LRU cache for TableReader (keyed by file_number)
+// Uses sharding to reduce lock contention: file_number is hashed to select a shard
 class TableReaderCache {
  public:
   struct CacheEntry {
@@ -219,25 +221,67 @@ class TableReaderCache {
     InflightOpen() : promise(), future(promise.get_future().share()) {}
   };
 
-  explicit TableReaderCache(size_t max_size) : max_size_(max_size) {}
+  // Shard structure: each shard has its own lock, cache, and LRU
+  struct Shard {
+    mutable std::shared_mutex mutex;  // shared_mutex for read-heavy workload
+    std::unordered_map<uint64_t, std::shared_ptr<CacheEntry>> cache;
+    std::unordered_map<uint64_t, std::shared_ptr<InflightOpen>> inflight;
+    std::list<uint64_t> lru_list;  // Front = MRU, Back = LRU
+    std::unordered_map<uint64_t, std::list<uint64_t>::iterator> lru_map;
+    size_t max_size;
+    
+    Shard(size_t max_size_per_shard) : max_size(max_size_per_shard) {}
+  };
+
+  static constexpr size_t N_SHARDS = 16;  // 2^4 shards for better distribution
+
+  explicit TableReaderCache(size_t max_size) : max_size_(max_size) {
+    // Initialize shards
+    size_t max_size_per_shard = (max_size + N_SHARDS - 1) / N_SHARDS;
+    for (size_t i = 0; i < N_SHARDS; ++i) {
+      shards_[i] = std::make_unique<Shard>(max_size_per_shard);
+    }
+  }
+  
+  // Hash function to select shard from file_number
+  static size_t GetShardIndex(uint64_t file_number) {
+    // Simple hash: mix bits for better distribution
+    return std::hash<uint64_t>{}(file_number) & (N_SHARDS - 1);
+  }
+  
+  Shard& GetShard(uint64_t file_number) {
+    return *shards_[GetShardIndex(file_number)];
+  }
 
   // Get or create TableReader for SST file (by file_number)
   // Returns nullptr on error (safe to treat as may_match=true)
   std::shared_ptr<CacheEntry> GetOrOpen(uint64_t file_number,
                                         const ROCKSDB_NAMESPACE::Options& options,
                                         Stats* stats, std::mutex* log_mutex, std::atomic<size_t>* open_count) {
-    // Phase A: Check cache hit under lock (short duration)
+    Shard& shard = GetShard(file_number);
+    
+    // Phase A: Check cache hit with shared_lock (read-heavy optimization)
+    std::shared_ptr<CacheEntry> cached_entry;
     {
-      std::lock_guard<std::mutex> lock(cache_mutex_);
+      std::shared_lock<std::shared_mutex> lock(shard.mutex);
       
       // Check cache first (by file_number)
-      auto it = cache_.find(file_number);
-      if (it != cache_.end()) {
-        // Cache hit - update LRU and return
-        UpdateLRU(file_number);
+      auto it = shard.cache.find(file_number);
+      if (it != shard.cache.end()) {
+        // Cache hit - remember entry, update LRU outside shared_lock
+        cached_entry = it->second;
         if (stats) stats->cache_hits++;
-        return it->second;
       }
+    }
+    
+    // Update LRU outside shared_lock (requires unique_lock)
+    if (cached_entry) {
+      std::unique_lock<std::shared_mutex> lock(shard.mutex);
+      // Double-check cache still exists (might have been evicted)
+      if (shard.cache.find(file_number) != shard.cache.end()) {
+        UpdateLRU(shard, file_number);
+      }
+      return cached_entry;
     }
 
     // Cache miss - need to open file
@@ -247,30 +291,30 @@ class TableReaderCache {
     std::shared_ptr<InflightOpen> inflight;
     bool is_waiting = false;
     {
-      std::lock_guard<std::mutex> lock(cache_mutex_);
+      std::unique_lock<std::shared_mutex> lock(shard.mutex);
       
       // Double-check cache (might have been inserted by another thread)
-      auto it = cache_.find(file_number);
-      if (it != cache_.end()) {
-        UpdateLRU(file_number);
+      auto it = shard.cache.find(file_number);
+      if (it != shard.cache.end()) {
+        UpdateLRU(shard, file_number);
         if (stats) stats->cache_hits++;
         return it->second;
       }
       
       // Check if another thread is already opening this file
-      auto inflight_it = inflight_.find(file_number);
-      if (inflight_it != inflight_.end()) {
+      auto inflight_it = shard.inflight.find(file_number);
+      if (inflight_it != shard.inflight.end()) {
         // Another thread is opening - wait for result
         inflight = inflight_it->second;
         is_waiting = true;
       } else {
         // We are the first thread to open this file - register inflight
         inflight = std::make_shared<InflightOpen>();
-        inflight_[file_number] = inflight;
+        shard.inflight[file_number] = inflight;
         
         // If cache is full, evict LRU entry before opening
-        if (cache_.size() >= max_size_) {
-          EvictLRUOne(stats);
+        if (shard.cache.size() >= shard.max_size) {
+          EvictLRUOne(shard, stats);
         }
       }
       // Lock released here - proceed to Phase B
@@ -327,8 +371,8 @@ class TableReaderCache {
       }
       // Clean up inflight entry on failure
       {
-        std::lock_guard<std::mutex> lock(cache_mutex_);
-        inflight_.erase(file_number);
+        std::lock_guard<std::shared_mutex> lock(shard.mutex);
+        shard.inflight.erase(file_number);
         inflight->promise.set_value(nullptr);
       }
       return nullptr;
@@ -349,8 +393,8 @@ class TableReaderCache {
       }
       // Clean up inflight entry on failure
       {
-        std::lock_guard<std::mutex> lock(cache_mutex_);
-        inflight_.erase(file_number);
+        std::lock_guard<std::shared_mutex> lock(shard.mutex);
+        shard.inflight.erase(file_number);
         inflight->promise.set_value(nullptr);
       }
       return nullptr;
@@ -396,8 +440,8 @@ class TableReaderCache {
       }
       // Clean up inflight entry on failure
       {
-        std::lock_guard<std::mutex> lock(cache_mutex_);
-        inflight_.erase(file_number);
+        std::lock_guard<std::shared_mutex> lock(shard.mutex);
+        shard.inflight.erase(file_number);
         inflight->promise.set_value(nullptr);
       }
       return nullptr;
@@ -459,26 +503,26 @@ class TableReaderCache {
     
     // Phase C: Insert into cache under lock (short duration)
     {
-      std::lock_guard<std::mutex> lock(cache_mutex_);
+      std::unique_lock<std::shared_mutex> lock(shard.mutex);
       
       // Double-check cache (might have been inserted by another thread during Phase B)
-      auto it = cache_.find(file_number);
-      if (it != cache_.end()) {
+      auto it = shard.cache.find(file_number);
+      if (it != shard.cache.end()) {
         // Another thread already inserted - use existing entry
-        UpdateLRU(file_number);
+        UpdateLRU(shard, file_number);
         if (stats) stats->cache_hits++;
         // Clean up inflight entry
-        inflight_.erase(file_number);
+        shard.inflight.erase(file_number);
         inflight->promise.set_value(it->second);
         return it->second;
       }
       
       // Cache by file_number and update LRU
-      cache_[file_number] = entry_ptr;
-      UpdateLRU(file_number);
+      shard.cache[file_number] = entry_ptr;
+      UpdateLRU(shard, file_number);
       
       // Clean up inflight entry and notify waiters
-      inflight_.erase(file_number);
+      shard.inflight.erase(file_number);
       inflight->promise.set_value(entry_ptr);
     }
     
@@ -487,46 +531,42 @@ class TableReaderCache {
 
  private:
   // Update LRU list: move file_number to front (MRU)
-  // Requires: caller must hold lock on cache_mutex_
-  void UpdateLRU(uint64_t file_number) {
-    auto lru_it = lru_map_.find(file_number);
-    if (lru_it != lru_map_.end()) {
+  // Requires: caller must hold unique_lock on shard.mutex
+  void UpdateLRU(Shard& shard, uint64_t file_number) {
+    auto lru_it = shard.lru_map.find(file_number);
+    if (lru_it != shard.lru_map.end()) {
       // Already in LRU list - move to front
-      lru_list_.splice(lru_list_.begin(), lru_list_, lru_it->second);
-      // Iterator is still valid, no need to update lru_map_
+      shard.lru_list.splice(shard.lru_list.begin(), shard.lru_list, lru_it->second);
+      // Iterator is still valid, no need to update lru_map
     } else {
       // Not in LRU list - add to front
-      lru_list_.push_front(file_number);
-      lru_map_[file_number] = lru_list_.begin();
+      shard.lru_list.push_front(file_number);
+      shard.lru_map[file_number] = shard.lru_list.begin();
     }
   }
   
   // Evict one LRU entry (O(1) operation)
-  // Requires: caller must hold lock on cache_mutex_
+  // Requires: caller must hold unique_lock on shard.mutex
   // Note: Removing from cache doesn't immediately delete CacheEntry because
   // shared_ptr ensures existing references remain valid until released
-  void EvictLRUOne(Stats* stats) {
-    if (lru_list_.empty()) return;
+  void EvictLRUOne(Shard& shard, Stats* stats) {
+    if (shard.lru_list.empty()) return;
     
     // Back of list is LRU
-    uint64_t lru_file_number = lru_list_.back();
-    lru_list_.pop_back();
-    lru_map_.erase(lru_file_number);
+    uint64_t lru_file_number = shard.lru_list.back();
+    shard.lru_list.pop_back();
+    shard.lru_map.erase(lru_file_number);
     
     // Remove from cache
     // Note: shared_ptr ensures existing references remain valid until released
-    auto cache_it = cache_.find(lru_file_number);
-    if (cache_it != cache_.end()) {
-      cache_.erase(cache_it);
+    auto cache_it = shard.cache.find(lru_file_number);
+    if (cache_it != shard.cache.end()) {
+      shard.cache.erase(cache_it);
       if (stats) stats->evictions++;
     }
   }
 
-  mutable std::mutex cache_mutex_;
-  std::unordered_map<uint64_t, std::shared_ptr<CacheEntry>> cache_;
-  std::unordered_map<uint64_t, std::shared_ptr<InflightOpen>> inflight_;
-  std::list<uint64_t> lru_list_;  // Front = MRU, Back = LRU
-  std::unordered_map<uint64_t, std::list<uint64_t>::iterator> lru_map_;
+  std::array<std::unique_ptr<Shard>, N_SHARDS> shards_;
   size_t max_size_;
 };
 
@@ -608,18 +648,36 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
     
     const ROCKSDB_NAMESPACE::Slice user_key(req.user_key());
     
+    // total_candidates: 요청된 전체 candidate 파일 수
+    uint64_t total_candidates = req.sst_file_numbers_size();
+    resp->set_total_candidates(total_candidates);
+    
     if (key_req_id <= 10 || key_req_id % 100 == 0) {
       std::cerr << "[INFO] ProcessKeyRequest #" << key_req_id 
                 << ": key_len=" << user_key.size() 
-                << ", sst_count=" << req.sst_file_numbers_size() << std::flush << std::endl;
+                << ", sst_count=" << total_candidates << std::flush << std::endl;
     }
 
+    // checked_count: 실제로 검사한 파일 수 (성공적으로 처리한 파일 수)
+    uint64_t checked_count = 0;
+    
     for (uint64_t file_number : req.sst_file_numbers()) {
       bool may_match = CheckKeyInSST(user_key, file_number);
+      checked_count++;  // CheckKeyInSST 호출 시도 (성공/실패 무관)
+      
       if (may_match) {
         resp->add_may_match_sst_file_numbers(file_number);
       }
     }
+    
+    // checked_count 설정
+    resp->set_checked_count(checked_count);
+    
+    // complete: 모든 candidate 파일을 검사했는지 여부
+    // 정상적으로 모든 파일을 검사했다면 true
+    // (현재는 항상 true, 나중에 timeout/error 처리 시 false 가능)
+    bool complete = (checked_count == total_candidates);
+    resp->set_complete(complete);
     
     // 샘플링 로그: key hex, 입력 sst_file_numbers, 출력 may_match_file_numbers
     // may_match_count > 0일 때만 출력 (확인을 수월하게 하기 위해)
