@@ -21,13 +21,18 @@ $CXX -std=c++20 -DROCKSDB_PLATFORM_POSIX -DOS_LINUX -I. -I./include -Itools -c t
 
 # 3. bloomd 링크
 echo "3. Linking bloomd..."
-# RocksDB 라이브러리가 있으면 사용, 없으면 gRPC/protobuf만 링크
+# RocksDB 라이브러리 찾기: 현재 디렉토리 -> 시스템 라이브러리
 LIB_OPTION=""
 if ls librocksdb*.a 2>/dev/null | head -1 | grep -q .; then
     LIB_FILE=$(ls librocksdb*.a 2>/dev/null | head -1)
     LIB_OPTION="$LIB_FILE"
+    echo "   Using local RocksDB library: $LIB_FILE"
 elif ls librocksdb*.so 2>/dev/null | head -1 | grep -q .; then
     LIB_OPTION="-L. -lrocksdb"
+    echo "   Using local RocksDB shared library"
+elif [ -f /usr/lib/x86_64-linux-gnu/librocksdb.so ]; then
+    LIB_OPTION="-lrocksdb"
+    echo "   Using system RocksDB library: /usr/lib/x86_64-linux-gnu/librocksdb.so"
 else
     echo "Warning: RocksDB library not found. Building without it..."
 fi

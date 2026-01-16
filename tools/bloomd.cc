@@ -11,9 +11,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <future>
 #include <iostream>
+#include <list>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -208,31 +211,80 @@ class TableReaderCache {
     }
   };
 
+  // Inflight open tracking for deduplication
+  struct InflightOpen {
+    std::promise<std::shared_ptr<CacheEntry>> promise;
+    std::shared_future<std::shared_ptr<CacheEntry>> future;
+    
+    InflightOpen() : promise(), future(promise.get_future().share()) {}
+  };
+
   explicit TableReaderCache(size_t max_size) : max_size_(max_size) {}
 
   // Get or create TableReader for SST file (by file_number)
   // Returns nullptr on error (safe to treat as may_match=true)
-  CacheEntry* GetOrOpen(uint64_t file_number,
-                        const ROCKSDB_NAMESPACE::Options& options,
-                        Stats* stats, std::mutex* log_mutex, std::atomic<size_t>* open_count) {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    
-    // Check cache first (by file_number)
-    auto it = cache_.find(file_number);
-    if (it != cache_.end()) {
-      // Cache hit - update last_access and return
-      std::lock_guard<std::mutex> entry_lock(it->second->mutex);
-      it->second->last_access = std::chrono::steady_clock::now();
-      if (stats) stats->cache_hits++;
-      return it->second.get();
+  std::shared_ptr<CacheEntry> GetOrOpen(uint64_t file_number,
+                                        const ROCKSDB_NAMESPACE::Options& options,
+                                        Stats* stats, std::mutex* log_mutex, std::atomic<size_t>* open_count) {
+    // Phase A: Check cache hit under lock (short duration)
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex_);
+      
+      // Check cache first (by file_number)
+      auto it = cache_.find(file_number);
+      if (it != cache_.end()) {
+        // Cache hit - update LRU and return
+        UpdateLRU(file_number);
+        if (stats) stats->cache_hits++;
+        return it->second;
+      }
     }
 
     // Cache miss - need to open file
     if (stats) stats->cache_misses++;
     
-    // If cache is full, evict LRU entry
-    if (cache_.size() >= max_size_) {
-      EvictLRU(stats);
+    // Phase A (continued): Check inflight and register if needed
+    std::shared_ptr<InflightOpen> inflight;
+    bool is_waiting = false;
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex_);
+      
+      // Double-check cache (might have been inserted by another thread)
+      auto it = cache_.find(file_number);
+      if (it != cache_.end()) {
+        UpdateLRU(file_number);
+        if (stats) stats->cache_hits++;
+        return it->second;
+      }
+      
+      // Check if another thread is already opening this file
+      auto inflight_it = inflight_.find(file_number);
+      if (inflight_it != inflight_.end()) {
+        // Another thread is opening - wait for result
+        inflight = inflight_it->second;
+        is_waiting = true;
+      } else {
+        // We are the first thread to open this file - register inflight
+        inflight = std::make_shared<InflightOpen>();
+        inflight_[file_number] = inflight;
+        
+        // If cache is full, evict LRU entry before opening
+        if (cache_.size() >= max_size_) {
+          EvictLRUOne(stats);
+        }
+      }
+      // Lock released here - proceed to Phase B
+    }
+    
+    // If another thread is opening, wait for result
+    if (is_waiting && inflight) {
+      try {
+        std::shared_ptr<CacheEntry> result = inflight->future.get();
+        return result;
+      } catch (...) {
+        // Promise was broken (shouldn't happen, but handle gracefully)
+        return nullptr;
+      }
     }
 
     // Open SST file directly using BlockBasedTable
@@ -265,7 +317,7 @@ class TableReaderCache {
     if (actual_path.empty() || file_size == 0) {
       // TryOpenSstPath failed to find any matching file
       if (stats) stats->open_fail_getfilesize++;
-      // 샘플 로그 (초기 50회 + 매 1000회)
+      // 샘플 로그 (초기 50회 + 매 1000회) - 락 밖에서
       if (open_id <= 50 || open_id % 1000 == 0) {
         std::lock_guard<std::mutex> log_lock(*log_mutex);
         std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
@@ -273,13 +325,19 @@ class TableReaderCache {
         std::cerr << "[SAMPLE]   file_number: " << file_number << std::endl;
         std::cerr << "[SAMPLE]   actual_path: " << (actual_path.empty() ? "(empty)" : actual_path) << std::endl;
       }
+      // Clean up inflight entry on failure
+      {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        inflight_.erase(file_number);
+        inflight->promise.set_value(nullptr);
+      }
       return nullptr;
     }
 
     ROCKSDB_NAMESPACE::IOStatus s = fs->NewRandomAccessFile(actual_path, fopts, &file, nullptr);
     if (!s.ok()) {
       if (stats) stats->open_fail_newfile++;
-      // 샘플 로그
+      // 샘플 로그 - 락 밖에서
       if (open_id <= 50 || open_id % 1000 == 0) {
         std::lock_guard<std::mutex> log_lock(*log_mutex);
         std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
@@ -288,6 +346,12 @@ class TableReaderCache {
         std::cerr << "[SAMPLE]   actual_path: " << actual_path << std::endl;
         std::cerr << "[SAMPLE]   file_size: " << file_size << std::endl;
         std::cerr << "[SAMPLE]   error: " << s.ToString() << std::endl;
+      }
+      // Clean up inflight entry on failure
+      {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        inflight_.erase(file_number);
+        inflight->promise.set_value(nullptr);
       }
       return nullptr;
     }
@@ -320,7 +384,7 @@ class TableReaderCache {
     
     if (!table_status.ok() || !table_reader) {
       if (stats) stats->open_fail_newreader++;
-      // 샘플 로그
+      // 샘플 로그 - 락 밖에서
       if (open_id <= 50 || open_id % 1000 == 0) {
         std::lock_guard<std::mutex> log_lock(*log_mutex);
         std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
@@ -329,6 +393,12 @@ class TableReaderCache {
         std::cerr << "[SAMPLE]   actual_path: " << actual_path << std::endl;
         std::cerr << "[SAMPLE]   file_size: " << file_size << std::endl;
         std::cerr << "[SAMPLE]   status: " << table_status.ToString() << std::endl;
+      }
+      // Clean up inflight entry on failure
+      {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        inflight_.erase(file_number);
+        inflight->promise.set_value(nullptr);
       }
       return nullptr;
     }
@@ -385,33 +455,78 @@ class TableReaderCache {
     }
 
     entry->reader = std::move(table_reader);
-    CacheEntry* entry_ptr = entry.get();
-    // Cache by file_number
-    cache_[file_number] = std::move(entry);
+    std::shared_ptr<CacheEntry> entry_ptr = std::move(entry);
+    
+    // Phase C: Insert into cache under lock (short duration)
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex_);
+      
+      // Double-check cache (might have been inserted by another thread during Phase B)
+      auto it = cache_.find(file_number);
+      if (it != cache_.end()) {
+        // Another thread already inserted - use existing entry
+        UpdateLRU(file_number);
+        if (stats) stats->cache_hits++;
+        // Clean up inflight entry
+        inflight_.erase(file_number);
+        inflight->promise.set_value(it->second);
+        return it->second;
+      }
+      
+      // Cache by file_number and update LRU
+      cache_[file_number] = entry_ptr;
+      UpdateLRU(file_number);
+      
+      // Clean up inflight entry and notify waiters
+      inflight_.erase(file_number);
+      inflight->promise.set_value(entry_ptr);
+    }
+    
     return entry_ptr;
   }
 
  private:
-  void EvictLRU(Stats* stats) {
-    if (cache_.empty()) return;
-
-    auto oldest_it = cache_.begin();
-    auto oldest_time = oldest_it->second->last_access;
-
-    for (auto it = cache_.begin(); it != cache_.end(); ++it) {
-      std::lock_guard<std::mutex> entry_lock(it->second->mutex);
-      if (it->second->last_access < oldest_time) {
-        oldest_time = it->second->last_access;
-        oldest_it = it;
-      }
+  // Update LRU list: move file_number to front (MRU)
+  // Requires: caller must hold lock on cache_mutex_
+  void UpdateLRU(uint64_t file_number) {
+    auto lru_it = lru_map_.find(file_number);
+    if (lru_it != lru_map_.end()) {
+      // Already in LRU list - move to front
+      lru_list_.splice(lru_list_.begin(), lru_list_, lru_it->second);
+      // Iterator is still valid, no need to update lru_map_
+    } else {
+      // Not in LRU list - add to front
+      lru_list_.push_front(file_number);
+      lru_map_[file_number] = lru_list_.begin();
     }
-
-    cache_.erase(oldest_it);
-    if (stats) stats->evictions++;
+  }
+  
+  // Evict one LRU entry (O(1) operation)
+  // Requires: caller must hold lock on cache_mutex_
+  // Note: Removing from cache doesn't immediately delete CacheEntry because
+  // shared_ptr ensures existing references remain valid until released
+  void EvictLRUOne(Stats* stats) {
+    if (lru_list_.empty()) return;
+    
+    // Back of list is LRU
+    uint64_t lru_file_number = lru_list_.back();
+    lru_list_.pop_back();
+    lru_map_.erase(lru_file_number);
+    
+    // Remove from cache
+    // Note: shared_ptr ensures existing references remain valid until released
+    auto cache_it = cache_.find(lru_file_number);
+    if (cache_it != cache_.end()) {
+      cache_.erase(cache_it);
+      if (stats) stats->evictions++;
+    }
   }
 
-  std::mutex cache_mutex_;
-  std::unordered_map<uint64_t, std::unique_ptr<CacheEntry>> cache_;
+  mutable std::mutex cache_mutex_;
+  std::unordered_map<uint64_t, std::shared_ptr<CacheEntry>> cache_;
+  std::unordered_map<uint64_t, std::shared_ptr<InflightOpen>> inflight_;
+  std::list<uint64_t> lru_list_;  // Front = MRU, Back = LRU
+  std::unordered_map<uint64_t, std::list<uint64_t>::iterator> lru_map_;
   size_t max_size_;
 };
 
@@ -573,8 +688,8 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
                 << " in SST file_number=" << file_number << std::flush << std::endl;
     }
     
-    // Get or open TableReader
-    TableReaderCache::CacheEntry* entry = cache_.GetOrOpen(file_number, rocksdb_options_, &stats_, &log_mutex_, &open_count_);
+    // Get or open TableReader - returns shared_ptr to guarantee lifetime
+    std::shared_ptr<TableReaderCache::CacheEntry> entry = cache_.GetOrOpen(file_number, rocksdb_options_, &stats_, &log_mutex_, &open_count_);
     if (!entry) {
       // Error opening file - safe to return true (may_match)
       stats_.RecordReason(CheckReason::OPEN_FAIL);
@@ -587,6 +702,7 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
     }
 
     // Lock entry for thread-safe access
+    // Note: entry lifetime is guaranteed by shared_ptr even if evicted from cache
     std::lock_guard<std::mutex> lock(entry->mutex);
     entry->last_access = std::chrono::steady_clock::now();
 
