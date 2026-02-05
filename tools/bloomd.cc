@@ -11,8 +11,10 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <chrono>
 #include <future>
+#include <iomanip>
 #include <iostream>
 #include <list>
 #include <memory>
@@ -113,7 +115,7 @@ struct Stats {
     }
   }
   
-  void PrintStats(std::mutex& log_mutex, size_t total_opens) {
+  void PrintStats(std::mutex& log_mutex, size_t total_opens, size_t active_rpcs) {
     std::lock_guard<std::mutex> lock(log_mutex);
     
     size_t hits = cache_hits.load();
@@ -126,6 +128,7 @@ struct Stats {
               << " (" << hits << "/" << total_accesses << ")" << std::endl;
     std::cerr << "[STATS] evictions: " << evictions_count << std::endl;
     std::cerr << "[STATS] NewTableReader(open): " << total_opens << std::endl;
+    std::cerr << "[STATS] active_rpcs: " << active_rpcs << std::endl;
   }
 };
 
@@ -600,8 +603,17 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
   grpc::Status Check(grpc::ServerContext* /*context*/,
                      const BatchRequest* request,
                      BatchResponse* response) override {
+    // Active RPC 카운터 증가
+    size_t active_count = active_rpc_count_.fetch_add(1) + 1;
+    
+    // Handler 시작 시간 측정
+    auto handler_start = std::chrono::steady_clock::now();
+    
     static std::atomic<size_t> request_count{0};
     size_t req_id = request_count.fetch_add(1) + 1;
+    
+    // Total RPC count 증가 (QPS 계산용)
+    total_rpc_count_.fetch_add(1);
     
     if (req_id <= 10 || req_id % 100 == 0) {
       std::cerr << "[INFO] Check request #" << req_id 
@@ -618,10 +630,19 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
       *response->add_resps() = key_resp;
     }
     
+    // Handler 종료 시간 측정
+    auto handler_end = std::chrono::steady_clock::now();
+    auto handler_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        handler_end - handler_start).count();
+    
     if (req_id <= 10 || req_id % 100 == 0) {
       std::cerr << "[INFO] Check request #" << req_id << " completed" << std::flush << std::endl;
       std::cerr << "[INFO] Check request #" << req_id 
                 << " response size: " << response->resps_size() << std::flush << std::endl;
+      std::cerr << "[PERF] Check request #" << req_id 
+                << " server_handler_us=" << handler_us 
+                << " active_rpcs=" << active_count
+                << " (handler processing time)" << std::flush << std::endl;
     }
     
     // 응답 전송 전 로그 (처음 10개)
@@ -632,6 +653,9 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
 
     grpc::Status status = grpc::Status::OK;
     
+    // Active RPC 카운터 감소
+    active_rpc_count_.fetch_sub(1);
+    
     // 응답 반환 후 로그 (처음 10개)
     if (req_id <= 10) {
       std::cerr << "[INFO] Check request #" << req_id 
@@ -641,8 +665,40 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
     return status;
   }
 
+  grpc::Status Noop(grpc::ServerContext* /*context*/,
+                     const NoopRequest* /*request*/,
+                     NoopResponse* response) override {
+    // Get monotonic timestamp in nanoseconds
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_ns = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + 
+                      static_cast<uint64_t>(ts.tv_nsec);
+    
+    response->set_server_ts_ns(now_ns);
+    
+    // Optional: very sparse logging (1/100000 sample rate)
+    static std::atomic<size_t> noop_count{0};
+    size_t count = noop_count.fetch_add(1) + 1;
+    
+    // Check if logging is enabled via environment variable
+    static bool noop_log_enabled = []() {
+      const char* env = std::getenv("BLOOMD_NOOP_LOG");
+      return env && std::string(env) == "1";
+    }();
+    
+    if (noop_log_enabled && count % 100000 == 0) {
+      std::cerr << "[NOOP] Noop request #" << count 
+                << " server_ts_ns=" << now_ns << std::flush << std::endl;
+    }
+    
+    return grpc::Status::OK;
+  }
+
  private:
   void ProcessKeyRequest(const KeyRequest& req, KeyResponse* resp) {
+    // ProcessKeyRequest 시작 시간 측정
+    auto process_start = std::chrono::steady_clock::now();
+    
     static std::atomic<size_t> key_request_count{0};
     size_t key_req_id = key_request_count.fetch_add(1) + 1;
     
@@ -660,9 +716,16 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
 
     // checked_count: 실제로 검사한 파일 수 (성공적으로 처리한 파일 수)
     uint64_t checked_count = 0;
+    uint64_t total_check_us = 0;  // 모든 CheckKeyInSST 시간 합계
     
     for (uint64_t file_number : req.sst_file_numbers()) {
+      auto sst_check_start = std::chrono::steady_clock::now();
       bool may_match = CheckKeyInSST(user_key, file_number);
+      auto sst_check_end = std::chrono::steady_clock::now();
+      auto sst_check_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          sst_check_end - sst_check_start).count();
+      total_check_us += sst_check_us;
+      
       checked_count++;  // CheckKeyInSST 호출 시도 (성공/실패 무관)
       
       if (may_match) {
@@ -678,6 +741,23 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
     // (현재는 항상 true, 나중에 timeout/error 처리 시 false 가능)
     bool complete = (checked_count == total_candidates);
     resp->set_complete(complete);
+    
+    // ProcessKeyRequest 종료 시간 측정
+    auto process_end = std::chrono::steady_clock::now();
+    auto process_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        process_end - process_start).count();
+    
+    if (key_req_id <= 10 || key_req_id % 100 == 0) {
+      std::lock_guard<std::mutex> log_lock(log_mutex_);
+      uint64_t overhead_us = process_us - total_check_us;
+      std::cerr << "[PERF] ProcessKeyRequest #" << key_req_id 
+                << " process_us=" << process_us 
+                << " total_check_us=" << total_check_us
+                << " overhead_us=" << overhead_us
+                << " sst_count=" << total_candidates
+                << " avg_check_us=" << (total_candidates > 0 ? total_check_us / total_candidates : 0)
+                << " (per-key processing time)" << std::flush << std::endl;
+    }
     
     // 샘플링 로그: key hex, 입력 sst_file_numbers, 출력 may_match_file_numbers
     // may_match_count > 0일 때만 출력 (확인을 수월하게 하기 위해)
@@ -737,6 +817,9 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
 
   bool CheckKeyInSST(const ROCKSDB_NAMESPACE::Slice& user_key,
                      uint64_t file_number) {
+    // CheckKeyInSST 시작 시간 측정
+    auto check_start = std::chrono::steady_clock::now();
+    
     static std::atomic<size_t> call_count{0};
     size_t call_id = call_count.fetch_add(1) + 1;
     
@@ -747,7 +830,11 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
     }
     
     // Get or open TableReader - returns shared_ptr to guarantee lifetime
+    auto get_entry_start = std::chrono::steady_clock::now();
     std::shared_ptr<TableReaderCache::CacheEntry> entry = cache_.GetOrOpen(file_number, rocksdb_options_, &stats_, &log_mutex_, &open_count_);
+    auto get_entry_end = std::chrono::steady_clock::now();
+    auto get_entry_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        get_entry_end - get_entry_start).count();
     if (!entry) {
       // Error opening file - safe to return true (may_match)
       stats_.RecordReason(CheckReason::OPEN_FAIL);
@@ -929,7 +1016,31 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
       }
     } catch (...) {
       stats_.RecordReason(CheckReason::KEYMAYMATCH_EXCEPTION);
+      // CheckKeyInSST 종료 시간 측정 (exception case)
+      auto check_end = std::chrono::steady_clock::now();
+      auto check_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          check_end - check_start).count();
+      if (call_id <= 10 || call_id % 1000 == 0) {
+        std::lock_guard<std::mutex> log_lock(log_mutex_);
+        std::cerr << "[PERF] CheckKeyInSST #" << call_id 
+                  << " check_us=" << check_us 
+                  << " get_entry_us=" << get_entry_us 
+                  << " (exception)" << std::flush << std::endl;
+      }
       return true;  // Safe default on exception
+    }
+    
+    // CheckKeyInSST 종료 시간 측정
+    auto check_end = std::chrono::steady_clock::now();
+    auto check_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        check_end - check_start).count();
+    
+    if (call_id <= 10 || call_id % 1000 == 0) {
+      std::lock_guard<std::mutex> log_lock(log_mutex_);
+      std::cerr << "[PERF] CheckKeyInSST #" << call_id 
+                << " check_us=" << check_us 
+                << " get_entry_us=" << get_entry_us 
+                << " (per-SST check time)" << std::flush << std::endl;
     }
     
     return may_match;
@@ -940,6 +1051,8 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
   Stats stats_;
   std::mutex log_mutex_;
   std::atomic<size_t> open_count_{0};
+  std::atomic<size_t> active_rpc_count_{0};  // 동시 처리 중인 RPC 개수
+  std::atomic<size_t> total_rpc_count_{0};   // 총 처리된 RPC 개수 (QPS 계산용)
   std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock_;
   std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs_;
   
@@ -953,9 +1066,47 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
   
   void StartStatsThread() {
     stats_thread_ = std::thread([this]() {
+      size_t last_total_rpc = 0;
+      auto last_time = std::chrono::steady_clock::now();
+      
       while (!stop_stats_thread_.load()) {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
-        stats_.PrintStats(log_mutex_, open_count_.load());
+        // 1초마다 QPS 계산
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        
+        auto now = std::chrono::steady_clock::now();
+        size_t current_total_rpc = total_rpc_count_.load();
+        size_t current_active_rpc = active_rpc_count_.load();
+        
+        // Delta 계산
+        size_t delta_rpc = current_total_rpc - last_total_rpc;
+        auto delta_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_time).count();
+        
+        // QPS 계산 (delta_rpc / delta_time_seconds)
+        double qps = 0.0;
+        if (delta_time > 0) {
+          qps = (delta_rpc * 1000.0) / delta_time;
+        }
+        
+        // QPS 로그 출력 (매 1초)
+        {
+          std::lock_guard<std::mutex> log_lock(log_mutex_);
+          std::cerr << "[QPS] rpc_qps=" << static_cast<size_t>(qps)
+                    << " active_rpcs=" << current_active_rpc
+                    << " total_rpcs=" << current_total_rpc
+                    << " (qps=" << std::fixed << std::setprecision(1) << qps << ")"
+                    << std::endl;
+        }
+        
+        last_total_rpc = current_total_rpc;
+        last_time = now;
+        
+        // 5초마다 상세 통계 출력
+        static int detail_counter = 0;
+        if (++detail_counter >= 5) {
+          detail_counter = 0;
+          stats_.PrintStats(log_mutex_, open_count_.load(), current_active_rpc);
+        }
       }
     });
   }
@@ -981,16 +1132,36 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
   builder.RegisterService(&service);
   
-  // 스레드 풀 설정: 동시 요청 처리를 위한 completion queue 스레드 수
-  // 
-  // gRPC 기본 동작:
-  // - 비동기 completion queue 사용
-  // - 여러 요청이 동시에 들어오면 자동으로 병렬 처리
-  // - 기본 스레드 수: CPU 코어 수 (시스템 리소스에 따라 자동 조정)
-  //
-  // 명시적으로 스레드 개수를 제한하려면:
-  // builder.SetResourceQuota(grpc::ResourceQuota().SetMaxThreads(num_threads));
-  // 또는 completion queue를 직접 관리하여 스레드 수 제어 가능
+  // ============================================
+  // gRPC 서버 성능 최적화 설정
+  // ============================================
+  
+  // 1. 스레드 풀 크기 증가 (SyncServer의 기본 제한 해제)
+  // 기본값: CPU 코어 수 또는 고정값 (보통 16-32)
+  // 문제: 클라이언트가 64 threads여도 서버는 16개만 처리
+  grpc::ResourceQuota quota;
+  quota.SetMaxThreads(128);  // 충분히 크게 설정 (필요시 조정)
+  builder.SetResourceQuota(quota);
+  
+  // 2. HTTP/2 stream concurrency 증가 (connection당)
+  // 기본값: 100
+  // 문제: connection당 동시 stream 수 제한
+  builder.AddChannelArgument(GRPC_ARG_MAX_CONCURRENT_STREAMS, 1000);
+  
+  // 3. 메시지 크기 제한 (필요시)
+  builder.SetMaxReceiveMessageSize(4 * 1024 * 1024);  // 4MB
+  builder.SetMaxSendMessageSize(4 * 1024 * 1024);    // 4MB
+  
+  // 4. Connection 관리
+  builder.AddChannelArgument(GRPC_ARG_MAX_CONNECTION_IDLE_MS, 300000);  // 5분
+  builder.AddChannelArgument(GRPC_ARG_MAX_CONNECTION_AGE_MS, 3600000);   // 1시간
+  
+  // ============================================
+  // 현재 서버 모델: SyncServer
+  // - 각 RPC는 별도 스레드에서 실행
+  // - gRPC 내부 스레드 풀 사용
+  // - CompletionQueue는 내부적으로 자동 관리
+  // ============================================
   
   std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
   std::cout << "BloomCheck server listening on " << server_address << std::endl;

@@ -21,6 +21,14 @@ message BatchResponse {
   repeated KeyResponse resps = 1;
 }
 
+message NoopRequest {
+}
+
+message NoopResponse {
+  optional uint64 server_ts_ns = 1;
+}
+
 service BloomCheck {
   rpc Check(BatchRequest) returns (BatchResponse);
+  rpc Noop(NoopRequest) returns (NoopResponse);
 }
