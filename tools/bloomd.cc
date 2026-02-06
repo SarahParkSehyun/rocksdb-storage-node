@@ -13,12 +13,14 @@
 #include <cstring>
 #include <ctime>
 #include <chrono>
+#include <condition_variable>
 #include <future>
 #include <iomanip>
 #include <iostream>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -573,125 +575,176 @@ class TableReaderCache {
   size_t max_size_;
 };
 
-// BloomCheckServiceImpl implements the gRPC service
-class BloomCheckServiceImpl final : public BloomCheck::Service {
+// Base class for all CallData (for polymorphic Proceed() call)
+class CallDataBase {
  public:
-  explicit BloomCheckServiceImpl(size_t cache_size)
-      : cache_(cache_size), rocksdb_options_(),
-        clock_(ROCKSDB_NAMESPACE::SystemClock::Default()),
-        fs_(ROCKSDB_NAMESPACE::Env::Default()->GetFileSystem()) {
-    // Configure RocksDB options for filter-only access
-    rocksdb_options_.env = ROCKSDB_NAMESPACE::Env::Default();
-    // FileSystem lifetime is maintained by fs_ member
-    // ImmutableOptions constructor will set fs from env->GetFileSystem()
+  virtual ~CallDataBase() = default;
+  virtual void Proceed() = 0;
+};
+
+// Forward declaration
+class CheckCallData;
+
+// Per-CQ worker queue (lock-free structure)
+// Each CQ has its own worker queue and dedicated worker threads
+class PerCQWorkerQueue {
+ public:
+  struct WorkItem {
+    CheckCallData* call_data;
+    BatchRequest request;
+    std::chrono::steady_clock::time_point handler_start;
+    size_t req_id;
+    size_t active_count;
     
-    // Set BlockBasedTableOptions with filter_policy
-    ROCKSDB_NAMESPACE::BlockBasedTableOptions bbto;
-    bbto.filter_policy.reset(ROCKSDB_NAMESPACE::NewBloomFilterPolicy(10, false));
-    bbto.whole_key_filtering = true;
-    bbto.partition_filters = true;
-    rocksdb_options_.table_factory.reset(
-        ROCKSDB_NAMESPACE::NewBlockBasedTableFactory(bbto));
-    
-    StartStatsThread();
+    WorkItem(CheckCallData* cd, const BatchRequest& req,
+             std::chrono::steady_clock::time_point start,
+             size_t id, size_t active)
+        : call_data(cd), request(req), handler_start(start),
+          req_id(id), active_count(active) {}
+  };
+  
+  explicit PerCQWorkerQueue(size_t num_workers)
+      : num_workers_(num_workers), shutdown_(false) {
+    for (size_t i = 0; i < num_workers_; i++) {
+      workers_.emplace_back([this]() { WorkerLoop(); });
+    }
   }
   
-  ~BloomCheckServiceImpl() {
-    StopStatsThread();
+  ~PerCQWorkerQueue() {
+    Shutdown();
+  }
+  
+  // Lock-free enqueue using atomic operations
+  void Enqueue(WorkItem item) {
+    // Use atomic operations for lock-free enqueue
+    // For simplicity, we use a lock here but can be optimized with lock-free queue
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      work_queue_.push(std::move(item));
+    }
+    queue_cv_.notify_one();
+  }
+  
+  void Shutdown() {
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      shutdown_ = true;
+    }
+    queue_cv_.notify_all();
+    
+    for (auto& worker : workers_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+  }
+  
+ private:
+  void WorkerLoop();
+  
+  size_t num_workers_;
+  std::atomic<bool> shutdown_;
+  std::queue<WorkItem> work_queue_;
+  std::mutex queue_mutex_;
+  std::condition_variable queue_cv_;
+  std::vector<std::thread> workers_;
+};
+
+// Per-RPC state machine for Check RPC
+class CheckCallData : public CallDataBase {
+ public:
+  CheckCallData(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* cq,
+                TableReaderCache* cache, ROCKSDB_NAMESPACE::Options* rocksdb_options,
+                Stats* stats, std::mutex* log_mutex, std::atomic<size_t>* open_count,
+                std::atomic<size_t>* active_rpc_count, std::atomic<size_t>* total_rpc_count,
+                std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock,
+                std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs,
+                PerCQWorkerQueue* worker_queue)
+      : service_(service), cq_(cq), cache_(cache), rocksdb_options_(rocksdb_options),
+        stats_(stats), log_mutex_(log_mutex), open_count_(open_count),
+        active_rpc_count_(active_rpc_count), total_rpc_count_(total_rpc_count),
+        clock_(clock), fs_(fs), worker_queue_(worker_queue),
+        responder_(&ctx_), status_(CREATE) {
+    Proceed();
   }
 
-  grpc::Status Check(grpc::ServerContext* /*context*/,
-                     const BatchRequest* request,
-                     BatchResponse* response) override {
-    // Active RPC 카운터 증가
-    size_t active_count = active_rpc_count_.fetch_add(1) + 1;
-    
-    // Handler 시작 시간 측정
-    auto handler_start = std::chrono::steady_clock::now();
-    
-    static std::atomic<size_t> request_count{0};
-    size_t req_id = request_count.fetch_add(1) + 1;
-    
-    // Total RPC count 증가 (QPS 계산용)
-    total_rpc_count_.fetch_add(1);
-    
-    if (req_id <= 10 || req_id % 100 == 0) {
-      std::cerr << "[INFO] Check request #" << req_id 
-                << " received: " << request->reqs_size() << " key request(s)" << std::flush << std::endl;
+  void Proceed() override {
+    if (status_ == CREATE) {
+      // ACCEPT: 새로운 RPC 요청 수락
+      status_ = PROCESS;
+      service_->RequestCheck(&ctx_, &request_, &responder_, cq_, cq_, this);
+      
+      // Active RPC 카운터 증가
+      active_count_ = active_rpc_count_->fetch_add(1) + 1;
+      total_rpc_count_->fetch_add(1);
+      
+      handler_start_ = std::chrono::steady_clock::now();
+      req_id_ = request_count_.fetch_add(1) + 1;
+      
+      if (req_id_ <= 10 || req_id_ % 100 == 0) {
+        std::cerr << "[INFO] Check request #" << req_id_ 
+                  << " received: " << request_.reqs_size() << " key request(s)" << std::flush << std::endl;
+      }
+    } else if (status_ == PROCESS) {
+      // READ 완료, PROCESS 시작
+      // 새로운 CallData를 생성하여 다음 요청을 받을 준비
+      new CheckCallData(service_, cq_, cache_, rocksdb_options_, stats_, log_mutex_,
+                       open_count_, active_rpc_count_, total_rpc_count_, clock_, fs_,
+                       worker_queue_);
+      
+      // CQ poller thread: Enqueue work to per-CQ worker queue and return immediately
+      // DO NOT perform bloom filter checks here - that happens in worker thread
+      worker_queue_->Enqueue(PerCQWorkerQueue::WorkItem(
+          this, request_, handler_start_, req_id_, active_count_));
+      
+      // Return immediately - worker thread will call Finish() directly
+      // No need for WORK_DONE state or Alarm
+    } else {
+      // FINISH 완료
+      GPR_ASSERT(status_ == FINISH);
+      delete this;
     }
-    
-    response->clear_resps();
-    response->mutable_resps()->Reserve(request->reqs_size());
+  }
+  
+  // Called from worker thread - performs actual bloom filter processing
+  // Worker thread directly calls Finish() - no Alarm needed
+  void ProcessInWorkerThread(PerCQWorkerQueue::WorkItem item) {
+    // This runs in worker thread, NOT in CQ poller thread
+    response_.clear_resps();
+    response_.mutable_resps()->Reserve(item.request.reqs_size());
 
-    // Process each key request
-    for (const auto& key_req : request->reqs()) {
+    // Process each key request (bloom filter checks happen here)
+    for (const auto& key_req : item.request.reqs()) {
       KeyResponse key_resp;
       ProcessKeyRequest(key_req, &key_resp);
-      *response->add_resps() = key_resp;
+      *response_.add_resps() = key_resp;
     }
     
     // Handler 종료 시간 측정
     auto handler_end = std::chrono::steady_clock::now();
     auto handler_us = std::chrono::duration_cast<std::chrono::microseconds>(
-        handler_end - handler_start).count();
+        handler_end - item.handler_start).count();
     
-    if (req_id <= 10 || req_id % 100 == 0) {
-      std::cerr << "[INFO] Check request #" << req_id << " completed" << std::flush << std::endl;
-      std::cerr << "[INFO] Check request #" << req_id 
-                << " response size: " << response->resps_size() << std::flush << std::endl;
-      std::cerr << "[PERF] Check request #" << req_id 
+    if (item.req_id <= 10 || item.req_id % 100 == 0) {
+      std::lock_guard<std::mutex> log_lock(*log_mutex_);
+      std::cerr << "[INFO] Check request #" << item.req_id << " completed" << std::flush << std::endl;
+      std::cerr << "[INFO] Check request #" << item.req_id 
+                << " response size: " << response_.resps_size() << std::flush << std::endl;
+      std::cerr << "[PERF] Check request #" << item.req_id 
                 << " server_handler_us=" << handler_us 
-                << " active_rpcs=" << active_count
+                << " active_rpcs=" << item.active_count
                 << " (handler processing time)" << std::flush << std::endl;
     }
     
-    // 응답 전송 전 로그 (처음 10개)
-    if (req_id <= 10) {
-      std::cerr << "[INFO] Check request #" << req_id 
-                << " about to return grpc::Status::OK" << std::flush << std::endl;
-    }
-
-    grpc::Status status = grpc::Status::OK;
+    // Worker thread directly calls Finish() - gRPC responder is thread-safe
+    // No need for Alarm or CQ notification
+    status_ = FINISH;
+    responder_.Finish(response_, grpc::Status::OK, this);
     
     // Active RPC 카운터 감소
-    active_rpc_count_.fetch_sub(1);
+    active_rpc_count_->fetch_sub(1);
     
-    // 응답 반환 후 로그 (처음 10개)
-    if (req_id <= 10) {
-      std::cerr << "[INFO] Check request #" << req_id 
-                << " returned grpc::Status::OK" << std::flush << std::endl;
-    }
-    
-    return status;
-  }
-
-  grpc::Status Noop(grpc::ServerContext* /*context*/,
-                     const NoopRequest* /*request*/,
-                     NoopResponse* response) override {
-    // Get monotonic timestamp in nanoseconds
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint64_t now_ns = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + 
-                      static_cast<uint64_t>(ts.tv_nsec);
-    
-    response->set_server_ts_ns(now_ns);
-    
-    // Optional: very sparse logging (1/100000 sample rate)
-    static std::atomic<size_t> noop_count{0};
-    size_t count = noop_count.fetch_add(1) + 1;
-    
-    // Check if logging is enabled via environment variable
-    static bool noop_log_enabled = []() {
-      const char* env = std::getenv("BLOOMD_NOOP_LOG");
-      return env && std::string(env) == "1";
-    }();
-    
-    if (noop_log_enabled && count % 100000 == 0) {
-      std::cerr << "[NOOP] Noop request #" << count 
-                << " server_ts_ns=" << now_ns << std::flush << std::endl;
-    }
-    
-    return grpc::Status::OK;
+    // Note: CallData will be deleted when FINISH event is processed by CQ poller
   }
 
  private:
@@ -737,8 +790,6 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
     resp->set_checked_count(checked_count);
     
     // complete: 모든 candidate 파일을 검사했는지 여부
-    // 정상적으로 모든 파일을 검사했다면 true
-    // (현재는 항상 true, 나중에 timeout/error 처리 시 false 가능)
     bool complete = (checked_count == total_candidates);
     resp->set_complete(complete);
     
@@ -748,7 +799,7 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
         process_end - process_start).count();
     
     if (key_req_id <= 10 || key_req_id % 100 == 0) {
-      std::lock_guard<std::mutex> log_lock(log_mutex_);
+      std::lock_guard<std::mutex> log_lock(*log_mutex_);
       uint64_t overhead_us = process_us - total_check_us;
       std::cerr << "[PERF] ProcessKeyRequest #" << key_req_id 
                 << " process_us=" << process_us 
@@ -758,179 +809,65 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
                 << " avg_check_us=" << (total_candidates > 0 ? total_check_us / total_candidates : 0)
                 << " (per-key processing time)" << std::flush << std::endl;
     }
-    
-    // 샘플링 로그: key hex, 입력 sst_file_numbers, 출력 may_match_file_numbers
-    // may_match_count > 0일 때만 출력 (확인을 수월하게 하기 위해)
-    size_t may_match_count = resp->may_match_sst_file_numbers_size();
-    bool should_log = (may_match_count > 0);
-    
-    // 디버깅: CheckKeyInSST가 true를 반환했는데도 추가되지 않는 경우 확인
-    if (key_req_id <= 50) {
-      std::lock_guard<std::mutex> log_lock(log_mutex_);
-      std::cerr << "[DEBUG] ProcessKeyRequest #" << key_req_id 
-                << " after loop: may_match_count=" << may_match_count 
-                << ", input_sst_count=" << req.sst_file_numbers_size() << std::endl;
-    }
-    
-    if (should_log) {
-      std::lock_guard<std::mutex> log_lock(log_mutex_);
-      
-      // key 앞 8바이트 hex (key가 8바이트 이상인 경우)
-      std::string key_hex_prefix;
-      if (user_key.size() >= 8) {
-        key_hex_prefix = ROCKSDB_NAMESPACE::Slice(user_key.data(), 8).ToString(true);
-      } else {
-        key_hex_prefix = ROCKSDB_NAMESPACE::Slice(user_key).ToString(true);
-      }
-      
-      // std::cerr << "[SAMPLE] ProcessKeyRequest #" << key_req_id << std::endl;
-      // std::cerr << "[SAMPLE]   key_hex_prefix: " << key_hex_prefix << std::endl;
-      // std::cerr << "[SAMPLE]   input_sst_paths_count: " << req.sst_paths_size() << std::endl;
-      // 
-      // // 입력 sst_paths 목록 (최대 10개까지만)
-      // size_t input_count = std::min(static_cast<size_t>(req.sst_paths_size()), size_t(10));
-      // for (size_t i = 0; i < input_count; i++) {
-      //   std::cerr << "[SAMPLE]   input_sst_paths[" << i << "]: " << req.sst_paths(i) << std::endl;
-      // }
-      // if (req.sst_paths_size() > 10) {
-      //   std::cerr << "[SAMPLE]   ... (" << (req.sst_paths_size() - 10) << " more input paths)" << std::endl;
-      // }
-      // 
-      // std::cerr << "[SAMPLE]   output_may_match_count: " << may_match_count << std::endl;
-      // 
-      // // 출력 may_match_paths 목록
-      // if (may_match_count > 0) {
-      //   for (size_t i = 0; i < may_match_count; i++) {
-      //     std::cerr << "[SAMPLE]   may_match_paths[" << i << "]: " << resp->may_match_sst_paths(i) << std::endl;
-      //   }
-      // } else {
-      //   std::cerr << "[SAMPLE]   may_match_paths: (none)" << std::endl;
-      // }
-    }
-    
-    if (key_req_id <= 10 || key_req_id % 100 == 0) {
-      std::cerr << "[INFO] ProcessKeyRequest #" << key_req_id 
-                << " completed: " << may_match_count 
-                << " may_match files" << std::flush << std::endl;
-    }
   }
 
-  bool CheckKeyInSST(const ROCKSDB_NAMESPACE::Slice& user_key,
-                     uint64_t file_number) {
+  bool CheckKeyInSST(const ROCKSDB_NAMESPACE::Slice& user_key, uint64_t file_number) {
     // CheckKeyInSST 시작 시간 측정
     auto check_start = std::chrono::steady_clock::now();
     
     static std::atomic<size_t> call_count{0};
     size_t call_id = call_count.fetch_add(1) + 1;
     
-    if (call_id <= 10) {
-      std::cerr << "[DEBUG] CheckKeyInSST #" << call_id 
-                << " called for key (hex) " << user_key.ToString(true) 
-                << " in SST file_number=" << file_number << std::flush << std::endl;
-    }
-    
     // Get or open TableReader - returns shared_ptr to guarantee lifetime
     auto get_entry_start = std::chrono::steady_clock::now();
-    std::shared_ptr<TableReaderCache::CacheEntry> entry = cache_.GetOrOpen(file_number, rocksdb_options_, &stats_, &log_mutex_, &open_count_);
+    std::shared_ptr<TableReaderCache::CacheEntry> entry = cache_->GetOrOpen(
+        file_number, *rocksdb_options_, stats_, log_mutex_, open_count_);
     auto get_entry_end = std::chrono::steady_clock::now();
     auto get_entry_us = std::chrono::duration_cast<std::chrono::microseconds>(
         get_entry_end - get_entry_start).count();
     if (!entry) {
-      // Error opening file - safe to return true (may_match)
-      stats_.RecordReason(CheckReason::OPEN_FAIL);
-      if (call_id <= 10) {
-        std::lock_guard<std::mutex> log_lock(log_mutex_);
-        std::cerr << "[DEBUG] CheckKeyInSST #" << call_id 
-                  << " failed to open SST file, returning true (reason=OPEN_FAIL)" << std::flush << std::endl;
-      }
+      stats_->RecordReason(CheckReason::OPEN_FAIL);
       return true;
     }
 
     // Lock entry for thread-safe access
-    // Note: entry lifetime is guaranteed by shared_ptr even if evicted from cache
     std::lock_guard<std::mutex> lock(entry->mutex);
     entry->last_access = std::chrono::steady_clock::now();
 
     ROCKSDB_NAMESPACE::TableReader* reader = entry->reader.get();
     if (!reader) {
-      stats_.RecordReason(CheckReason::READER_NULL);
-      return true;  // Safe default
+      stats_->RecordReason(CheckReason::READER_NULL);
+      return true;
     }
 
     // Cast to BlockBasedTable to access filter
-    // Since we opened the table with BlockBasedTableFactory, it should be BlockBasedTable
     ROCKSDB_NAMESPACE::BlockBasedTable* bb_table =
         static_cast<ROCKSDB_NAMESPACE::BlockBasedTable*>(reader);
     if (!bb_table) {
-      // Safety check - return true (may_match)
-      stats_.RecordReason(CheckReason::BB_TABLE_NULL);
+      stats_->RecordReason(CheckReason::BB_TABLE_NULL);
       return true;
     }
 
     // Get filter from BlockBasedTable
     const ROCKSDB_NAMESPACE::BlockBasedTable::Rep* rep = bb_table->get_rep();
     if (!rep) {
-      stats_.RecordReason(CheckReason::REP_NULL);
+      stats_->RecordReason(CheckReason::REP_NULL);
       return true;
     }
     
-    // FileSystem 포인터 로그 (call_id <= 20)
-    if (call_id <= 20) {
-      std::lock_guard<std::mutex> log_lock(log_mutex_);
-      std::cerr << "[SAMPLE] CheckKeyInSST #" << call_id << " rep obtained" << std::endl;
-      std::cerr << "[SAMPLE]   rocksdb_options_.env=" << (void*)rocksdb_options_.env << std::endl;
-      if (rocksdb_options_.env) {
-        auto env_fs = rocksdb_options_.env->GetFileSystem();
-        std::cerr << "[SAMPLE]   rocksdb_options_.env->GetFileSystem().get()=" << (void*)env_fs.get() << std::endl;
-      }
-      std::cerr << "[SAMPLE]   rep->ioptions.fs.get()=" << (void*)rep->ioptions.fs.get() << std::endl;
-    }
-    
-    // KeyMayMatch 호출 직전 fs null 체크
     if (!rep->ioptions.fs || !rep->ioptions.fs.get()) {
-      stats_.RecordReason(CheckReason::FILTER_NULL);  // 임시로 FILTER_NULL 사용
-      if (call_id <= 20) {
-        std::lock_guard<std::mutex> log_lock(log_mutex_);
-        std::cerr << "[ERROR] CheckKeyInSST #" << call_id << " rep->ioptions.fs is null -> fallback true" << std::endl;
-      }
+      stats_->RecordReason(CheckReason::FILTER_NULL);
       return true;
     }
     
     if (!rep->filter) {
-      stats_.RecordReason(CheckReason::FILTER_NULL);
-      
-      // Rate-limited logging (1초에 1번)
-      auto now = std::chrono::steady_clock::now();
-      auto last_log = last_filter_null_log_time_.load();
-      if (now - last_log >= std::chrono::seconds(1)) {
-        if (last_filter_null_log_time_.compare_exchange_strong(last_log, now)) {
-          std::lock_guard<std::mutex> log_lock(log_mutex_);
-          std::cerr << "[WARN] FilterNull: file_number=" << file_number << std::endl;
-          
-          // Table properties에서 filter_policy_name 가져오기
-          auto props = bb_table->GetTableProperties();
-          if (props) {
-            std::cerr << "[WARN]   table_properties.filter_policy_name: " << props->filter_policy_name << std::endl;
-          } else {
-            std::cerr << "[WARN]   table_properties: null" << std::endl;
-          }
-          
-          std::cerr << "[WARN]   rep->filter_policy_name: " << (rep->table_options.filter_policy ? rep->table_options.filter_policy->Name() : "null") << std::endl;
-          std::cerr << "[WARN]   rep->filter_policy exists: " << (rep->table_options.filter_policy ? "yes" : "no") << std::endl;
-        }
-      }
-      
-      if (call_id <= 10) {
-        std::lock_guard<std::mutex> log_lock(log_mutex_);
-        std::cerr << "[DEBUG] CheckKeyInSST #" << call_id 
-                  << " no filter in SST, returning true (reason=FILTER_NULL)" << std::flush << std::endl;
-      }
+      stats_->RecordReason(CheckReason::FILTER_NULL);
       return true;
     }
 
     // Check whole_key_filtering
     if (!rep->whole_key_filtering) {
-      stats_.RecordReason(CheckReason::WHOLE_KEY_FILTERING_FALSE);
+      stats_->RecordReason(CheckReason::WHOLE_KEY_FILTERING_FALSE);
       return true;
     }
 
@@ -942,12 +879,11 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
     const ROCKSDB_NAMESPACE::Comparator* ucmp =
         rep->internal_comparator.user_comparator();
     if (!ucmp) {
-      stats_.RecordReason(CheckReason::UCOMP_NULL);
+      stats_->RecordReason(CheckReason::UCOMP_NULL);
       return true;
     }
 
     // Create minimal GetContext
-    // We don't need value, just filter check
     ROCKSDB_NAMESPACE::PinnableSlice dummy_value;
     bool dummy_value_found = false;
     ROCKSDB_NAMESPACE::MergeContext dummy_merge_context;
@@ -972,61 +908,26 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
         false /* get_from_user_specified_snapshot */);
 
     // Generate internal key for partitioned filter lookup
-    // RocksDB's BlockBasedTable::FullFilterKeyMayMatch creates internal_key from user_key
-    // and passes it to filter->KeyMayMatch. We follow the same pattern.
     ROCKSDB_NAMESPACE::InternalKey ikey_for_seek(
         user_key_without_ts, ROCKSDB_NAMESPACE::kMaxSequenceNumber,
         ROCKSDB_NAMESPACE::kValueTypeForSeek);
     ROCKSDB_NAMESPACE::Slice ikey_slice = ikey_for_seek.Encode();
     const ROCKSDB_NAMESPACE::Slice* const_ikey_ptr = &ikey_slice;
     
-    // 디버깅 로그 (call_id <= 20)
-    if (call_id <= 20) {
-      std::lock_guard<std::mutex> log_lock(log_mutex_);
-      std::cerr << "[SAMPLE] CheckKeyInSST #" << call_id << std::endl;
-      std::cerr << "[SAMPLE]   clock_ptr=" << (void*)clock_.get() << std::endl;
-      if (rocksdb_options_.env) {
-        std::cerr << "[SAMPLE]   fs_ptr=" << (void*)rocksdb_options_.env->GetFileSystem().get() << std::endl;
-      }
-      std::cerr << "[SAMPLE]   filter_ptr=" << (void*)rep->filter.get() << std::endl;
-      std::cerr << "[SAMPLE]   whole_key_filtering=" << (rep->whole_key_filtering ? "true" : "false") << std::endl;
-      std::cerr << "[SAMPLE]   index_key_includes_seq=" << (rep->index_key_includes_seq ? "true" : "false") << std::endl;
-      std::cerr << "[SAMPLE]   user_key_without_ts(hex): " << user_key_without_ts.ToString(true) << std::endl;
-      std::cerr << "[SAMPLE]   internal_key(hex): " << const_ikey_ptr->ToString(true) << std::endl;
-    }
-    
     // Check filter
-    // For whole_key_filtering, we use KeyMayMatch
-    // Pass internal key (same pattern as BlockBasedTable::FullFilterKeyMayMatch)
     bool may_match = false;
     try {
       may_match = rep->filter->KeyMayMatch(
           user_key_without_ts, const_ikey_ptr, &get_context,
           &lookup_context, read_options);
       
-      if (call_id <= 20) {
-        std::lock_guard<std::mutex> log_lock(log_mutex_);
-        std::cerr << "[SAMPLE]   KeyMayMatch_result=" << (may_match ? "true" : "false") << std::endl;
-      }
-      
       if (may_match) {
-        stats_.RecordReason(CheckReason::KEYMAYMATCH_TRUE);
+        stats_->RecordReason(CheckReason::KEYMAYMATCH_TRUE);
       } else {
-        stats_.RecordReason(CheckReason::KEYMAYMATCH_FALSE);
+        stats_->RecordReason(CheckReason::KEYMAYMATCH_FALSE);
       }
     } catch (...) {
-      stats_.RecordReason(CheckReason::KEYMAYMATCH_EXCEPTION);
-      // CheckKeyInSST 종료 시간 측정 (exception case)
-      auto check_end = std::chrono::steady_clock::now();
-      auto check_us = std::chrono::duration_cast<std::chrono::microseconds>(
-          check_end - check_start).count();
-      if (call_id <= 10 || call_id % 1000 == 0) {
-        std::lock_guard<std::mutex> log_lock(log_mutex_);
-        std::cerr << "[PERF] CheckKeyInSST #" << call_id 
-                  << " check_us=" << check_us 
-                  << " get_entry_us=" << get_entry_us 
-                  << " (exception)" << std::flush << std::endl;
-      }
+      stats_->RecordReason(CheckReason::KEYMAYMATCH_EXCEPTION);
       return true;  // Safe default on exception
     }
     
@@ -1036,7 +937,7 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
         check_end - check_start).count();
     
     if (call_id <= 10 || call_id % 1000 == 0) {
-      std::lock_guard<std::mutex> log_lock(log_mutex_);
+      std::lock_guard<std::mutex> log_lock(*log_mutex_);
       std::cerr << "[PERF] CheckKeyInSST #" << call_id 
                 << " check_us=" << check_us 
                 << " get_entry_us=" << get_entry_us 
@@ -1046,6 +947,161 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
     return may_match;
   }
 
+  enum CallStatus { CREATE, PROCESS, FINISH };
+  CallStatus status_;
+  
+  BloomCheck::AsyncService* service_;
+  grpc::ServerCompletionQueue* cq_;
+  grpc::ServerContext ctx_;
+  BatchRequest request_;
+  BatchResponse response_;
+  grpc::ServerAsyncResponseWriter<BatchResponse> responder_;
+  
+  TableReaderCache* cache_;
+  ROCKSDB_NAMESPACE::Options* rocksdb_options_;
+  Stats* stats_;
+  std::mutex* log_mutex_;
+  std::atomic<size_t>* open_count_;
+  std::atomic<size_t>* active_rpc_count_;
+  std::atomic<size_t>* total_rpc_count_;
+  std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock_;
+  std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs_;
+  PerCQWorkerQueue* worker_queue_;
+  
+  std::chrono::steady_clock::time_point handler_start_;
+  size_t req_id_;
+  size_t active_count_;
+  
+  static std::atomic<size_t> request_count_;
+};
+
+std::atomic<size_t> CheckCallData::request_count_{0};
+
+// PerCQWorkerQueue::WorkerLoop implementation (after CheckCallData definition)
+void PerCQWorkerQueue::WorkerLoop() {
+  while (true) {
+    std::unique_lock<std::mutex> lock(queue_mutex_);
+    queue_cv_.wait(lock, [this]() { return !work_queue_.empty() || shutdown_; });
+    
+    if (shutdown_ && work_queue_.empty()) {
+      break;
+    }
+    
+    if (!work_queue_.empty()) {
+      WorkItem item = std::move(work_queue_.front());
+      work_queue_.pop();
+      lock.unlock();
+      
+      // Perform actual work in worker thread
+      // This calls ProcessInWorkerThread which performs bloom filter checks
+      // Worker thread directly calls Finish() - no Alarm needed
+      item.call_data->ProcessInWorkerThread(std::move(item));
+    }
+  }
+}
+
+// Per-RPC state machine for Noop RPC
+class NoopCallData : public CallDataBase {
+ public:
+  NoopCallData(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* cq)
+      : service_(service), cq_(cq), responder_(&ctx_), status_(CREATE) {
+    Proceed();
+  }
+
+  void Proceed() override {
+    if (status_ == CREATE) {
+      // ACCEPT: 새로운 RPC 요청 수락
+      status_ = PROCESS;
+      service_->RequestNoop(&ctx_, &request_, &responder_, cq_, cq_, this);
+    } else if (status_ == PROCESS) {
+      // READ 완료, PROCESS 시작
+      // 새로운 CallData를 생성하여 다음 요청을 받을 준비
+      new NoopCallData(service_, cq_);
+      
+      // 실제 요청 처리
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      uint64_t now_ns = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + 
+                        static_cast<uint64_t>(ts.tv_nsec);
+      
+      response_.set_server_ts_ns(now_ns);
+      
+      // Optional: very sparse logging (1/100000 sample rate)
+      static std::atomic<size_t> noop_count{0};
+      size_t count = noop_count.fetch_add(1) + 1;
+      
+      static bool noop_log_enabled = []() {
+        const char* env = std::getenv("BLOOMD_NOOP_LOG");
+        return env && std::string(env) == "1";
+      }();
+      
+      if (noop_log_enabled && count % 100000 == 0) {
+        std::cerr << "[NOOP] Noop request #" << count 
+                  << " server_ts_ns=" << now_ns << std::flush << std::endl;
+      }
+      
+      // FINISH: 응답 전송
+      status_ = FINISH;
+      responder_.Finish(response_, grpc::Status::OK, this);
+    } else {
+      // FINISH 완료
+      GPR_ASSERT(status_ == FINISH);
+      delete this;
+    }
+  }
+
+ private:
+  enum CallStatus { CREATE, PROCESS, FINISH };
+  CallStatus status_;
+  
+  BloomCheck::AsyncService* service_;
+  grpc::ServerCompletionQueue* cq_;
+  grpc::ServerContext ctx_;
+  NoopRequest request_;
+  NoopResponse response_;
+  grpc::ServerAsyncResponseWriter<NoopResponse> responder_;
+};
+
+// BloomCheckServiceImpl implements the gRPC AsyncService
+class BloomCheckServiceImpl {
+ public:
+  explicit BloomCheckServiceImpl(size_t cache_size)
+      : cache_(cache_size), rocksdb_options_(),
+        clock_(ROCKSDB_NAMESPACE::SystemClock::Default()),
+        fs_(ROCKSDB_NAMESPACE::Env::Default()->GetFileSystem()) {
+    // Configure RocksDB options for filter-only access
+    rocksdb_options_.env = ROCKSDB_NAMESPACE::Env::Default();
+    
+    // Set BlockBasedTableOptions with filter_policy
+    ROCKSDB_NAMESPACE::BlockBasedTableOptions bbto;
+    bbto.filter_policy.reset(ROCKSDB_NAMESPACE::NewBloomFilterPolicy(10, false));
+    bbto.whole_key_filtering = true;
+    bbto.partition_filters = true;
+    rocksdb_options_.table_factory.reset(
+        ROCKSDB_NAMESPACE::NewBlockBasedTableFactory(bbto));
+    
+    StartStatsThread();
+  }
+  
+  ~BloomCheckServiceImpl() {
+    StopStatsThread();
+  }
+  
+  BloomCheck::AsyncService* service() { return &service_; }
+  
+  TableReaderCache* cache() { return &cache_; }
+  ROCKSDB_NAMESPACE::Options* rocksdb_options() { return &rocksdb_options_; }
+  Stats* stats() { return &stats_; }
+  std::mutex* log_mutex() { return &log_mutex_; }
+  std::atomic<size_t>* open_count() { return &open_count_; }
+  std::atomic<size_t>* active_rpc_count() { return &active_rpc_count_; }
+  std::atomic<size_t>* total_rpc_count() { return &total_rpc_count_; }
+  std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock() { return clock_; }
+  std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs() { return fs_; }
+
+ private:
+  BloomCheck::AsyncService service_;
+  
   TableReaderCache cache_;
   ROCKSDB_NAMESPACE::Options rocksdb_options_;
   Stats stats_;
@@ -1119,6 +1175,33 @@ class BloomCheckServiceImpl final : public BloomCheck::Service {
   }
 };
 
+// HandleRpcs: CQ 폴러 스레드에서 실행되는 함수
+// IMPORTANT: This thread MUST NOT perform any application logic (bloom filter checks).
+// It only handles CQ events and state transitions.
+void HandleRpcs(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* cq,
+                BloomCheckServiceImpl* impl, PerCQWorkerQueue* worker_queue) {
+  // 초기 CallData 생성 (ACCEPT 단계)
+  new CheckCallData(service, cq, impl->cache(), impl->rocksdb_options(), impl->stats(),
+                   impl->log_mutex(), impl->open_count(), impl->active_rpc_count(),
+                   impl->total_rpc_count(), impl->clock(), impl->fs(), worker_queue);
+  new NoopCallData(service, cq);
+  
+  void* tag;
+  bool ok;
+  
+  // CQ에서 이벤트 폴링
+  // This loop runs in CQ poller thread - must be fast and non-blocking
+  while (true) {
+    GPR_ASSERT(cq->Next(&tag, &ok));
+    GPR_ASSERT(ok);
+    
+    // CallData의 Proceed() 호출하여 state machine 진행
+    // Proceed() should only do state transitions and enqueue work, NOT execute bloom filters
+    // Worker thread will call Finish() directly - no WORK_DONE state needed
+    static_cast<CallDataBase*>(tag)->Proceed();
+  }
+}
+
 }  // namespace bloomcheck
 
 // Server main function
@@ -1126,29 +1209,31 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   bloomcheck::BloomCheckServiceImpl service(cache_size);
 
   grpc::EnableDefaultHealthCheckService(true);
-  // grpc::reflection::InitProtoReflectionServerBuilderPlugin();  // Optional: remove if not needed
 
   grpc::ServerBuilder builder;
   builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
-  builder.RegisterService(&service);
+  builder.RegisterService(service.service());
   
   // ============================================
-  // gRPC 서버 성능 최적화 설정
+  // gRPC AsyncServer 설정
   // ============================================
   
-  // 1. 스레드 풀 크기 증가 (SyncServer의 기본 제한 해제)
-  // 기본값: CPU 코어 수 또는 고정값 (보통 16-32)
-  // 문제: 클라이언트가 64 threads여도 서버는 16개만 처리
+  // CompletionQueue 생성 (여러 CQ 사용 가능)
+  const int NUM_CQS = 4;  // CQ 개수 (필요에 따라 조정)
+  std::vector<std::unique_ptr<grpc::ServerCompletionQueue>> cqs;
+  for (int i = 0; i < NUM_CQS; i++) {
+    cqs.emplace_back(builder.AddCompletionQueue());
+  }
+  
+  // 1. 스레드 풀 크기 증가
   grpc::ResourceQuota quota;
-  quota.SetMaxThreads(128);  // 충분히 크게 설정 (필요시 조정)
+  quota.SetMaxThreads(128);
   builder.SetResourceQuota(quota);
   
   // 2. HTTP/2 stream concurrency 증가 (connection당)
-  // 기본값: 100
-  // 문제: connection당 동시 stream 수 제한
   builder.AddChannelArgument(GRPC_ARG_MAX_CONCURRENT_STREAMS, 1000);
   
-  // 3. 메시지 크기 제한 (필요시)
+  // 3. 메시지 크기 제한
   builder.SetMaxReceiveMessageSize(4 * 1024 * 1024);  // 4MB
   builder.SetMaxSendMessageSize(4 * 1024 * 1024);    // 4MB
   
@@ -1157,18 +1242,66 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   builder.AddChannelArgument(GRPC_ARG_MAX_CONNECTION_AGE_MS, 3600000);   // 1시간
   
   // ============================================
-  // 현재 서버 모델: SyncServer
-  // - 각 RPC는 별도 스레드에서 실행
-  // - gRPC 내부 스레드 풀 사용
-  // - CompletionQueue는 내부적으로 자동 관리
+  // AsyncServer 모델
+  // - 각 RPC는 per-RPC state machine으로 처리
+  // - ServerCompletionQueue에서 이벤트 폴링
+  // - 여러 CQ 폴러 스레드로 병렬 처리
   // ============================================
   
   std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
-  std::cout << "BloomCheck server listening on " << server_address << std::endl;
-  std::cout << "Server will handle requests concurrently (default: multiple threads)" << std::endl;
-
+  std::cout << "BloomCheck AsyncServer listening on " << server_address << std::endl;
+  std::cout << "Using " << NUM_CQS << " CompletionQueues" << std::endl;
+  
+  // Per-CQ worker queue 생성 (각 CQ마다 별도의 worker queue)
+  // Lock contention을 줄이기 위해 CQ별로 분리
+  const size_t NUM_WORKER_THREADS_PER_CQ = 8;  // CQ당 worker thread 개수
+  std::vector<std::unique_ptr<bloomcheck::PerCQWorkerQueue>> worker_queues;
+  for (int i = 0; i < NUM_CQS; i++) {
+    worker_queues.emplace_back(
+        std::make_unique<bloomcheck::PerCQWorkerQueue>(NUM_WORKER_THREADS_PER_CQ));
+  }
+  std::cout << "Using " << NUM_WORKER_THREADS_PER_CQ 
+            << " worker threads per CQ (total: " 
+            << (NUM_CQS * NUM_WORKER_THREADS_PER_CQ) << ")" << std::endl;
+  
+  // CQ 폴러 스레드 생성 (각 CQ당 1개 스레드)
+  // CQ poller threads: 빠른 이벤트 처리만 수행 (bloom filter 체크 안 함)
+  std::vector<std::thread> cq_threads;
+  for (int i = 0; i < NUM_CQS; i++) {
+    cq_threads.emplace_back(std::thread(bloomcheck::HandleRpcs, 
+                                        service.service(), cqs[i].get(), &service, 
+                                        worker_queues[i].get()));
+  }
+  
+  // 서버 종료 대기
   server->Wait();
+  
+  // 서버 종료 시 CQ 종료
+  server->Shutdown();
+  for (auto& cq : cqs) {
+    cq->Shutdown();
+  }
+  
+  // Worker queues 종료 (큐에 남은 작업 처리)
+  for (auto& wq : worker_queues) {
+    wq->Shutdown();
+  }
+  
+  // CQ 폴러 스레드 종료 대기
+  for (auto& t : cq_threads) {
+    t.join();
+  }
+  
+  // 남은 이벤트 처리
+  for (auto& cq : cqs) {
+    void* tag;
+    bool ok;
+    while (cq->Next(&tag, &ok)) {
+      // 남은 이벤트 처리
+    }
+  }
 }
+
 
 int main(int argc, char** argv) {
   std::string server_address = "0.0.0.0:50051";
