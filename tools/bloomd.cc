@@ -6,6 +6,7 @@
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
+#include <grpc/support/log.h>
 
 #include <array>
 #include <atomic>
@@ -126,11 +127,11 @@ struct Stats {
     double cache_hit_rate = total_accesses > 0 ? (double)hits / total_accesses : 0.0;
     size_t evictions_count = evictions.load();
     
-    std::cerr << "[STATS] cache_hit_rate: " << cache_hit_rate 
-              << " (" << hits << "/" << total_accesses << ")" << std::endl;
-    std::cerr << "[STATS] evictions: " << evictions_count << std::endl;
-    std::cerr << "[STATS] NewTableReader(open): " << total_opens << std::endl;
-    std::cerr << "[STATS] active_rpcs: " << active_rpcs << std::endl;
+    // std::cerr << "[STATS] cache_hit_rate: " << cache_hit_rate 
+    //           << " (" << hits << "/" << total_accesses << ")" << std::endl;
+    // std::cerr << "[STATS] evictions: " << evictions_count << std::endl;
+    // std::cerr << "[STATS] NewTableReader(open): " << total_opens << std::endl;
+    // std::cerr << "[STATS] active_rpcs: " << active_rpcs << std::endl;
   }
 };
 
@@ -357,8 +358,8 @@ class TableReaderCache {
     // Debug output for first 20 cache misses
     size_t open_id = (open_count ? (*open_count)++ : 0);
     if (open_id <= 20) {
-      std::lock_guard<std::mutex> log_lock(*log_mutex);
-      std::cerr << "[DBG] file_number=" << file_number << ", actual_path(len=" << actual_path.size() << "): \"" << actual_path << "\"\n";
+      // std::lock_guard<std::mutex> log_lock(*log_mutex);
+      // std::cerr << "[DBG] file_number=" << file_number << ", actual_path(len=" << actual_path.size() << "): \"" << actual_path << "\"\n";
     }
     
     // Check if TryOpenSstPath found a valid file (file_size > 0 means success)
@@ -367,13 +368,13 @@ class TableReaderCache {
       // TryOpenSstPath failed to find any matching file
       if (stats) stats->open_fail_getfilesize++;
       // 샘플 로그 (초기 50회 + 매 1000회) - 락 밖에서
-      if (open_id <= 50 || open_id % 1000 == 0) {
-        std::lock_guard<std::mutex> log_lock(*log_mutex);
-        std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
-                  << " FAIL: TryOpenSstPath failed to find file" << std::endl;
-        std::cerr << "[SAMPLE]   file_number: " << file_number << std::endl;
-        std::cerr << "[SAMPLE]   actual_path: " << (actual_path.empty() ? "(empty)" : actual_path) << std::endl;
-      }
+      // if (open_id <= 50 || open_id % 1000 == 0) {
+      //   std::lock_guard<std::mutex> log_lock(*log_mutex);
+      //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
+      //             << " FAIL: TryOpenSstPath failed to find file" << std::endl;
+      //   std::cerr << "[SAMPLE]   file_number: " << file_number << std::endl;
+      //   std::cerr << "[SAMPLE]   actual_path: " << (actual_path.empty() ? "(empty)" : actual_path) << std::endl;
+      // }
       // Clean up inflight entry on failure
       {
         std::lock_guard<std::shared_mutex> lock(shard.mutex);
@@ -387,15 +388,15 @@ class TableReaderCache {
     if (!s.ok()) {
       if (stats) stats->open_fail_newfile++;
       // 샘플 로그 - 락 밖에서
-      if (open_id <= 50 || open_id % 1000 == 0) {
-        std::lock_guard<std::mutex> log_lock(*log_mutex);
-        std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
-                  << " FAIL: NewRandomAccessFile failed" << std::endl;
-        std::cerr << "[SAMPLE]   file_number: " << file_number << std::endl;
-        std::cerr << "[SAMPLE]   actual_path: " << actual_path << std::endl;
-        std::cerr << "[SAMPLE]   file_size: " << file_size << std::endl;
-        std::cerr << "[SAMPLE]   error: " << s.ToString() << std::endl;
-      }
+      // if (open_id <= 50 || open_id % 1000 == 0) {
+      //   std::lock_guard<std::mutex> log_lock(*log_mutex);
+      //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
+      //             << " FAIL: NewRandomAccessFile failed" << std::endl;
+      //   std::cerr << "[SAMPLE]   file_number: " << file_number << std::endl;
+      //   std::cerr << "[SAMPLE]   actual_path: " << actual_path << std::endl;
+      //   std::cerr << "[SAMPLE]   file_size: " << file_size << std::endl;
+      //   std::cerr << "[SAMPLE]   error: " << s.ToString() << std::endl;
+      // }
       // Clean up inflight entry on failure
       {
         std::lock_guard<std::shared_mutex> lock(shard.mutex);
@@ -434,15 +435,15 @@ class TableReaderCache {
     if (!table_status.ok() || !table_reader) {
       if (stats) stats->open_fail_newreader++;
       // 샘플 로그 - 락 밖에서
-      if (open_id <= 50 || open_id % 1000 == 0) {
-        std::lock_guard<std::mutex> log_lock(*log_mutex);
-        std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
-                  << " FAIL: NewTableReader failed" << std::endl;
-        std::cerr << "[SAMPLE]   file_number: " << file_number << std::endl;
-        std::cerr << "[SAMPLE]   actual_path: " << actual_path << std::endl;
-        std::cerr << "[SAMPLE]   file_size: " << file_size << std::endl;
-        std::cerr << "[SAMPLE]   status: " << table_status.ToString() << std::endl;
-      }
+      // if (open_id <= 50 || open_id % 1000 == 0) {
+      //   std::lock_guard<std::mutex> log_lock(*log_mutex);
+      //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
+      //             << " FAIL: NewTableReader failed" << std::endl;
+      //   std::cerr << "[SAMPLE]   file_number: " << file_number << std::endl;
+      //   std::cerr << "[SAMPLE]   actual_path: " << actual_path << std::endl;
+      //   std::cerr << "[SAMPLE]   file_size: " << file_size << std::endl;
+      //   std::cerr << "[SAMPLE]   status: " << table_status.ToString() << std::endl;
+      // }
       // Clean up inflight entry on failure
       {
         std::lock_guard<std::shared_mutex> lock(shard.mutex);
@@ -453,55 +454,55 @@ class TableReaderCache {
     }
 
     // 샘플 로그 (성공한 경우) 및 table properties 로그
-    if (open_id <= 5 || open_id % 1000 == 0) {
-      std::lock_guard<std::mutex> log_lock(*log_mutex);
-      std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
-                << " SUCCESS file_number=" << file_number 
-                << " path=" << actual_path << std::endl;
-      
-      // Table properties 로그
-      auto props = table_reader->GetTableProperties();
-      if (props) {
-        std::cerr << "[SAMPLE]   table_properties.filter_policy_name: " << props->filter_policy_name << std::endl;
-      } else {
-        std::cerr << "[SAMPLE]   table_properties: null" << std::endl;
-      }
-      
-      // BlockBasedTable::Rep 정보 로그
-      ROCKSDB_NAMESPACE::BlockBasedTable* bb_table =
-          static_cast<ROCKSDB_NAMESPACE::BlockBasedTable*>(table_reader.get());
-      if (bb_table) {
-        const ROCKSDB_NAMESPACE::BlockBasedTable::Rep* rep = bb_table->get_rep();
-        if (rep) {
-          std::cerr << "[SAMPLE]   rep->filter_policy: " << (rep->table_options.filter_policy ? rep->table_options.filter_policy.get() : nullptr) << std::endl;
-          if (rep->table_options.filter_policy) {
-            std::cerr << "[SAMPLE]   rep->filter_policy->Name(): " << rep->table_options.filter_policy->Name() << std::endl;
-          }
-          std::cerr << "[SAMPLE]   rep->filter: " << (rep->filter ? rep->filter.get() : nullptr) << std::endl;
-          std::cerr << "[SAMPLE]   rep->whole_key_filtering: " << (rep->whole_key_filtering ? "true" : "false") << std::endl;
-          std::cerr << "[SAMPLE]   rep->index_type: " << static_cast<int>(rep->index_type) << std::endl;
-          
-          // 실제로 열린 파일의 첫 번째 키 확인 (초기 5회만)
-          if (open_id <= 5) {
-            ROCKSDB_NAMESPACE::ReadOptions ro;
-            std::unique_ptr<ROCKSDB_NAMESPACE::InternalIterator> iter(
-                table_reader->NewIterator(ro, nullptr, nullptr, false,
-                                         ROCKSDB_NAMESPACE::TableReaderCaller::kSSTDumpTool));
-            iter->SeekToFirst();
-            if (iter->Valid()) {
-              ROCKSDB_NAMESPACE::Slice first_key = iter->key();
-              std::cerr << "[SAMPLE]   First key in file (hex): " << first_key.ToString(true) << std::endl;
-              ROCKSDB_NAMESPACE::ParsedInternalKey parsed;
-              if (ROCKSDB_NAMESPACE::ParseInternalKey(first_key, &parsed, false).ok()) {
-                std::cerr << "[SAMPLE]   First user_key (hex): " << parsed.user_key.ToString(true) << std::endl;
-              }
-            }
-          }
-        } else {
-          std::cerr << "[SAMPLE]   rep: null" << std::endl;
-        }
-      }
-    }
+    // if (open_id <= 5 || open_id % 1000 == 0) {
+    //   std::lock_guard<std::mutex> log_lock(*log_mutex);
+    //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
+    //             << " SUCCESS file_number=" << file_number 
+    //             << " path=" << actual_path << std::endl;
+    //   
+    //   // Table properties 로그
+    //   auto props = table_reader->GetTableProperties();
+    //   if (props) {
+    //     std::cerr << "[SAMPLE]   table_properties.filter_policy_name: " << props->filter_policy_name << std::endl;
+    //   } else {
+    //     std::cerr << "[SAMPLE]   table_properties: null" << std::endl;
+    //   }
+    //   
+    //   // BlockBasedTable::Rep 정보 로그
+    //   ROCKSDB_NAMESPACE::BlockBasedTable* bb_table =
+    //       static_cast<ROCKSDB_NAMESPACE::BlockBasedTable*>(table_reader.get());
+    //   if (bb_table) {
+    //     const ROCKSDB_NAMESPACE::BlockBasedTable::Rep* rep = bb_table->get_rep();
+    //     if (rep) {
+    //       std::cerr << "[SAMPLE]   rep->filter_policy: " << (rep->table_options.filter_policy ? rep->table_options.filter_policy.get() : nullptr) << std::endl;
+    //       if (rep->table_options.filter_policy) {
+    //         std::cerr << "[SAMPLE]   rep->filter_policy->Name(): " << rep->table_options.filter_policy->Name() << std::endl;
+    //       }
+    //       std::cerr << "[SAMPLE]   rep->filter: " << (rep->filter ? rep->filter.get() : nullptr) << std::endl;
+    //       std::cerr << "[SAMPLE]   rep->whole_key_filtering: " << (rep->whole_key_filtering ? "true" : "false") << std::endl;
+    //       std::cerr << "[SAMPLE]   rep->index_type: " << static_cast<int>(rep->index_type) << std::endl;
+    //       
+    //       // 실제로 열린 파일의 첫 번째 키 확인 (초기 5회만)
+    //       if (open_id <= 5) {
+    //         ROCKSDB_NAMESPACE::ReadOptions ro;
+    //         std::unique_ptr<ROCKSDB_NAMESPACE::InternalIterator> iter(
+    //             table_reader->NewIterator(ro, nullptr, nullptr, false,
+    //                                      ROCKSDB_NAMESPACE::TableReaderCaller::kSSTDumpTool));
+    //         iter->SeekToFirst();
+    //         if (iter->Valid()) {
+    //           ROCKSDB_NAMESPACE::Slice first_key = iter->key();
+    //           std::cerr << "[SAMPLE]   First key in file (hex): " << first_key.ToString(true) << std::endl;
+    //           ROCKSDB_NAMESPACE::ParsedInternalKey parsed;
+    //           if (ROCKSDB_NAMESPACE::ParseInternalKey(first_key, &parsed, false).ok()) {
+    //             std::cerr << "[SAMPLE]   First user_key (hex): " << parsed.user_key.ToString(true) << std::endl;
+    //           }
+    //         }
+    //       }
+    //     } else {
+    //       std::cerr << "[SAMPLE]   rep: null" << std::endl;
+    //     }
+    //   }
+    // }
 
     entry->reader = std::move(table_reader);
     std::shared_ptr<CacheEntry> entry_ptr = std::move(entry);
@@ -682,8 +683,8 @@ class CheckCallData : public CallDataBase {
       req_id_ = request_count_.fetch_add(1) + 1;
       
       if (req_id_ <= 10 || req_id_ % 100 == 0) {
-        std::cerr << "[INFO] Check request #" << req_id_ 
-                  << " received: " << request_.reqs_size() << " key request(s)" << std::flush << std::endl;
+        // std::cerr << "[INFO] Check request #" << req_id_ 
+        //           << " received: " << request_.reqs_size() << " key request(s)" << std::flush << std::endl;
       }
     } else if (status_ == PROCESS) {
       // READ 완료, PROCESS 시작
@@ -725,16 +726,16 @@ class CheckCallData : public CallDataBase {
     auto handler_us = std::chrono::duration_cast<std::chrono::microseconds>(
         handler_end - item.handler_start).count();
     
-    if (item.req_id <= 10 || item.req_id % 100 == 0) {
-      std::lock_guard<std::mutex> log_lock(*log_mutex_);
-      std::cerr << "[INFO] Check request #" << item.req_id << " completed" << std::flush << std::endl;
-      std::cerr << "[INFO] Check request #" << item.req_id 
-                << " response size: " << response_.resps_size() << std::flush << std::endl;
-      std::cerr << "[PERF] Check request #" << item.req_id 
-                << " server_handler_us=" << handler_us 
-                << " active_rpcs=" << item.active_count
-                << " (handler processing time)" << std::flush << std::endl;
-    }
+    // if (item.req_id <= 10 || item.req_id % 100 == 0) {
+    //   std::lock_guard<std::mutex> log_lock(*log_mutex_);
+    //   std::cerr << "[INFO] Check request #" << item.req_id << " completed" << std::flush << std::endl;
+    //   std::cerr << "[INFO] Check request #" << item.req_id 
+    //             << " response size: " << response_.resps_size() << std::flush << std::endl;
+    //   std::cerr << "[PERF] Check request #" << item.req_id 
+    //             << " server_handler_us=" << handler_us 
+    //             << " active_rpcs=" << item.active_count
+    //             << " (handler processing time)" << std::flush << std::endl;
+    // }
     
     // Worker thread directly calls Finish() - gRPC responder is thread-safe
     // No need for Alarm or CQ notification
@@ -761,11 +762,11 @@ class CheckCallData : public CallDataBase {
     uint64_t total_candidates = req.sst_file_numbers_size();
     resp->set_total_candidates(total_candidates);
     
-    if (key_req_id <= 10 || key_req_id % 100 == 0) {
-      std::cerr << "[INFO] ProcessKeyRequest #" << key_req_id 
-                << ": key_len=" << user_key.size() 
-                << ", sst_count=" << total_candidates << std::flush << std::endl;
-    }
+    // if (key_req_id <= 10 || key_req_id % 100 == 0) {
+    //   std::cerr << "[INFO] ProcessKeyRequest #" << key_req_id 
+    //             << ": key_len=" << user_key.size() 
+    //             << ", sst_count=" << total_candidates << std::flush << std::endl;
+    // }
 
     // checked_count: 실제로 검사한 파일 수 (성공적으로 처리한 파일 수)
     uint64_t checked_count = 0;
@@ -798,17 +799,17 @@ class CheckCallData : public CallDataBase {
     auto process_us = std::chrono::duration_cast<std::chrono::microseconds>(
         process_end - process_start).count();
     
-    if (key_req_id <= 10 || key_req_id % 100 == 0) {
-      std::lock_guard<std::mutex> log_lock(*log_mutex_);
-      uint64_t overhead_us = process_us - total_check_us;
-      std::cerr << "[PERF] ProcessKeyRequest #" << key_req_id 
-                << " process_us=" << process_us 
-                << " total_check_us=" << total_check_us
-                << " overhead_us=" << overhead_us
-                << " sst_count=" << total_candidates
-                << " avg_check_us=" << (total_candidates > 0 ? total_check_us / total_candidates : 0)
-                << " (per-key processing time)" << std::flush << std::endl;
-    }
+    // if (key_req_id <= 10 || key_req_id % 100 == 0) {
+    //   std::lock_guard<std::mutex> log_lock(*log_mutex_);
+    //   uint64_t overhead_us = process_us - total_check_us;
+    //   std::cerr << "[PERF] ProcessKeyRequest #" << key_req_id 
+    //             << " process_us=" << process_us 
+    //             << " total_check_us=" << total_check_us
+    //             << " overhead_us=" << overhead_us
+    //             << " sst_count=" << total_candidates
+    //             << " avg_check_us=" << (total_candidates > 0 ? total_check_us / total_candidates : 0)
+    //             << " (per-key processing time)" << std::flush << std::endl;
+    // }
   }
 
   bool CheckKeyInSST(const ROCKSDB_NAMESPACE::Slice& user_key, uint64_t file_number) {
@@ -936,13 +937,13 @@ class CheckCallData : public CallDataBase {
     auto check_us = std::chrono::duration_cast<std::chrono::microseconds>(
         check_end - check_start).count();
     
-    if (call_id <= 10 || call_id % 1000 == 0) {
-      std::lock_guard<std::mutex> log_lock(*log_mutex_);
-      std::cerr << "[PERF] CheckKeyInSST #" << call_id 
-                << " check_us=" << check_us 
-                << " get_entry_us=" << get_entry_us 
-                << " (per-SST check time)" << std::flush << std::endl;
-    }
+    // if (call_id <= 10 || call_id % 1000 == 0) {
+    //   std::lock_guard<std::mutex> log_lock(*log_mutex_);
+    //   std::cerr << "[PERF] CheckKeyInSST #" << call_id 
+    //             << " check_us=" << check_us 
+    //             << " get_entry_us=" << get_entry_us 
+    //             << " (per-SST check time)" << std::flush << std::endl;
+    // }
     
     return may_match;
   }
@@ -1035,10 +1036,10 @@ class NoopCallData : public CallDataBase {
         return env && std::string(env) == "1";
       }();
       
-      if (noop_log_enabled && count % 100000 == 0) {
-        std::cerr << "[NOOP] Noop request #" << count 
-                  << " server_ts_ns=" << now_ns << std::flush << std::endl;
-      }
+      // if (noop_log_enabled && count % 100000 == 0) {
+      //   std::cerr << "[NOOP] Noop request #" << count 
+      //             << " server_ts_ns=" << now_ns << std::flush << std::endl;
+      // }
       
       // FINISH: 응답 전송
       status_ = FINISH;
@@ -1071,6 +1072,9 @@ class BloomCheckServiceImpl {
         fs_(ROCKSDB_NAMESPACE::Env::Default()->GetFileSystem()) {
     // Configure RocksDB options for filter-only access
     rocksdb_options_.env = ROCKSDB_NAMESPACE::Env::Default();
+    
+    // Disable RocksDB verbose logging (ERROR level only)
+    rocksdb_options_.info_log_level = ROCKSDB_NAMESPACE::InfoLogLevel::ERROR_LEVEL;
     
     // Set BlockBasedTableOptions with filter_policy
     ROCKSDB_NAMESPACE::BlockBasedTableOptions bbto;
@@ -1145,24 +1149,24 @@ class BloomCheckServiceImpl {
         }
         
         // QPS 로그 출력 (매 1초)
-        {
-          std::lock_guard<std::mutex> log_lock(log_mutex_);
-          std::cerr << "[QPS] rpc_qps=" << static_cast<size_t>(qps)
-                    << " active_rpcs=" << current_active_rpc
-                    << " total_rpcs=" << current_total_rpc
-                    << " (qps=" << std::fixed << std::setprecision(1) << qps << ")"
-                    << std::endl;
-        }
+        // {
+        //   std::lock_guard<std::mutex> log_lock(log_mutex_);
+        //   std::cerr << "[QPS] rpc_qps=" << static_cast<size_t>(qps)
+        //             << " active_rpcs=" << current_active_rpc
+        //             << " total_rpcs=" << current_total_rpc
+        //             << " (qps=" << std::fixed << std::setprecision(1) << qps << ")"
+        //             << std::endl;
+        // }
         
         last_total_rpc = current_total_rpc;
         last_time = now;
         
         // 5초마다 상세 통계 출력
-        static int detail_counter = 0;
-        if (++detail_counter >= 5) {
-          detail_counter = 0;
-          stats_.PrintStats(log_mutex_, open_count_.load(), current_active_rpc);
-        }
+        // static int detail_counter = 0;
+        // if (++detail_counter >= 5) {
+        //   detail_counter = 0;
+        //   stats_.PrintStats(log_mutex_, open_count_.load(), current_active_rpc);
+        // }
       }
     });
   }
@@ -1206,6 +1210,9 @@ void HandleRpcs(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* 
 
 // Server main function
 void RunServer(const std::string& server_address, size_t cache_size) {
+  // Disable gRPC verbose logging (ERROR level only)
+  gpr_set_log_verbosity(GPR_LOG_SEVERITY_ERROR);
+  
   bloomcheck::BloomCheckServiceImpl service(cache_size);
 
   grpc::EnableDefaultHealthCheckService(true);
@@ -1249,8 +1256,8 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   // ============================================
   
   std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
-  std::cout << "BloomCheck AsyncServer listening on " << server_address << std::endl;
-  std::cout << "Using " << NUM_CQS << " CompletionQueues" << std::endl;
+  // std::cout << "BloomCheck AsyncServer listening on " << server_address << std::endl;
+  // std::cout << "Using " << NUM_CQS << " CompletionQueues" << std::endl;
   
   // Per-CQ worker queue 생성 (각 CQ마다 별도의 worker queue)
   // Lock contention을 줄이기 위해 CQ별로 분리
@@ -1260,9 +1267,9 @@ void RunServer(const std::string& server_address, size_t cache_size) {
     worker_queues.emplace_back(
         std::make_unique<bloomcheck::PerCQWorkerQueue>(NUM_WORKER_THREADS_PER_CQ));
   }
-  std::cout << "Using " << NUM_WORKER_THREADS_PER_CQ 
-            << " worker threads per CQ (total: " 
-            << (NUM_CQS * NUM_WORKER_THREADS_PER_CQ) << ")" << std::endl;
+  // std::cout << "Using " << NUM_WORKER_THREADS_PER_CQ 
+  //           << " worker threads per CQ (total: " 
+  //           << (NUM_CQS * NUM_WORKER_THREADS_PER_CQ) << ")" << std::endl;
   
   // CQ 폴러 스레드 생성 (각 CQ당 1개 스레드)
   // CQ poller threads: 빠른 이벤트 처리만 수행 (bloom filter 체크 안 함)
