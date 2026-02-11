@@ -208,13 +208,12 @@ class TableReaderCache {
     std::unique_ptr<ROCKSDB_NAMESPACE::TableReader> reader;
     ROCKSDB_NAMESPACE::InternalKeyComparator internal_comparator;
     ROCKSDB_NAMESPACE::ImmutableOptions ioptions;
-    std::chrono::steady_clock::time_point last_access;
-    std::mutex mutex;  // Per-entry lock for thread safety
+    std::atomic<std::chrono::steady_clock::time_point> last_access;  // Atomic for lock-free updates
     
     explicit CacheEntry(const ROCKSDB_NAMESPACE::Options& opt)
         : internal_comparator(opt.comparator),
           ioptions(opt),
-          last_access(std::chrono::steady_clock::now()) {
+          last_access(std::chrono::steady_clock::now()) {  // Atomic initialization  // Atomic initialization
       // ImmutableOptions constructor sets fs from env automatically
       // (ImmutableDBOptions constructor sets: fs = env->GetFileSystem())
     }
@@ -240,7 +239,7 @@ class TableReaderCache {
     Shard(size_t max_size_per_shard) : max_size(max_size_per_shard) {}
   };
 
-  static constexpr size_t N_SHARDS = 16;  // 2^4 shards for better distribution
+  static constexpr size_t N_SHARDS = 32;  // 2^5 shards for better distribution (reduced contention)
 
   explicit TableReaderCache(size_t max_size) : max_size_(max_size) {
     // Initialize shards
@@ -253,6 +252,7 @@ class TableReaderCache {
   // Hash function to select shard from file_number
   static size_t GetShardIndex(uint64_t file_number) {
     // Simple hash: mix bits for better distribution
+    // N_SHARDS = 32 (2^5), so mask is 0x1F (31)
     return std::hash<uint64_t>{}(file_number) & (N_SHARDS - 1);
   }
   
@@ -752,9 +752,9 @@ class CheckCallData : public CallDataBase {
       return true;
     }
 
-    // Lock entry for thread-safe access
-    std::lock_guard<std::mutex> lock(entry->mutex);
-    entry->last_access = std::chrono::steady_clock::now();
+    // Update last_access atomically (lock-free)
+    // TableReader is thread-safe, so no mutex needed for read operations
+    entry->last_access.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
 
     ROCKSDB_NAMESPACE::TableReader* reader = entry->reader.get();
     if (!reader) {
