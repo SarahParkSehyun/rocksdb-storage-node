@@ -80,6 +80,32 @@ struct Stats {
   std::atomic<size_t> cache_misses{0};
   std::atomic<size_t> evictions{0};
   
+  // Performance timing statistics (atomic accumulation)
+  std::atomic<uint64_t> total_accept_wait_us{0};
+  std::atomic<uint64_t> total_queue_wait_us{0};
+  std::atomic<uint64_t> total_work_us{0};
+  std::atomic<uint64_t> total_server_handler_us{0};
+  std::atomic<uint64_t> total_finish_call_us{0};
+  std::atomic<uint64_t> total_finish_cq_pop_us{0};
+  std::atomic<size_t> timing_sample_count{0};
+  
+  void RecordTiming(int64_t accept_wait_us, int64_t queue_wait_us, int64_t work_us,
+                    int64_t server_handler_us, int64_t finish_call_us, int64_t finish_cq_pop_us) {
+    // 음수 값은 0으로 처리 (시간 계산 오류 방지)
+    total_accept_wait_us.fetch_add(accept_wait_us > 0 ? accept_wait_us : 0);
+    total_queue_wait_us.fetch_add(queue_wait_us > 0 ? queue_wait_us : 0);
+    total_work_us.fetch_add(work_us > 0 ? work_us : 0);
+    total_server_handler_us.fetch_add(server_handler_us > 0 ? server_handler_us : 0);
+    total_finish_call_us.fetch_add(finish_call_us > 0 ? finish_call_us : 0);
+    total_finish_cq_pop_us.fetch_add(finish_cq_pop_us > 0 ? finish_cq_pop_us : 0);
+    timing_sample_count.fetch_add(1);
+  }
+  
+  void UpdateFinishCqPopUs(int64_t finish_cq_pop_us) {
+    // 음수 값은 0으로 처리 (시간 계산 오류 방지)
+    total_finish_cq_pop_us.fetch_add(finish_cq_pop_us > 0 ? finish_cq_pop_us : 0);
+  }
+  
   void RecordReason(CheckReason reason) {
     total_checks++;
     switch (reason) {
@@ -593,15 +619,21 @@ class PerCQWorkerQueue {
   struct WorkItem {
     CheckCallData* call_data;
     BatchRequest request;
-    std::chrono::steady_clock::time_point handler_start;
+    std::chrono::steady_clock::time_point accept_time;      // CREATE에서 등록한 시간
+    std::chrono::steady_clock::time_point process_time;    // PROCESS에서 요청 도착 시간
+    std::chrono::steady_clock::time_point enqueue_time;     // Worker queue에 enqueue한 시간
+    std::chrono::steady_clock::time_point work_start_time; // Worker thread에서 작업 시작 시간
     size_t req_id;
     size_t active_count;
     
     WorkItem(CheckCallData* cd, const BatchRequest& req,
-             std::chrono::steady_clock::time_point start,
+             std::chrono::steady_clock::time_point accept,
+             std::chrono::steady_clock::time_point process,
+             std::chrono::steady_clock::time_point enqueue,
              size_t id, size_t active)
-        : call_data(cd), request(req), handler_start(start),
-          req_id(id), active_count(active) {}
+        : call_data(cd), request(req), accept_time(accept),
+          process_time(process), enqueue_time(enqueue),
+          work_start_time(), req_id(id), active_count(active) {}
   };
   
   explicit PerCQWorkerQueue(size_t num_workers)
@@ -665,44 +697,66 @@ class CheckCallData : public CallDataBase {
         stats_(stats), log_mutex_(log_mutex), open_count_(open_count),
         active_rpc_count_(active_rpc_count), total_rpc_count_(total_rpc_count),
         clock_(clock), fs_(fs), worker_queue_(worker_queue),
-        responder_(&ctx_), status_(CREATE) {
+        responder_(&ctx_), status_(CREATE),
+        accept_time_(std::chrono::steady_clock::now()) {
     Proceed();
   }
 
   void Proceed() override {
     if (status_ == CREATE) {
-      // ACCEPT: 새로운 RPC 요청 수락
+      // CREATE: 다음 요청을 받기 위해 등록만 함 (아직 실제 요청이 도착하지 않음)
+      // accept_time_은 생성자에서 이미 설정됨
       status_ = PROCESS;
       service_->RequestCheck(&ctx_, &request_, &responder_, cq_, cq_, this);
+      // 여기서 끝. timer/req_id/active++ 절대 하지 말기
+      return;
+    } else if (status_ == PROCESS) {
+      // PROCESS: 실제 요청이 도착한 시점 (request_가 유효함)
+      // accept_time_은 이미 생성자에서 설정되어 있음 (CREATE 등록 시점)
+      process_time_ = std::chrono::steady_clock::now(); // 실제 요청 도착 시간
       
-      // Active RPC 카운터 증가
+      req_id_ = request_count_.fetch_add(1) + 1;
       active_count_ = active_rpc_count_->fetch_add(1) + 1;
       total_rpc_count_->fetch_add(1);
       
-      handler_start_ = std::chrono::steady_clock::now();
-      req_id_ = request_count_.fetch_add(1) + 1;
-      
-      if (req_id_ <= 10 || req_id_ % 100 == 0) {
-        // std::cerr << "[INFO] Check request #" << req_id_ 
-        //           << " received: " << request_.reqs_size() << " key request(s)" << std::flush << std::endl;
-      }
-    } else if (status_ == PROCESS) {
-      // READ 완료, PROCESS 시작
       // 새로운 CallData를 생성하여 다음 요청을 받을 준비
+      // 생성자에서 accept_time_이 자동으로 설정됨 (생성 시점 = 등록 시점)
       new CheckCallData(service_, cq_, cache_, rocksdb_options_, stats_, log_mutex_,
                        open_count_, active_rpc_count_, total_rpc_count_, clock_, fs_,
                        worker_queue_);
       
       // CQ poller thread: Enqueue work to per-CQ worker queue and return immediately
       // DO NOT perform bloom filter checks here - that happens in worker thread
+      auto enqueue_time = std::chrono::steady_clock::now();
       worker_queue_->Enqueue(PerCQWorkerQueue::WorkItem(
-          this, request_, handler_start_, req_id_, active_count_));
+          this, request_, accept_time_, process_time_, enqueue_time,
+          req_id_, active_count_));
       
       // Return immediately - worker thread will call Finish() directly
       // No need for WORK_DONE state or Alarm
     } else {
-      // FINISH 완료
+      // FINISH 완료 - CQ poller thread에서 completion 이벤트 처리
       GPR_ASSERT(status_ == FINISH);
+      auto finish_cq_pop_time = std::chrono::steady_clock::now();
+      
+      // finish_call_us: Finish() 호출 후 시간 측정
+      auto finish_call_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          finish_call_time_ - process_time_).count();
+      
+      // finish_cq_pop_us: PROCESS 요청 도착 → FINISH completion 이벤트
+      auto finish_cq_pop_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          finish_cq_pop_time - process_time_).count();
+      
+      // 통계 기록을 FINISH에서 한 번에 수행 (레이스 조건 방지)
+      if (stats_) {
+        int64_t finish_call_us_safe = finish_call_us > 0 ? finish_call_us : 0;
+        int64_t finish_cq_pop_us_safe = finish_cq_pop_us > 0 ? finish_cq_pop_us : 0;
+        stats_->RecordTiming(accept_wait_us_, queue_wait_us_, work_us_, handler_us_,
+                            finish_call_us_safe, finish_cq_pop_us_safe);
+      }
+      
+      // active_rpc_count 감소는 FINISH에서만 1번
+      active_rpc_count_->fetch_sub(1);
       delete this;
     }
   }
@@ -711,6 +765,13 @@ class CheckCallData : public CallDataBase {
   // Worker thread directly calls Finish() - no Alarm needed
   void ProcessInWorkerThread(PerCQWorkerQueue::WorkItem item) {
     // This runs in worker thread, NOT in CQ poller thread
+    auto work_start_time = std::chrono::steady_clock::now();
+    item.work_start_time = work_start_time;
+    
+    // Queue wait: enqueue → worker start
+    auto queue_wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        work_start_time - item.enqueue_time).count();
+    
     response_.clear_resps();
     response_.mutable_resps()->Reserve(item.request.reqs_size());
 
@@ -721,31 +782,37 @@ class CheckCallData : public CallDataBase {
       *response_.add_resps() = key_resp;
     }
     
-    // Handler 종료 시간 측정
-    auto handler_end = std::chrono::steady_clock::now();
-    auto handler_us = std::chrono::duration_cast<std::chrono::microseconds>(
-        handler_end - item.handler_start).count();
+    // Work 종료 시간 측정
+    auto work_end_time = std::chrono::steady_clock::now();
     
-    // if (item.req_id <= 10 || item.req_id % 100 == 0) {
-    //   std::lock_guard<std::mutex> log_lock(*log_mutex_);
-    //   std::cerr << "[INFO] Check request #" << item.req_id << " completed" << std::flush << std::endl;
-    //   std::cerr << "[INFO] Check request #" << item.req_id 
-    //             << " response size: " << response_.resps_size() << std::flush << std::endl;
-    //   std::cerr << "[PERF] Check request #" << item.req_id 
-    //             << " server_handler_us=" << handler_us 
-    //             << " active_rpcs=" << item.active_count
-    //             << " (handler processing time)" << std::flush << std::endl;
-    // }
+    // Accept wait: CREATE 등록 → PROCESS 요청 도착
+    auto accept_wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        item.process_time - item.accept_time).count();
+    
+    // Work time: worker start → work end
+    auto work_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        work_end_time - work_start_time).count();
+    
+    // Total handler time: PROCESS 요청 도착 → work end
+    auto handler_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        work_end_time - item.process_time).count();
+    
+    // 핫패스에서 로그 완전 제거 - 값들을 멤버 변수에 저장하여 FINISH에서 한 번에 기록
+    accept_wait_us_ = accept_wait_us > 0 ? accept_wait_us : 0;
+    queue_wait_us_ = queue_wait_us > 0 ? queue_wait_us : 0;
+    work_us_ = work_us > 0 ? work_us : 0;
+    handler_us_ = handler_us > 0 ? handler_us : 0;
     
     // Worker thread directly calls Finish() - gRPC responder is thread-safe
     // No need for Alarm or CQ notification
     status_ = FINISH;
     responder_.Finish(response_, grpc::Status::OK, this);
     
-    // Active RPC 카운터 감소
-    active_rpc_count_->fetch_sub(1);
+    // finish_call_time은 Finish() 호출 후 측정
+    finish_call_time_ = std::chrono::steady_clock::now();
     
     // Note: CallData will be deleted when FINISH event is processed by CQ poller
+    // 통계 기록은 FINISH 상태에서 한 번에 수행됨
   }
 
  private:
@@ -969,7 +1036,16 @@ class CheckCallData : public CallDataBase {
   std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs_;
   PerCQWorkerQueue* worker_queue_;
   
-  std::chrono::steady_clock::time_point handler_start_;
+  std::chrono::steady_clock::time_point accept_time_;   // CREATE에서 등록한 시간
+  std::chrono::steady_clock::time_point process_time_;  // PROCESS에서 요청 도착 시간
+  std::chrono::steady_clock::time_point finish_call_time_;  // Finish() 호출 후 시간
+  
+  // Timing 값들을 멤버 변수에 저장하여 FINISH에서 한 번에 기록
+  int64_t accept_wait_us_{0};
+  int64_t queue_wait_us_{0};
+  int64_t work_us_{0};
+  int64_t handler_us_{0};
+  
   size_t req_id_;
   size_t active_count_;
   
@@ -1004,20 +1080,36 @@ void PerCQWorkerQueue::WorkerLoop() {
 // Per-RPC state machine for Noop RPC
 class NoopCallData : public CallDataBase {
  public:
-  NoopCallData(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* cq)
-      : service_(service), cq_(cq), responder_(&ctx_), status_(CREATE) {
+  NoopCallData(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* cq,
+               std::mutex* log_mutex, std::atomic<size_t>* active_rpc_count,
+               std::atomic<size_t>* total_rpc_count, Stats* stats)
+      : service_(service), cq_(cq), log_mutex_(log_mutex),
+        active_rpc_count_(active_rpc_count), total_rpc_count_(total_rpc_count),
+        stats_(stats), responder_(&ctx_), status_(CREATE),
+        accept_time_(std::chrono::steady_clock::now()) {
     Proceed();
   }
 
   void Proceed() override {
     if (status_ == CREATE) {
-      // ACCEPT: 새로운 RPC 요청 수락
+      // CREATE: 다음 요청을 받기 위해 등록만 함 (아직 실제 요청이 도착하지 않음)
+      // accept_time_은 생성자에서 이미 설정됨
       status_ = PROCESS;
       service_->RequestNoop(&ctx_, &request_, &responder_, cq_, cq_, this);
+      // 여기서 끝. timer/req_id/active++ 절대 하지 말기
+      return;
     } else if (status_ == PROCESS) {
-      // READ 완료, PROCESS 시작
+      // PROCESS: 실제 요청이 도착한 시점 (request_가 유효함)
+      // accept_time_은 이미 생성자에서 설정되어 있음 (CREATE 등록 시점)
+      process_time_ = std::chrono::steady_clock::now(); // 실제 요청 도착 시간
+      
+      req_id_ = request_count_.fetch_add(1) + 1;
+      active_count_ = active_rpc_count_->fetch_add(1) + 1;
+      total_rpc_count_->fetch_add(1);
+      
       // 새로운 CallData를 생성하여 다음 요청을 받을 준비
-      new NoopCallData(service_, cq_);
+      // 생성자에서 accept_time_이 자동으로 설정됨 (생성 시점 = 등록 시점)
+      new NoopCallData(service_, cq_, log_mutex_, active_rpc_count_, total_rpc_count_, stats_);
       
       // 실제 요청 처리
       struct timespec ts;
@@ -1027,26 +1119,56 @@ class NoopCallData : public CallDataBase {
       
       response_.set_server_ts_ns(now_ns);
       
-      // Optional: very sparse logging (1/100000 sample rate)
-      static std::atomic<size_t> noop_count{0};
-      size_t count = noop_count.fetch_add(1) + 1;
+      // Handler 종료 시간 측정
+      auto handler_end = std::chrono::steady_clock::now();
       
-      static bool noop_log_enabled = []() {
-        const char* env = std::getenv("BLOOMD_NOOP_LOG");
-        return env && std::string(env) == "1";
-      }();
+      // Accept wait: CREATE 등록 → PROCESS 요청 도착
+      auto accept_wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          process_time_ - accept_time_).count();
       
-      // if (noop_log_enabled && count % 100000 == 0) {
-      //   std::cerr << "[NOOP] Noop request #" << count 
-      //             << " server_ts_ns=" << now_ns << std::flush << std::endl;
-      // }
+      // Work time: PROCESS 요청 도착 → handler end (noop은 worker queue 없으므로 바로 처리)
+      auto work_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          handler_end - process_time_).count();
+      
+      // Total handler time: PROCESS 요청 도착 → handler end
+      auto handler_us = work_us;
+      
+      // 핫패스에서 로그 완전 제거 - 값들을 멤버 변수에 저장하여 FINISH에서 한 번에 기록
+      accept_wait_us_ = accept_wait_us > 0 ? accept_wait_us : 0;
+      work_us_ = work_us > 0 ? work_us : 0;
+      handler_us_ = handler_us > 0 ? handler_us : 0;
       
       // FINISH: 응답 전송
       status_ = FINISH;
       responder_.Finish(response_, grpc::Status::OK, this);
+      
+      // finish_call_time은 Finish() 호출 후 측정
+      finish_call_time_ = std::chrono::steady_clock::now();
+      
+      // Note: 통계 기록은 FINISH 상태에서 한 번에 수행됨
     } else {
-      // FINISH 완료
+      // FINISH 완료 - CQ poller thread에서 completion 이벤트 처리
       GPR_ASSERT(status_ == FINISH);
+      auto finish_cq_pop_time = std::chrono::steady_clock::now();
+      
+      // finish_call_us: Finish() 호출 후 시간 측정
+      auto finish_call_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          finish_call_time_ - process_time_).count();
+      
+      // finish_cq_pop_us: PROCESS 요청 도착 → FINISH completion 이벤트
+      auto finish_cq_pop_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          finish_cq_pop_time - process_time_).count();
+      
+      // 통계 기록을 FINISH에서 한 번에 수행 (레이스 조건 방지)
+      if (stats_) {
+        int64_t finish_call_us_safe = finish_call_us > 0 ? finish_call_us : 0;
+        int64_t finish_cq_pop_us_safe = finish_cq_pop_us > 0 ? finish_cq_pop_us : 0;
+        stats_->RecordTiming(accept_wait_us_, 0, work_us_, handler_us_,
+                            finish_call_us_safe, finish_cq_pop_us_safe);
+      }
+      
+      // active_rpc_count 감소는 FINISH에서만 1번
+      active_rpc_count_->fetch_sub(1);
       delete this;
     }
   }
@@ -1061,7 +1183,28 @@ class NoopCallData : public CallDataBase {
   NoopRequest request_;
   NoopResponse response_;
   grpc::ServerAsyncResponseWriter<NoopResponse> responder_;
+  
+  std::mutex* log_mutex_;
+  std::atomic<size_t>* active_rpc_count_;
+  std::atomic<size_t>* total_rpc_count_;
+  Stats* stats_;
+  
+  std::chrono::steady_clock::time_point accept_time_;   // CREATE에서 등록한 시간
+  std::chrono::steady_clock::time_point process_time_;  // PROCESS에서 요청 도착 시간
+  std::chrono::steady_clock::time_point finish_call_time_;  // Finish() 호출 후 시간
+  
+  // Timing 값들을 멤버 변수에 저장하여 FINISH에서 한 번에 기록
+  int64_t accept_wait_us_{0};
+  int64_t work_us_{0};
+  int64_t handler_us_{0};
+  
+  size_t req_id_;
+  size_t active_count_;
+  
+  static std::atomic<size_t> request_count_;
 };
+
+std::atomic<size_t> NoopCallData::request_count_{0};
 
 // BloomCheckServiceImpl implements the gRPC AsyncService
 class BloomCheckServiceImpl {
@@ -1148,25 +1291,31 @@ class BloomCheckServiceImpl {
           qps = (delta_rpc * 1000.0) / delta_time;
         }
         
-        // QPS 로그 출력 (매 1초)
-        // {
+        // Timing statistics 출력 (매 1초)
+        // size_t sample_count = stats_.timing_sample_count.load();
+        // if (sample_count > 0) {
+        //   uint64_t total_accept_wait = stats_.total_accept_wait_us.load();
+        //   uint64_t total_queue_wait = stats_.total_queue_wait_us.load();
+        //   uint64_t total_work = stats_.total_work_us.load();
+        //   uint64_t total_handler = stats_.total_server_handler_us.load();
+        //   uint64_t total_finish_call = stats_.total_finish_call_us.load();
+        //   uint64_t total_finish_cq_pop = stats_.total_finish_cq_pop_us.load();
+        //   
         //   std::lock_guard<std::mutex> log_lock(log_mutex_);
-        //   std::cerr << "[QPS] rpc_qps=" << static_cast<size_t>(qps)
+        //   std::cerr << "[STATS] samples=" << sample_count
+        //             << " accept_wait_avg=" << (total_accept_wait / sample_count)
+        //             << " queue_wait_avg=" << (total_queue_wait / sample_count)
+        //             << " work_avg=" << (total_work / sample_count)
+        //             << " handler_avg=" << (total_handler / sample_count)
+        //             << " finish_call_avg=" << (total_finish_call / sample_count)
+        //             << " finish_cq_pop_avg=" << (total_finish_cq_pop / sample_count)
+        //             << " qps=" << static_cast<size_t>(qps)
         //             << " active_rpcs=" << current_active_rpc
-        //             << " total_rpcs=" << current_total_rpc
-        //             << " (qps=" << std::fixed << std::setprecision(1) << qps << ")"
         //             << std::endl;
         // }
         
         last_total_rpc = current_total_rpc;
         last_time = now;
-        
-        // 5초마다 상세 통계 출력
-        // static int detail_counter = 0;
-        // if (++detail_counter >= 5) {
-        //   detail_counter = 0;
-        //   stats_.PrintStats(log_mutex_, open_count_.load(), current_active_rpc);
-        // }
       }
     });
   }
@@ -1185,10 +1334,12 @@ class BloomCheckServiceImpl {
 void HandleRpcs(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* cq,
                 BloomCheckServiceImpl* impl, PerCQWorkerQueue* worker_queue) {
   // 초기 CallData 생성 (ACCEPT 단계)
+  // 생성자에서 accept_time_이 자동으로 설정됨
   new CheckCallData(service, cq, impl->cache(), impl->rocksdb_options(), impl->stats(),
                    impl->log_mutex(), impl->open_count(), impl->active_rpc_count(),
                    impl->total_rpc_count(), impl->clock(), impl->fs(), worker_queue);
-  new NoopCallData(service, cq);
+  new NoopCallData(service, cq, impl->log_mutex(), impl->active_rpc_count(),
+                   impl->total_rpc_count(), impl->stats());
   
   void* tag;
   bool ok;
@@ -1196,8 +1347,17 @@ void HandleRpcs(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* 
   // CQ에서 이벤트 폴링
   // This loop runs in CQ poller thread - must be fast and non-blocking
   while (true) {
-    GPR_ASSERT(cq->Next(&tag, &ok));
-    GPR_ASSERT(ok);
+    // CQ가 shutdown되면 Next()는 false를 반환함
+    if (!cq->Next(&tag, &ok)) {
+      // CQ가 shutdown되었으므로 루프 종료
+      break;
+    }
+    
+    // ok가 false인 경우는 shutdown 이벤트일 수 있음
+    if (!ok) {
+      // Shutdown 이벤트이거나 오류 - 루프 종료
+      break;
+    }
     
     // CallData의 Proceed() 호출하여 state machine 진행
     // Proceed() should only do state transitions and enqueue work, NOT execute bloom filters
@@ -1283,15 +1443,18 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   // 서버 종료 대기
   server->Wait();
   
-  // 서버 종료 시 CQ 종료
+  // 서버 종료 시작 (새로운 요청 수락 중단)
   server->Shutdown();
-  for (auto& cq : cqs) {
-    cq->Shutdown();
-  }
   
-  // Worker queues 종료 (큐에 남은 작업 처리)
+  // Worker queues 종료 (큐에 남은 작업 처리 완료 대기)
+  // CQ poller thread가 종료되기 전에 worker thread가 완료되도록 보장
   for (auto& wq : worker_queues) {
     wq->Shutdown();
+  }
+  
+  // CQ 종료 (worker thread가 완료된 후)
+  for (auto& cq : cqs) {
+    cq->Shutdown();
   }
   
   // CQ 폴러 스레드 종료 대기
