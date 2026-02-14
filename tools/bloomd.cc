@@ -43,6 +43,24 @@
 
 namespace bloomcheck {
 
+// Performance tuning environment variables
+static bool GetEnvBool(const char* name, bool default_value) {
+  const char* val = std::getenv(name);
+  if (!val) return default_value;
+  return std::string(val) == "1" || std::string(val) == "true" || std::string(val) == "on";
+}
+
+static std::string GetEnvString(const char* name, const char* default_value) {
+  const char* val = std::getenv(name);
+  return val ? std::string(val) : std::string(default_value);
+}
+
+// Performance tuning flags
+static const bool BLOOMCHECK_DEBUG_COUNTERS = GetEnvBool("BLOOMCHECK_DEBUG_COUNTERS", false);
+static const std::string BLOOMCHECK_STATS_MODE = GetEnvString("BLOOMCHECK_STATS_MODE", "atomic");
+static const std::string BLOOMCHECK_ENTRY_LOCK = GetEnvString("BLOOMCHECK_ENTRY_LOCK", "mutex");
+static const std::string BLOOMCHECK_WORKERQ_MODE = GetEnvString("BLOOMCHECK_WORKERQ_MODE", "single");
+
 // Reason codes for why CheckKeyInSST returned true/false
 enum class CheckReason {
   OPEN_FAIL,              // GetOrOpen returned nullptr
@@ -233,8 +251,10 @@ class TableReaderCache {
     std::unique_ptr<ROCKSDB_NAMESPACE::TableReader> reader;
     ROCKSDB_NAMESPACE::InternalKeyComparator internal_comparator;
     ROCKSDB_NAMESPACE::ImmutableOptions ioptions;
-    std::chrono::steady_clock::time_point last_access;
-    std::mutex mutex;  // Per-entry lock for thread safety
+    std::atomic<std::chrono::steady_clock::time_point> last_access;  // Atomic으로 변경하여 lock-free
+    // Mutex는 env var로 제어: "0"=없음, "shared"=shared_mutex, "mutex"=mutex
+    mutable std::mutex mutex;  // Per-entry lock for thread safety (optional)
+    mutable std::shared_mutex shared_mutex;  // Alternative: shared_mutex for read-heavy
     
     explicit CacheEntry(const ROCKSDB_NAMESPACE::Options& opt)
         : internal_comparator(opt.comparator),
@@ -242,6 +262,11 @@ class TableReaderCache {
           last_access(std::chrono::steady_clock::now()) {
       // ImmutableOptions constructor sets fs from env automatically
       // (ImmutableDBOptions constructor sets: fs = env->GetFileSystem())
+    }
+    
+    // Lock-free last_access 업데이트
+    void UpdateLastAccess() {
+      last_access.store(std::chrono::steady_clock::now());
     }
   };
 
@@ -262,7 +287,12 @@ class TableReaderCache {
     std::unordered_map<uint64_t, std::list<uint64_t>::iterator> lru_map;
     size_t max_size;
     
-    Shard(size_t max_size_per_shard) : max_size(max_size_per_shard) {}
+    Shard(size_t max_size_per_shard) : max_size(max_size_per_shard) {
+      // Reserve to avoid rehash during writer lock
+      cache.reserve(max_size * 2);
+      inflight.reserve(max_size * 2);
+      lru_map.reserve(max_size * 2);
+    }
   };
 
   static constexpr size_t N_SHARDS = 16;  // 2^4 shards for better distribution
@@ -285,85 +315,12 @@ class TableReaderCache {
     return *shards_[GetShardIndex(file_number)];
   }
 
-  // Get or create TableReader for SST file (by file_number)
-  // Returns nullptr on error (safe to treat as may_match=true)
-  std::shared_ptr<CacheEntry> GetOrOpen(uint64_t file_number,
-                                        const ROCKSDB_NAMESPACE::Options& options,
-                                        Stats* stats, std::mutex* log_mutex, std::atomic<size_t>* open_count) {
-    Shard& shard = GetShard(file_number);
-    
-    // Phase A: Check cache hit with shared_lock (read-heavy optimization)
-    std::shared_ptr<CacheEntry> cached_entry;
-    {
-      std::shared_lock<std::shared_mutex> lock(shard.mutex);
-      
-      // Check cache first (by file_number)
-      auto it = shard.cache.find(file_number);
-      if (it != shard.cache.end()) {
-        // Cache hit - remember entry, update LRU outside shared_lock
-        cached_entry = it->second;
-        if (stats) stats->cache_hits++;
-      }
-    }
-    
-    // Update LRU outside shared_lock (requires unique_lock)
-    if (cached_entry) {
-      std::unique_lock<std::shared_mutex> lock(shard.mutex);
-      // Double-check cache still exists (might have been evicted)
-      if (shard.cache.find(file_number) != shard.cache.end()) {
-        UpdateLRU(shard, file_number);
-      }
-      return cached_entry;
-    }
-
-    // Cache miss - need to open file
-    if (stats) stats->cache_misses++;
-    
-    // Phase A (continued): Check inflight and register if needed
-    std::shared_ptr<InflightOpen> inflight;
-    bool is_waiting = false;
-    {
-      std::unique_lock<std::shared_mutex> lock(shard.mutex);
-      
-      // Double-check cache (might have been inserted by another thread)
-      auto it = shard.cache.find(file_number);
-      if (it != shard.cache.end()) {
-        UpdateLRU(shard, file_number);
-        if (stats) stats->cache_hits++;
-        return it->second;
-      }
-      
-      // Check if another thread is already opening this file
-      auto inflight_it = shard.inflight.find(file_number);
-      if (inflight_it != shard.inflight.end()) {
-        // Another thread is opening - wait for result
-        inflight = inflight_it->second;
-        is_waiting = true;
-      } else {
-        // We are the first thread to open this file - register inflight
-        inflight = std::make_shared<InflightOpen>();
-        shard.inflight[file_number] = inflight;
-        
-        // If cache is full, evict LRU entry before opening
-        if (shard.cache.size() >= shard.max_size) {
-          EvictLRUOne(shard, stats);
-        }
-      }
-      // Lock released here - proceed to Phase B
-    }
-    
-    // If another thread is opening, wait for result
-    if (is_waiting && inflight) {
-      try {
-        std::shared_ptr<CacheEntry> result = inflight->future.get();
-        return result;
-      } catch (...) {
-        // Promise was broken (shouldn't happen, but handle gracefully)
-        return nullptr;
-      }
-    }
-
-    // Open SST file directly using BlockBasedTable
+  // Helper function: Open TableReader outside of any locks
+  // Returns nullptr on error
+  std::shared_ptr<CacheEntry> DoOpenTableReader(
+      uint64_t file_number,
+      const ROCKSDB_NAMESPACE::Options& options,
+      Stats* stats, std::mutex* log_mutex, std::atomic<size_t>* open_count) {
     // Create a new entry with ImmutableOptions and InternalKeyComparator
     auto entry = std::make_unique<CacheEntry>(options);
 
@@ -393,42 +350,12 @@ class TableReaderCache {
     if (actual_path.empty() || file_size == 0) {
       // TryOpenSstPath failed to find any matching file
       if (stats) stats->open_fail_getfilesize++;
-      // 샘플 로그 (초기 50회 + 매 1000회) - 락 밖에서
-      // if (open_id <= 50 || open_id % 1000 == 0) {
-      //   std::lock_guard<std::mutex> log_lock(*log_mutex);
-      //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
-      //             << " FAIL: TryOpenSstPath failed to find file" << std::endl;
-      //   std::cerr << "[SAMPLE]   file_number: " << file_number << std::endl;
-      //   std::cerr << "[SAMPLE]   actual_path: " << (actual_path.empty() ? "(empty)" : actual_path) << std::endl;
-      // }
-      // Clean up inflight entry on failure
-      {
-        std::lock_guard<std::shared_mutex> lock(shard.mutex);
-        shard.inflight.erase(file_number);
-        inflight->promise.set_value(nullptr);
-      }
       return nullptr;
     }
 
     ROCKSDB_NAMESPACE::IOStatus s = fs->NewRandomAccessFile(actual_path, fopts, &file, nullptr);
     if (!s.ok()) {
       if (stats) stats->open_fail_newfile++;
-      // 샘플 로그 - 락 밖에서
-      // if (open_id <= 50 || open_id % 1000 == 0) {
-      //   std::lock_guard<std::mutex> log_lock(*log_mutex);
-      //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
-      //             << " FAIL: NewRandomAccessFile failed" << std::endl;
-      //   std::cerr << "[SAMPLE]   file_number: " << file_number << std::endl;
-      //   std::cerr << "[SAMPLE]   actual_path: " << actual_path << std::endl;
-      //   std::cerr << "[SAMPLE]   file_size: " << file_size << std::endl;
-      //   std::cerr << "[SAMPLE]   error: " << s.ToString() << std::endl;
-      // }
-      // Clean up inflight entry on failure
-      {
-        std::lock_guard<std::shared_mutex> lock(shard.mutex);
-        shard.inflight.erase(file_number);
-        inflight->promise.set_value(nullptr);
-      }
       return nullptr;
     }
 
@@ -460,105 +387,130 @@ class TableReaderCache {
     
     if (!table_status.ok() || !table_reader) {
       if (stats) stats->open_fail_newreader++;
-      // 샘플 로그 - 락 밖에서
-      // if (open_id <= 50 || open_id % 1000 == 0) {
-      //   std::lock_guard<std::mutex> log_lock(*log_mutex);
-      //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
-      //             << " FAIL: NewTableReader failed" << std::endl;
-      //   std::cerr << "[SAMPLE]   file_number: " << file_number << std::endl;
-      //   std::cerr << "[SAMPLE]   actual_path: " << actual_path << std::endl;
-      //   std::cerr << "[SAMPLE]   file_size: " << file_size << std::endl;
-      //   std::cerr << "[SAMPLE]   status: " << table_status.ToString() << std::endl;
-      // }
-      // Clean up inflight entry on failure
-      {
-        std::lock_guard<std::shared_mutex> lock(shard.mutex);
-        shard.inflight.erase(file_number);
-        inflight->promise.set_value(nullptr);
-      }
       return nullptr;
     }
 
-    // 샘플 로그 (성공한 경우) 및 table properties 로그
-    // if (open_id <= 5 || open_id % 1000 == 0) {
-    //   std::lock_guard<std::mutex> log_lock(*log_mutex);
-    //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
-    //             << " SUCCESS file_number=" << file_number 
-    //             << " path=" << actual_path << std::endl;
-    //   
-    //   // Table properties 로그
-    //   auto props = table_reader->GetTableProperties();
-    //   if (props) {
-    //     std::cerr << "[SAMPLE]   table_properties.filter_policy_name: " << props->filter_policy_name << std::endl;
-    //   } else {
-    //     std::cerr << "[SAMPLE]   table_properties: null" << std::endl;
-    //   }
-    //   
-    //   // BlockBasedTable::Rep 정보 로그
-    //   ROCKSDB_NAMESPACE::BlockBasedTable* bb_table =
-    //       static_cast<ROCKSDB_NAMESPACE::BlockBasedTable*>(table_reader.get());
-    //   if (bb_table) {
-    //     const ROCKSDB_NAMESPACE::BlockBasedTable::Rep* rep = bb_table->get_rep();
-    //     if (rep) {
-    //       std::cerr << "[SAMPLE]   rep->filter_policy: " << (rep->table_options.filter_policy ? rep->table_options.filter_policy.get() : nullptr) << std::endl;
-    //       if (rep->table_options.filter_policy) {
-    //         std::cerr << "[SAMPLE]   rep->filter_policy->Name(): " << rep->table_options.filter_policy->Name() << std::endl;
-    //       }
-    //       std::cerr << "[SAMPLE]   rep->filter: " << (rep->filter ? rep->filter.get() : nullptr) << std::endl;
-    //       std::cerr << "[SAMPLE]   rep->whole_key_filtering: " << (rep->whole_key_filtering ? "true" : "false") << std::endl;
-    //       std::cerr << "[SAMPLE]   rep->index_type: " << static_cast<int>(rep->index_type) << std::endl;
-    //       
-    //       // 실제로 열린 파일의 첫 번째 키 확인 (초기 5회만)
-    //       if (open_id <= 5) {
-    //         ROCKSDB_NAMESPACE::ReadOptions ro;
-    //         std::unique_ptr<ROCKSDB_NAMESPACE::InternalIterator> iter(
-    //             table_reader->NewIterator(ro, nullptr, nullptr, false,
-    //                                      ROCKSDB_NAMESPACE::TableReaderCaller::kSSTDumpTool));
-    //         iter->SeekToFirst();
-    //         if (iter->Valid()) {
-    //           ROCKSDB_NAMESPACE::Slice first_key = iter->key();
-    //           std::cerr << "[SAMPLE]   First key in file (hex): " << first_key.ToString(true) << std::endl;
-    //           ROCKSDB_NAMESPACE::ParsedInternalKey parsed;
-    //           if (ROCKSDB_NAMESPACE::ParseInternalKey(first_key, &parsed, false).ok()) {
-    //             std::cerr << "[SAMPLE]   First user_key (hex): " << parsed.user_key.ToString(true) << std::endl;
-    //           }
-    //         }
-    //       }
-    //     } else {
-    //       std::cerr << "[SAMPLE]   rep: null" << std::endl;
-    //     }
-    //   }
-    // }
-
     entry->reader = std::move(table_reader);
-    std::shared_ptr<CacheEntry> entry_ptr = std::move(entry);
-    
-    // Phase C: Insert into cache under lock (short duration)
+    return std::shared_ptr<CacheEntry>(std::move(entry));
+  }
+
+  // Get or create TableReader for SST file (by file_number)
+  // Returns nullptr on error (safe to treat as may_match=true)
+  // Lock structure: waiter never holds writer lock, writer lock only for map updates
+  std::shared_ptr<CacheEntry> GetOrOpen(uint64_t file_number,
+                                        const ROCKSDB_NAMESPACE::Options& options,
+                                        Stats* stats, std::mutex* log_mutex, std::atomic<size_t>* open_count) {
+    Shard& shard = GetShard(file_number);
+
+    // (A) shared_lock 1차 fast-path: cache hit or inflight wait
     {
-      std::unique_lock<std::shared_mutex> lock(shard.mutex);
-      
-      // Double-check cache (might have been inserted by another thread during Phase B)
+      std::shared_lock<std::shared_mutex> rlock(shard.mutex);
+
+      auto it = shard.cache.find(file_number);
+      if (it != shard.cache.end()) {
+        // Cache hit - return immediately (LRU update disabled for performance)
+        // Note: LRU update on cache hit can be enabled later via separate policy if needed
+        if (stats) stats->cache_hits++;
+        return it->second;
+      }
+
+      auto iit = shard.inflight.find(file_number);
+      if (iit != shard.inflight.end()) {
+        // Inflight exists - copy shared_ptr and wait outside lock
+        auto inflight = iit->second;
+        rlock.unlock();
+        // Waiter never holds writer lock
+        try {
+          return inflight->future.get();
+        } catch (...) {
+          return nullptr;
+        }
+      }
+    }
+
+    // (B) inflight 객체는 락 밖에서 미리 생성
+    auto my_inflight = std::make_shared<InflightOpen>();
+    std::shared_ptr<InflightOpen> inflight_to_wait;
+    bool i_am_opener = false;
+
+    // (C) unique_lock 2차 결정(짧게): opener vs waiter 결정
+    {
+      std::unique_lock<std::shared_mutex> wlock(shard.mutex);
+
+      // Re-check cache (might have been inserted by another thread)
+      auto it = shard.cache.find(file_number);
+      if (it != shard.cache.end()) {
+        if (stats) stats->cache_hits++;
+        return it->second;
+      }
+
+      // Re-check inflight (might have been registered by another thread)
+      auto iit = shard.inflight.find(file_number);
+      if (iit != shard.inflight.end()) {
+        inflight_to_wait = iit->second;
+        i_am_opener = false;
+      } else {
+        // We are the opener - register inflight
+        shard.inflight.emplace(file_number, my_inflight);
+        inflight_to_wait = my_inflight;
+        i_am_opener = true;
+
+        if (stats) stats->cache_misses++;
+        // Evict if cache is full (before opening)
+        if (shard.cache.size() >= shard.max_size) {
+          EvictLRUOne(shard, stats);
+        }
+      }
+      // Writer lock released here - only map updates were done
+    }
+
+    // (D) opener가 아니면 기다리기 (writer lock 재진입 금지)
+    if (!i_am_opener) {
+      try {
+        return inflight_to_wait->future.get();
+      } catch (...) {
+        return nullptr;
+      }
+    }
+
+    // (E) opener만 락 밖에서 실제 Open 수행
+    std::shared_ptr<CacheEntry> opened_entry;
+    try {
+      opened_entry = DoOpenTableReader(
+          file_number, options, stats, log_mutex, open_count);
+    } catch (...) {
+      // Any exception during open - set nullptr to wake waiters
+      opened_entry = nullptr;
+    }
+
+    // (F) open 완료 후 insert/erase는 짧게 unique_lock으로
+    std::shared_ptr<CacheEntry> result;
+    {
+      std::unique_lock<std::shared_mutex> wlock(shard.mutex);
+
+      // Double-check cache (might have been inserted by another opener)
       auto it = shard.cache.find(file_number);
       if (it != shard.cache.end()) {
         // Another thread already inserted - use existing entry
-        UpdateLRU(shard, file_number);
-        if (stats) stats->cache_hits++;
-        // Clean up inflight entry
-        shard.inflight.erase(file_number);
-        inflight->promise.set_value(it->second);
-        return it->second;
+        result = it->second;
+        // UpdateLRU(shard, file_number); // optional
+      } else if (opened_entry) {
+        // Insert our opened entry
+        auto [insert_it, inserted] = shard.cache.emplace(file_number, opened_entry);
+        result = insert_it->second;
+        // UpdateLRU(shard, file_number); // optional - can be enabled later
+      } else {
+        result = nullptr;
       }
       
-      // Cache by file_number and update LRU
-      shard.cache[file_number] = entry_ptr;
-      UpdateLRU(shard, file_number);
-      
-      // Clean up inflight entry and notify waiters
+      // Clean up inflight entry
       shard.inflight.erase(file_number);
-      inflight->promise.set_value(entry_ptr);
     }
-    
-    return entry_ptr;
+
+    // (G) promise.set_value는 락 밖에서 (waiter hang 방지)
+    // Always set_value (even if nullptr) to wake waiters
+    my_inflight->promise.set_value(result);
+    return result;
   }
 
  private:
@@ -618,7 +570,7 @@ class PerCQWorkerQueue {
  public:
   struct WorkItem {
     CheckCallData* call_data;
-    BatchRequest request;
+    const BatchRequest* request;  // 포인터로 변경 - 복사 제거
     std::chrono::steady_clock::time_point accept_time;      // CREATE에서 등록한 시간
     std::chrono::steady_clock::time_point process_time;    // PROCESS에서 요청 도착 시간
     std::chrono::steady_clock::time_point enqueue_time;     // Worker queue에 enqueue한 시간
@@ -626,7 +578,7 @@ class PerCQWorkerQueue {
     size_t req_id;
     size_t active_count;
     
-    WorkItem(CheckCallData* cd, const BatchRequest& req,
+    WorkItem(CheckCallData* cd, const BatchRequest* req,
              std::chrono::steady_clock::time_point accept,
              std::chrono::steady_clock::time_point process,
              std::chrono::steady_clock::time_point enqueue,
@@ -636,10 +588,35 @@ class PerCQWorkerQueue {
           work_start_time(), req_id(id), active_count(active) {}
   };
   
+  // Worker별 queue 구조 (per_worker 모드용) - WorkItem 정의 후에 정의
+  struct WorkerQueue {
+    std::queue<WorkItem> queue;
+    std::mutex mutex;
+    std::condition_variable cv;
+    
+    // 기본 생성자/소멸자만 사용 (copy/move 불가)
+    WorkerQueue() = default;
+    WorkerQueue(const WorkerQueue&) = delete;
+    WorkerQueue& operator=(const WorkerQueue&) = delete;
+    WorkerQueue(WorkerQueue&&) = delete;
+    WorkerQueue& operator=(WorkerQueue&&) = delete;
+  };
+  
   explicit PerCQWorkerQueue(size_t num_workers)
       : num_workers_(num_workers), shutdown_(false) {
-    for (size_t i = 0; i < num_workers_; i++) {
-      workers_.emplace_back([this]() { WorkerLoop(); });
+    if (BLOOMCHECK_WORKERQ_MODE == "per_worker") {
+      // Worker별 queue 생성 (multi-consumer 경합 제거)
+      // unique_ptr 사용 (mutex/cv는 move 불가)
+      worker_queues_.reserve(num_workers_);
+      for (size_t i = 0; i < num_workers_; i++) {
+        worker_queues_.emplace_back(std::make_unique<WorkerQueue>());
+        workers_.emplace_back([this, i]() { WorkerLoopPerWorker(i); });
+      }
+    } else {
+      // 기존 방식: 단일 queue (기본)
+      for (size_t i = 0; i < num_workers_; i++) {
+        workers_.emplace_back([this]() { WorkerLoop(); });
+      }
     }
   }
   
@@ -647,23 +624,41 @@ class PerCQWorkerQueue {
     Shutdown();
   }
   
-  // Lock-free enqueue using atomic operations
+  // Enqueue work item (env var로 worker별 queue 또는 단일 queue 선택)
   void Enqueue(WorkItem item) {
-    // Use atomic operations for lock-free enqueue
-    // For simplicity, we use a lock here but can be optimized with lock-free queue
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex_);
-      work_queue_.push(std::move(item));
+    if (BLOOMCHECK_WORKERQ_MODE == "per_worker") {
+      // Round-robin 또는 req_id 기반으로 worker 선택
+      size_t worker_idx = item.req_id % num_workers_;
+      {
+        std::lock_guard<std::mutex> lock(worker_queues_[worker_idx]->mutex);
+        worker_queues_[worker_idx]->queue.push(std::move(item));
+      }
+      worker_queues_[worker_idx]->cv.notify_one();
+    } else {
+      // 기존 방식: 단일 queue
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        work_queue_.push(std::move(item));
+      }
+      queue_cv_.notify_one();
     }
-    queue_cv_.notify_one();
   }
   
   void Shutdown() {
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex_);
-      shutdown_ = true;
+    shutdown_ = true;
+    
+    if (BLOOMCHECK_WORKERQ_MODE == "per_worker") {
+      // 모든 worker queue에 notify
+      for (auto& wq : worker_queues_) {
+        wq->cv.notify_all();
+      }
+    } else {
+      // 기존 방식: 단일 queue
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+      }
+      queue_cv_.notify_all();
     }
-    queue_cv_.notify_all();
     
     for (auto& worker : workers_) {
       if (worker.joinable()) {
@@ -674,12 +669,19 @@ class PerCQWorkerQueue {
   
  private:
   void WorkerLoop();
+  void WorkerLoopPerWorker(size_t worker_idx);
   
   size_t num_workers_;
   std::atomic<bool> shutdown_;
+  
+  // 기존 방식: 단일 queue
   std::queue<WorkItem> work_queue_;
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
+  
+  // Worker별 queue (per_worker 모드) - unique_ptr 사용 (mutex/cv는 move 불가)
+  std::vector<std::unique_ptr<WorkerQueue>> worker_queues_;
+  
   std::vector<std::thread> workers_;
 };
 
@@ -729,7 +731,7 @@ class CheckCallData : public CallDataBase {
       // DO NOT perform bloom filter checks here - that happens in worker thread
       auto enqueue_time = std::chrono::steady_clock::now();
       worker_queue_->Enqueue(PerCQWorkerQueue::WorkItem(
-          this, request_, accept_time_, process_time_, enqueue_time,
+          this, &request_, accept_time_, process_time_, enqueue_time,
           req_id_, active_count_));
       
       // Return immediately - worker thread will call Finish() directly
@@ -773,13 +775,13 @@ class CheckCallData : public CallDataBase {
         work_start_time - item.enqueue_time).count();
     
     response_.clear_resps();
-    response_.mutable_resps()->Reserve(item.request.reqs_size());
+    response_.mutable_resps()->Reserve(item.request->reqs_size());
 
     // Process each key request (bloom filter checks happen here)
-    for (const auto& key_req : item.request.reqs()) {
-      KeyResponse key_resp;
-      ProcessKeyRequest(key_req, &key_resp);
-      *response_.add_resps() = key_resp;
+    // KeyResponse 복사 제거: add_resps()로 받은 포인터에 직접 채우기
+    for (const auto& key_req : item.request->reqs()) {
+      auto* out = response_.add_resps();
+      ProcessKeyRequest(key_req, out);
     }
     
     // Work 종료 시간 측정
@@ -803,15 +805,21 @@ class CheckCallData : public CallDataBase {
     work_us_ = work_us > 0 ? work_us : 0;
     handler_us_ = handler_us > 0 ? handler_us : 0;
     
+    // IMPORTANT: Finish() 호출 전에 모든 작업을 완료해야 함
+    // Finish() 호출 후에는 this가 삭제될 수 있으므로 멤버 변수에 접근하면 안 됨
+    // Active RPC 카운터 감소는 FINISH 이벤트에서만 수행 (double decrement 방지)
+    
+    // finish_call_time은 Finish() 호출 전에 측정 (Finish() 호출 후에는 this에 접근 불가)
+    finish_call_time_ = std::chrono::steady_clock::now();
+    
     // Worker thread directly calls Finish() - gRPC responder is thread-safe
     // No need for Alarm or CQ notification
+    // Finish() 호출 후에는 this의 멤버 변수에 접근하지 않아야 함
     status_ = FINISH;
     responder_.Finish(response_, grpc::Status::OK, this);
     
-    // finish_call_time은 Finish() 호출 후 측정
-    finish_call_time_ = std::chrono::steady_clock::now();
-    
     // Note: CallData will be deleted when FINISH event is processed by CQ poller
+    // Finish() 호출 후에는 함수를 즉시 반환해야 함 (this가 삭제될 수 있음)
     // 통계 기록은 FINISH 상태에서 한 번에 수행됨
   }
 
@@ -820,8 +828,12 @@ class CheckCallData : public CallDataBase {
     // ProcessKeyRequest 시작 시간 측정
     auto process_start = std::chrono::steady_clock::now();
     
+#if BLOOMCHECK_DEBUG_COUNTERS
     static std::atomic<size_t> key_request_count{0};
     size_t key_req_id = key_request_count.fetch_add(1) + 1;
+#else
+    (void)process_start;  // unused in release
+#endif
     
     const ROCKSDB_NAMESPACE::Slice user_key(req.user_key());
     
@@ -883,8 +895,13 @@ class CheckCallData : public CallDataBase {
     // CheckKeyInSST 시작 시간 측정
     auto check_start = std::chrono::steady_clock::now();
     
+#if BLOOMCHECK_DEBUG_COUNTERS
     static std::atomic<size_t> call_count{0};
     size_t call_id = call_count.fetch_add(1) + 1;
+#else
+    (void)check_start;  // unused in release
+    (void)file_number;  // unused in release
+#endif
     
     // Get or open TableReader - returns shared_ptr to guarantee lifetime
     auto get_entry_start = std::chrono::steady_clock::now();
@@ -898,11 +915,23 @@ class CheckCallData : public CallDataBase {
       return true;
     }
 
-    // Lock entry for thread-safe access
-    std::lock_guard<std::mutex> lock(entry->mutex);
-    entry->last_access = std::chrono::steady_clock::now();
-
-    ROCKSDB_NAMESPACE::TableReader* reader = entry->reader.get();
+    // Lock entry for thread-safe access (env var로 제어)
+    // last_access는 atomic으로 lock-free 업데이트
+    entry->UpdateLastAccess();
+    
+    ROCKSDB_NAMESPACE::TableReader* reader;
+    if (BLOOMCHECK_ENTRY_LOCK == "0") {
+      // Lock-free: read-only 접근 가정
+      reader = entry->reader.get();
+    } else if (BLOOMCHECK_ENTRY_LOCK == "shared") {
+      // Shared mutex: read path는 shared_lock
+      std::shared_lock<std::shared_mutex> lock(entry->shared_mutex);
+      reader = entry->reader.get();
+    } else {
+      // Default: mutex (기존 동작)
+      std::lock_guard<std::mutex> lock(entry->mutex);
+      reader = entry->reader.get();
+    }
     if (!reader) {
       stats_->RecordReason(CheckReason::READER_NULL);
       return true;
@@ -1072,6 +1101,30 @@ void PerCQWorkerQueue::WorkerLoop() {
       // Perform actual work in worker thread
       // This calls ProcessInWorkerThread which performs bloom filter checks
       // Worker thread directly calls Finish() - no Alarm needed
+      item.call_data->ProcessInWorkerThread(std::move(item));
+    }
+  }
+}
+
+// Worker별 queue를 사용하는 WorkerLoop (per_worker 모드)
+void PerCQWorkerQueue::WorkerLoopPerWorker(size_t worker_idx) {
+  auto& wq = worker_queues_[worker_idx];  // 참조로 저장하여 접근 간소화
+  while (true) {
+    std::unique_lock<std::mutex> lock(wq->mutex);
+    wq->cv.wait(lock, [this, &wq]() { 
+      return !wq->queue.empty() || shutdown_; 
+    });
+    
+    if (shutdown_ && wq->queue.empty()) {
+      break;
+    }
+    
+    if (!wq->queue.empty()) {
+      WorkItem item = std::move(wq->queue.front());
+      wq->queue.pop();
+      lock.unlock();
+      
+      // Perform actual work in worker thread
       item.call_data->ProcessInWorkerThread(std::move(item));
     }
   }
@@ -1398,7 +1451,9 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   builder.SetResourceQuota(quota);
   
   // 2. HTTP/2 stream concurrency 증가 (connection당)
-  builder.AddChannelArgument(GRPC_ARG_MAX_CONCURRENT_STREAMS, 1000);
+  // Note: Too high value can cause "Too many open files" error
+  // Each stream uses a file descriptor, so limit to reasonable value
+  builder.AddChannelArgument(GRPC_ARG_MAX_CONCURRENT_STREAMS, 100);
   
   // 3. 메시지 크기 제한
   builder.SetMaxReceiveMessageSize(4 * 1024 * 1024);  // 4MB
