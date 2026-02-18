@@ -30,7 +30,19 @@ if(WITH_TOOLS)
 endif()
 
 # eRPC bloomcheck server (optional, requires ERPC_ROOT)
-if(EXISTS "${ERPC_ROOT}/src/erpc/rpc.h")
+# Try to find eRPC headers in common locations
+set(ERPC_HEADER_PATH "")
+if(EXISTS "${ERPC_ROOT}/src/rpc.h")
+  set(ERPC_HEADER_PATH "${ERPC_ROOT}/src")
+elseif(EXISTS "${ERPC_ROOT}/src/erpc/rpc.h")
+  set(ERPC_HEADER_PATH "${ERPC_ROOT}/src")
+elseif(EXISTS "${ERPC_ROOT}/include/erpc/rpc.h")
+  set(ERPC_HEADER_PATH "${ERPC_ROOT}/include")
+elseif(EXISTS "${ERPC_ROOT}/erpc/rpc.h")
+  set(ERPC_HEADER_PATH "${ERPC_ROOT}")
+endif()
+
+if(ERPC_HEADER_PATH)
   # Find eRPC library
   set(ERPC_LIB_PATH "")
   if(EXISTS "${ERPC_ROOT}/build_perf/liberpc.a")
@@ -51,8 +63,12 @@ if(EXISTS "${ERPC_ROOT}/src/erpc/rpc.h")
       bloomcheck.pb.cc
     )
     
-    target_include_directories(bloomcheck_erpc_server${ARTIFACT_SUFFIX} PRIVATE
-      ${ERPC_ROOT}/src
+    # eRPC requires asio headers (even for InfiniBand transport)
+    set(ERPC_ASIO_PATH "${ERPC_ROOT}/third_party/asio/include")
+    
+    target_include_directories(bloomcheck_erpc_server${ARTIFACT_SUFFIX} BEFORE PRIVATE
+      ${ERPC_HEADER_PATH}
+      ${ERPC_ASIO_PATH}
       ${Protobuf_INCLUDE_DIRS}
     )
     
@@ -64,17 +80,27 @@ if(EXISTS "${ERPC_ROOT}/src/erpc/rpc.h")
       ${Protobuf_LIBRARIES}
     )
     
-    # Add compile definitions if needed
+    # Add compile definitions for eRPC
+    # eRPC uses TRANSPORT definition to select transport type
+    # ERPC_INFINIBAND is needed for ib_transport.h
     target_compile_definitions(bloomcheck_erpc_server${ARTIFACT_SUFFIX} PRIVATE
-      -DTRANSPORT=infiniband
+      TRANSPORT=infiniband
+      ERPC_INFINIBAND
+    )
+    
+    # Disable Werror for eRPC headers (they have unused function warnings)
+    # We only want to treat our own code warnings as errors
+    target_compile_options(bloomcheck_erpc_server${ARTIFACT_SUFFIX} PRIVATE
+      -Wno-error=unused-function
+      -Wno-error=volatile
     )
     
     list(APPEND tool_deps bloomcheck_erpc_server)
     
-    message(STATUS "eRPC bloomcheck server enabled (ERPC_ROOT=${ERPC_ROOT})")
+    message(STATUS "eRPC bloomcheck server enabled (ERPC_ROOT=${ERPC_ROOT}, header_path=${ERPC_HEADER_PATH}, lib_path=${ERPC_LIB_PATH})")
   else()
-    message(STATUS "eRPC library not found, skipping bloomcheck_erpc_server")
+    message(STATUS "eRPC library not found at ${ERPC_ROOT}/build_perf|build_dbg|build/liberpc.a, skipping bloomcheck_erpc_server")
   endif()
 else()
-  message(STATUS "eRPC headers not found (ERPC_ROOT=${ERPC_ROOT}), skipping bloomcheck_erpc_server")
+  message(STATUS "eRPC headers not found (ERPC_ROOT=${ERPC_ROOT}), tried: src/erpc/rpc.h, include/erpc/rpc.h, erpc/rpc.h")
 endif()

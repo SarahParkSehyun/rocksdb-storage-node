@@ -6,9 +6,11 @@
 
 #include "tools/bloomcheck.pb.h"
 
-#include <erpc/rpc.h>
-#include <erpc/nexus.h>
-#include <erpc/transport.h>
+// Include transport implementation for IBTransport before rpc.h.
+// ERPC_INFINIBAND is provided by build flags in tools/CMakeLists.txt.
+#include "transport_impl/infiniband/ib_transport.h"
+#include "rpc.h"
+#include "nexus.h"
 
 #include <csignal>
 #include <cstdlib>
@@ -26,8 +28,8 @@ namespace bloomcheck {
 static constexpr uint8_t kReqTypeNoop = 1;
 static constexpr uint8_t kReqTypeCheck = 2;
 
-// Global flag for graceful shutdown
-static std::atomic<bool> g_shutdown_requested{false};
+// Global flag for graceful shutdown. sig_atomic_t is signal-handler-safe.
+static volatile std::sig_atomic_t g_shutdown_requested = 0;
 
 // Global RPC pointer (set in main, used in handlers)
 static erpc::Rpc<erpc::CTransport>* g_rpc = nullptr;
@@ -35,7 +37,7 @@ static erpc::Rpc<erpc::CTransport>* g_rpc = nullptr;
 // Signal handler for SIGINT (Ctrl+C)
 void SignalHandler(int sig) {
   if (sig == SIGINT) {
-    g_shutdown_requested.store(true);
+    g_shutdown_requested = 1;
   }
 }
 
@@ -48,9 +50,9 @@ void NoopHandler(erpc::ReqHandle* req_handle, void* context) {
     return;
   }
   
-  // Get request buffer
-  erpc::MsgBuffer* req_msgbuf = req_handle->get_req_msgbuf();
-  const uint8_t* req_buf = req_msgbuf->buf;
+  // Get request buffer (get_req_msgbuf returns const pointer)
+  const erpc::MsgBuffer* req_msgbuf = req_handle->get_req_msgbuf();
+  const uint8_t* req_buf = req_msgbuf->buf_;
   size_t req_size = req_msgbuf->get_data_size();
   
   // Parse NoopRequest (empty request is OK)
@@ -76,9 +78,9 @@ void NoopHandler(erpc::ReqHandle* req_handle, void* context) {
   // Serialize response
   size_t resp_size = resp.ByteSizeLong();
   
-  // Resize response buffer
-  req_handle->pre_resp_msgbuf_ = rpc->resize_msg_buffer(&req_handle->pre_resp_msgbuf_, resp_size);
-  uint8_t* resp_buf = req_handle->pre_resp_msgbuf_.buf;
+  // Resize response buffer (resize_msg_buffer modifies the buffer in place)
+  rpc->resize_msg_buffer(&req_handle->pre_resp_msgbuf_, resp_size);
+  uint8_t* resp_buf = req_handle->pre_resp_msgbuf_.buf_;
   
   // Serialize to buffer
   if (!resp.SerializeToArray(resp_buf, static_cast<int>(resp_size))) {
@@ -87,8 +89,8 @@ void NoopHandler(erpc::ReqHandle* req_handle, void* context) {
     resp.Clear();
     resp.set_server_ts_ns(now_ns);
     resp_size = resp.ByteSizeLong();
-    req_handle->pre_resp_msgbuf_ = rpc->resize_msg_buffer(&req_handle->pre_resp_msgbuf_, resp_size);
-    resp_buf = req_handle->pre_resp_msgbuf_.buf;
+    rpc->resize_msg_buffer(&req_handle->pre_resp_msgbuf_, resp_size);
+    resp_buf = req_handle->pre_resp_msgbuf_.buf_;
     resp.SerializeToArray(resp_buf, static_cast<int>(resp_size));
   }
   
@@ -119,9 +121,9 @@ void CheckHandler(erpc::ReqHandle* req_handle, void* context) {
     return;
   }
   
-  // Get request buffer
-  erpc::MsgBuffer* req_msgbuf = req_handle->get_req_msgbuf();
-  const uint8_t* req_buf = req_msgbuf->buf;
+  // Get request buffer (get_req_msgbuf returns const pointer)
+  const erpc::MsgBuffer* req_msgbuf = req_handle->get_req_msgbuf();
+  const uint8_t* req_buf = req_msgbuf->buf_;
   size_t req_size = req_msgbuf->get_data_size();
   
   // Parse BatchRequest
@@ -157,9 +159,9 @@ void CheckHandler(erpc::ReqHandle* req_handle, void* context) {
   // Serialize response
   size_t resp_size = batch_resp.ByteSizeLong();
   
-  // Resize response buffer
-  req_handle->pre_resp_msgbuf_ = rpc->resize_msg_buffer(&req_handle->pre_resp_msgbuf_, resp_size);
-  uint8_t* resp_buf = req_handle->pre_resp_msgbuf_.buf;
+  // Resize response buffer (resize_msg_buffer modifies the buffer in place)
+  rpc->resize_msg_buffer(&req_handle->pre_resp_msgbuf_, resp_size);
+  uint8_t* resp_buf = req_handle->pre_resp_msgbuf_.buf_;
   
   // Serialize to buffer
   if (!batch_resp.SerializeToArray(resp_buf, static_cast<int>(resp_size))) {
@@ -167,8 +169,8 @@ void CheckHandler(erpc::ReqHandle* req_handle, void* context) {
     // Send empty response on serialize error
     batch_resp.clear_resps();
     resp_size = batch_resp.ByteSizeLong();
-    req_handle->pre_resp_msgbuf_ = rpc->resize_msg_buffer(&req_handle->pre_resp_msgbuf_, resp_size);
-    resp_buf = req_handle->pre_resp_msgbuf_.buf;
+    rpc->resize_msg_buffer(&req_handle->pre_resp_msgbuf_, resp_size);
+    resp_buf = req_handle->pre_resp_msgbuf_.buf_;
     batch_resp.SerializeToArray(resp_buf, static_cast<int>(resp_size));
   }
   
@@ -236,8 +238,9 @@ int main(int argc, char** argv) {
   std::cout << "[INFO] Press Ctrl+C to stop" << std::endl;
   
   // Run event loop until shutdown requested
-  while (!bloomcheck::g_shutdown_requested.load()) {
-    rpc.run_event_loop_once();
+  while (!bloomcheck::g_shutdown_requested) {
+    // Use a bounded event loop to ensure quick SIGINT responsiveness.
+    rpc.run_event_loop(50);
   }
   
   std::cout << "[INFO] Shutting down..." << std::endl;
