@@ -73,6 +73,7 @@ if(ERPC_HEADER_PATH)
     )
     
     target_link_libraries(bloomcheck_erpc_server${ARTIFACT_SUFFIX} PRIVATE
+      ${ROCKSDB_LIB}
       ${ERPC_LIB_PATH}
       pthread
       numa
