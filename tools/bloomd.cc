@@ -82,41 +82,42 @@ struct Stats {
   std::atomic<size_t> evictions{0};
   
   void RecordReason(CheckReason reason) {
-    total_checks++;
-    switch (reason) {
-      case CheckReason::OPEN_FAIL:
-        reason_open_fail++;
-        break;
-      case CheckReason::READER_NULL:
-        reason_reader_null++;
-        break;
-      case CheckReason::BB_TABLE_NULL:
-        reason_bb_table_null++;
-        break;
-      case CheckReason::REP_NULL:
-        reason_rep_null++;
-        break;
-      case CheckReason::FILTER_NULL:
-        reason_filter_null++;
-        break;
-      case CheckReason::WHOLE_KEY_FILTERING_FALSE:
-        reason_whole_key_filtering_false++;
-        break;
-      case CheckReason::UCOMP_NULL:
-        reason_ucomp_null++;
-        break;
-      case CheckReason::KEYMAYMATCH_EXCEPTION:
-        reason_keymaymatch_exception++;
-        break;
-      case CheckReason::KEYMAYMATCH_TRUE:
-        reason_keymaymatch_true++;
-        keymaymatch_calls++;
-        break;
-      case CheckReason::KEYMAYMATCH_FALSE:
-        reason_keymaymatch_false++;
-        keymaymatch_calls++;
-        break;
-    }
+    // Statistics collection disabled for performance
+    // total_checks++;
+    // switch (reason) {
+    //   case CheckReason::OPEN_FAIL:
+    //     reason_open_fail++;
+    //     break;
+    //   case CheckReason::READER_NULL:
+    //     reason_reader_null++;
+    //     break;
+    //   case CheckReason::BB_TABLE_NULL:
+    //     reason_bb_table_null++;
+    //     break;
+    //   case CheckReason::REP_NULL:
+    //     reason_rep_null++;
+    //     break;
+    //   case CheckReason::FILTER_NULL:
+    //     reason_filter_null++;
+    //     break;
+    //   case CheckReason::WHOLE_KEY_FILTERING_FALSE:
+    //     reason_whole_key_filtering_false++;
+    //     break;
+    //   case CheckReason::UCOMP_NULL:
+    //     reason_ucomp_null++;
+    //     break;
+    //   case CheckReason::KEYMAYMATCH_EXCEPTION:
+    //     reason_keymaymatch_exception++;
+    //     break;
+    //   case CheckReason::KEYMAYMATCH_TRUE:
+    //     reason_keymaymatch_true++;
+    //     keymaymatch_calls++;
+    //     break;
+    //   case CheckReason::KEYMAYMATCH_FALSE:
+    //     reason_keymaymatch_false++;
+    //     keymaymatch_calls++;
+    //     break;
+    // }
   }
   
   void PrintStats(std::mutex& log_mutex, size_t total_opens, size_t active_rpcs) {
@@ -277,7 +278,7 @@ class TableReaderCache {
       if (it != shard.cache.end()) {
         // Cache hit - remember entry, update LRU outside shared_lock
         cached_entry = it->second;
-        if (stats) stats->cache_hits++;
+        // if (stats) stats->cache_hits++;
       }
     }
     
@@ -292,7 +293,7 @@ class TableReaderCache {
     }
 
     // Cache miss - need to open file
-    if (stats) stats->cache_misses++;
+    // if (stats) stats->cache_misses++;
     
     // Phase A (continued): Check inflight and register if needed
     std::shared_ptr<InflightOpen> inflight;
@@ -304,7 +305,7 @@ class TableReaderCache {
       auto it = shard.cache.find(file_number);
       if (it != shard.cache.end()) {
         UpdateLRU(shard, file_number);
-        if (stats) stats->cache_hits++;
+        // if (stats) stats->cache_hits++;
         return it->second;
       }
       
@@ -367,7 +368,7 @@ class TableReaderCache {
     // Note: TryOpenSstPath already called GetFileSize, so we check file_size here
     if (actual_path.empty() || file_size == 0) {
       // TryOpenSstPath failed to find any matching file
-      if (stats) stats->open_fail_getfilesize++;
+      // if (stats) stats->open_fail_getfilesize++;
       // 샘플 로그 (초기 50회 + 매 1000회) - 락 밖에서
       // if (open_id <= 50 || open_id % 1000 == 0) {
       //   std::lock_guard<std::mutex> log_lock(*log_mutex);
@@ -387,7 +388,7 @@ class TableReaderCache {
 
     ROCKSDB_NAMESPACE::IOStatus s = fs->NewRandomAccessFile(actual_path, fopts, &file, nullptr);
     if (!s.ok()) {
-      if (stats) stats->open_fail_newfile++;
+      // if (stats) stats->open_fail_newfile++;
       // 샘플 로그 - 락 밖에서
       // if (open_id <= 50 || open_id % 1000 == 0) {
       //   std::lock_guard<std::mutex> log_lock(*log_mutex);
@@ -434,7 +435,7 @@ class TableReaderCache {
         false /* prefetch_index_and_filter_in_cache */);
     
     if (!table_status.ok() || !table_reader) {
-      if (stats) stats->open_fail_newreader++;
+      // if (stats) stats->open_fail_newreader++;
       // 샘플 로그 - 락 밖에서
       // if (open_id <= 50 || open_id % 1000 == 0) {
       //   std::lock_guard<std::mutex> log_lock(*log_mutex);
@@ -517,7 +518,7 @@ class TableReaderCache {
       if (it != shard.cache.end()) {
         // Another thread already inserted - use existing entry
         UpdateLRU(shard, file_number);
-        if (stats) stats->cache_hits++;
+        // if (stats) stats->cache_hits++;
         // Clean up inflight entry
         shard.inflight.erase(file_number);
         inflight->promise.set_value(it->second);
@@ -569,7 +570,7 @@ class TableReaderCache {
     auto cache_it = shard.cache.find(lru_file_number);
     if (cache_it != shard.cache.end()) {
       shard.cache.erase(cache_it);
-      if (stats) stats->evictions++;
+      // if (stats) stats->evictions++;
     }
   }
 
@@ -899,56 +900,56 @@ class CheckCallData : public CallDataBase {
     // Active RPC 카운터 감소
     active_rpc_count_->fetch_sub(1);
 
-    // eRPC 로그와 동일한 형태의 누적 평균 타이밍 출력
-    check_timing_req_count_.fetch_add(1, std::memory_order_relaxed);
-    check_timing_work_us_sum_.fetch_add(work_us, std::memory_order_relaxed);
-    check_timing_handler_us_sum_.fetch_add(handler_us, std::memory_order_relaxed);
-    bool check_log_enabled = []() {
-      const char* env = std::getenv("BLOOMD_CHECK_TIMING_LOG");
-      return env && std::string(env) == "1";
-    }();
-    bool should_log = check_log_enabled && (item.req_id <= 10 || item.req_id % 1000 == 0);
-    if (should_log) {
-      const uint64_t req_cnt =
-          check_timing_req_count_.load(std::memory_order_relaxed);
-      const uint64_t sst_cnt =
-          check_timing_sst_count_.load(std::memory_order_relaxed);
-      const uint64_t work_avg_us =
-          req_cnt == 0 ? 0
-                       : check_timing_work_us_sum_.load(std::memory_order_relaxed) / req_cnt;
-      const uint64_t handler_avg_us =
-          req_cnt == 0 ? 0
-                       : check_timing_handler_us_sum_.load(std::memory_order_relaxed) / req_cnt;
-      const uint64_t sst_get_or_open_avg_us =
-          sst_cnt == 0
-              ? 0
-              : check_timing_sst_get_or_open_us_sum_.load(std::memory_order_relaxed) / sst_cnt;
-      const uint64_t sst_keymaymatch_avg_us =
-          sst_cnt == 0
-              ? 0
-              : check_timing_sst_keymaymatch_us_sum_.load(std::memory_order_relaxed) / sst_cnt;
+    // Statistics collection and logging disabled for performance
+    // check_timing_req_count_.fetch_add(1, std::memory_order_relaxed);
+    // check_timing_work_us_sum_.fetch_add(work_us, std::memory_order_relaxed);
+    // check_timing_handler_us_sum_.fetch_add(handler_us, std::memory_order_relaxed);
+    // bool check_log_enabled = []() {
+    //   const char* env = std::getenv("BLOOMD_CHECK_TIMING_LOG");
+    //   return env && std::string(env) == "1";
+    // }();
+    // bool should_log = check_log_enabled && (item.req_id <= 10 || item.req_id % 1000 == 0);
+    // if (should_log) {
+    //   const uint64_t req_cnt =
+    //       check_timing_req_count_.load(std::memory_order_relaxed);
+    //   const uint64_t sst_cnt =
+    //       check_timing_sst_count_.load(std::memory_order_relaxed);
+    //   const uint64_t work_avg_us =
+    //       req_cnt == 0 ? 0
+    //                    : check_timing_work_us_sum_.load(std::memory_order_relaxed) / req_cnt;
+    //   const uint64_t handler_avg_us =
+    //       req_cnt == 0 ? 0
+    //                    : check_timing_handler_us_sum_.load(std::memory_order_relaxed) / req_cnt;
+    //   const uint64_t sst_get_or_open_avg_us =
+    //       sst_cnt == 0
+    //           ? 0
+    //           : check_timing_sst_get_or_open_us_sum_.load(std::memory_order_relaxed) / sst_cnt;
+    //   const uint64_t sst_keymaymatch_avg_us =
+    //       sst_cnt == 0
+    //           ? 0
+    //           : check_timing_sst_keymaymatch_us_sum_.load(std::memory_order_relaxed) / sst_cnt;
 
-      std::lock_guard<std::mutex> snapshot_lock(log_snapshot_mutex_);
-      log_snapshot_.should_log = true;
-      log_snapshot_.req_id = item.req_id;
-      log_snapshot_.keys = item.request.reqs_size();
-      log_snapshot_.total_candidates = total_candidates;
-      log_snapshot_.checked = total_checked;
-      log_snapshot_.may_match = total_may_match;
-      log_snapshot_.handler_us = handler_us;
-      log_snapshot_.work_avg_us = work_avg_us;
-      log_snapshot_.sst_get_or_open_avg_us = sst_get_or_open_avg_us;
-      log_snapshot_.sst_keymaymatch_avg_us = sst_keymaymatch_avg_us;
-      log_snapshot_.sst_call_id = sst_trace.call_id;
-      log_snapshot_.sst_file_number = sst_trace.file_number;
-      log_snapshot_.sst_stage = sst_trace.stage;
-      log_snapshot_.sst_get_or_open_us = sst_trace.get_or_open_us;
-      log_snapshot_.sst_keymaymatch_us = sst_trace.keymaymatch_us;
-      log_snapshot_.sst_total_check_us = sst_trace.total_check_us;
-      log_snapshot_.accept_wait_us = item.accept_wait_us;
-      log_snapshot_.queue_wait_us = queue_wait_us;
-      log_snapshot_.finish_call_us = finish_call_us;
-    }
+    //   std::lock_guard<std::mutex> snapshot_lock(log_snapshot_mutex_);
+    //   log_snapshot_.should_log = true;
+    //   log_snapshot_.req_id = item.req_id;
+    //   log_snapshot_.keys = item.request.reqs_size();
+    //   log_snapshot_.total_candidates = total_candidates;
+    //   log_snapshot_.checked = total_checked;
+    //   log_snapshot_.may_match = total_may_match;
+    //   log_snapshot_.handler_us = handler_us;
+    //   log_snapshot_.work_avg_us = work_avg_us;
+    //   log_snapshot_.sst_get_or_open_avg_us = sst_get_or_open_avg_us;
+    //   log_snapshot_.sst_keymaymatch_avg_us = sst_keymaymatch_avg_us;
+    //   log_snapshot_.sst_call_id = sst_trace.call_id;
+    //   log_snapshot_.sst_file_number = sst_trace.file_number;
+    //   log_snapshot_.sst_stage = sst_trace.stage;
+    //   log_snapshot_.sst_get_or_open_us = sst_trace.get_or_open_us;
+    //   log_snapshot_.sst_keymaymatch_us = sst_trace.keymaymatch_us;
+    //   log_snapshot_.sst_total_check_us = sst_trace.total_check_us;
+    //   log_snapshot_.accept_wait_us = item.accept_wait_us;
+    //   log_snapshot_.queue_wait_us = queue_wait_us;
+    //   log_snapshot_.finish_call_us = finish_call_us;
+    // }
     
     // Note: CallData will be deleted when FINISH event is processed by CQ poller
   }
@@ -1030,19 +1031,20 @@ class CheckCallData : public CallDataBase {
     size_t call_id = call_count.fetch_add(1) + 1;
     uint64_t keymaymatch_us = 0;
     
-    auto maybe_log_timing = [&](const char* stage, uint64_t get_entry_us_val) {
-      auto now = std::chrono::steady_clock::now();
-      uint64_t total_us = static_cast<uint64_t>(
-          std::chrono::duration_cast<std::chrono::microseconds>(now - check_start).count());
-      auto& sst_trace = ThreadLocalSstTrace();
-      sst_trace.valid = true;
-      sst_trace.call_id = call_id;
-      sst_trace.file_number = file_number;
-      sst_trace.stage = stage;
-      sst_trace.get_or_open_us = get_entry_us_val;
-      sst_trace.keymaymatch_us = keymaymatch_us;
-      sst_trace.total_check_us = total_us;
-    };
+    // Statistics collection disabled for performance
+    // auto maybe_log_timing = [&](const char* stage, uint64_t get_entry_us_val) {
+    //   auto now = std::chrono::steady_clock::now();
+    //   uint64_t total_us = static_cast<uint64_t>(
+    //       std::chrono::duration_cast<std::chrono::microseconds>(now - check_start).count());
+    //   auto& sst_trace = ThreadLocalSstTrace();
+    //   sst_trace.valid = true;
+    //   sst_trace.call_id = call_id;
+    //   sst_trace.file_number = file_number;
+    //   sst_trace.stage = stage;
+    //   sst_trace.get_or_open_us = get_entry_us_val;
+    //   sst_trace.keymaymatch_us = keymaymatch_us;
+    //   sst_trace.total_check_us = total_us;
+    // };
     
     // Get or open TableReader - returns shared_ptr to guarantee lifetime
     auto get_entry_start = std::chrono::steady_clock::now();
@@ -1052,8 +1054,8 @@ class CheckCallData : public CallDataBase {
     auto get_entry_us = std::chrono::duration_cast<std::chrono::microseconds>(
         get_entry_end - get_entry_start).count();
     if (!entry) {
-      stats_->RecordReason(CheckReason::OPEN_FAIL);
-      maybe_log_timing("open_fail", static_cast<uint64_t>(get_entry_us));
+      // stats_->RecordReason(CheckReason::OPEN_FAIL);
+      // maybe_log_timing("open_fail", static_cast<uint64_t>(get_entry_us));
       return true;
     }
 
@@ -1063,8 +1065,8 @@ class CheckCallData : public CallDataBase {
 
     ROCKSDB_NAMESPACE::TableReader* reader = entry->reader.get();
     if (!reader) {
-      stats_->RecordReason(CheckReason::READER_NULL);
-      maybe_log_timing("reader_null", static_cast<uint64_t>(get_entry_us));
+      // stats_->RecordReason(CheckReason::READER_NULL);
+      // maybe_log_timing("reader_null", static_cast<uint64_t>(get_entry_us));
       return true;
     }
 
@@ -1072,35 +1074,35 @@ class CheckCallData : public CallDataBase {
     ROCKSDB_NAMESPACE::BlockBasedTable* bb_table =
         static_cast<ROCKSDB_NAMESPACE::BlockBasedTable*>(reader);
     if (!bb_table) {
-      stats_->RecordReason(CheckReason::BB_TABLE_NULL);
-      maybe_log_timing("bb_table_null", static_cast<uint64_t>(get_entry_us));
+      // stats_->RecordReason(CheckReason::BB_TABLE_NULL);
+      // maybe_log_timing("bb_table_null", static_cast<uint64_t>(get_entry_us));
       return true;
     }
 
     // Get filter from BlockBasedTable
     const ROCKSDB_NAMESPACE::BlockBasedTable::Rep* rep = bb_table->get_rep();
     if (!rep) {
-      stats_->RecordReason(CheckReason::REP_NULL);
-      maybe_log_timing("rep_null", static_cast<uint64_t>(get_entry_us));
+      // stats_->RecordReason(CheckReason::REP_NULL);
+      // maybe_log_timing("rep_null", static_cast<uint64_t>(get_entry_us));
       return true;
     }
     
     if (!rep->ioptions.fs || !rep->ioptions.fs.get()) {
-      stats_->RecordReason(CheckReason::FILTER_NULL);
-      maybe_log_timing("fs_null", static_cast<uint64_t>(get_entry_us));
+      // stats_->RecordReason(CheckReason::FILTER_NULL);
+      // maybe_log_timing("fs_null", static_cast<uint64_t>(get_entry_us));
       return true;
     }
     
     if (!rep->filter) {
-      stats_->RecordReason(CheckReason::FILTER_NULL);
-      maybe_log_timing("filter_null", static_cast<uint64_t>(get_entry_us));
+      // stats_->RecordReason(CheckReason::FILTER_NULL);
+      // maybe_log_timing("filter_null", static_cast<uint64_t>(get_entry_us));
       return true;
     }
 
     // Check whole_key_filtering
     if (!rep->whole_key_filtering) {
-      stats_->RecordReason(CheckReason::WHOLE_KEY_FILTERING_FALSE);
-      maybe_log_timing("whole_key_filtering_false", static_cast<uint64_t>(get_entry_us));
+      // stats_->RecordReason(CheckReason::WHOLE_KEY_FILTERING_FALSE);
+      // maybe_log_timing("whole_key_filtering_false", static_cast<uint64_t>(get_entry_us));
       return true;
     }
 
@@ -1112,8 +1114,8 @@ class CheckCallData : public CallDataBase {
     const ROCKSDB_NAMESPACE::Comparator* ucmp =
         rep->internal_comparator.user_comparator();
     if (!ucmp) {
-      stats_->RecordReason(CheckReason::UCOMP_NULL);
-      maybe_log_timing("ucmp_null", static_cast<uint64_t>(get_entry_us));
+      // stats_->RecordReason(CheckReason::UCOMP_NULL);
+      // maybe_log_timing("ucmp_null", static_cast<uint64_t>(get_entry_us));
       return true;
     }
 
@@ -1160,14 +1162,14 @@ class CheckCallData : public CallDataBase {
           std::chrono::duration_cast<std::chrono::microseconds>(
               keymaymatch_end - keymaymatch_start).count());
       
-      if (may_match) {
-        stats_->RecordReason(CheckReason::KEYMAYMATCH_TRUE);
-      } else {
-        stats_->RecordReason(CheckReason::KEYMAYMATCH_FALSE);
-      }
+      // if (may_match) {
+      //   stats_->RecordReason(CheckReason::KEYMAYMATCH_TRUE);
+      // } else {
+      //   stats_->RecordReason(CheckReason::KEYMAYMATCH_FALSE);
+      // }
     } catch (...) {
-      stats_->RecordReason(CheckReason::KEYMAYMATCH_EXCEPTION);
-      maybe_log_timing("keymaymatch_exception", static_cast<uint64_t>(get_entry_us));
+      // stats_->RecordReason(CheckReason::KEYMAYMATCH_EXCEPTION);
+      // maybe_log_timing("keymaymatch_exception", static_cast<uint64_t>(get_entry_us));
       return true;  // Safe default on exception
     }
     
@@ -1175,12 +1177,13 @@ class CheckCallData : public CallDataBase {
     auto check_end = std::chrono::steady_clock::now();
     auto check_us = std::chrono::duration_cast<std::chrono::microseconds>(
         check_end - check_start).count();
-    check_timing_sst_count_.fetch_add(1, std::memory_order_relaxed);
-    check_timing_sst_get_or_open_us_sum_.fetch_add(
-        static_cast<uint64_t>(get_entry_us), std::memory_order_relaxed);
-    check_timing_sst_keymaymatch_us_sum_.fetch_add(
-        keymaymatch_us, std::memory_order_relaxed);
-    maybe_log_timing("ok", static_cast<uint64_t>(get_entry_us));
+    // Statistics collection disabled for performance
+    // check_timing_sst_count_.fetch_add(1, std::memory_order_relaxed);
+    // check_timing_sst_get_or_open_us_sum_.fetch_add(
+    //     static_cast<uint64_t>(get_entry_us), std::memory_order_relaxed);
+    // check_timing_sst_keymaymatch_us_sum_.fetch_add(
+    //     keymaymatch_us, std::memory_order_relaxed);
+    // maybe_log_timing("ok", static_cast<uint64_t>(get_entry_us));
     
     // if (call_id <= 10 || call_id % 1000 == 0) {
     //   std::lock_guard<std::mutex> log_lock(*log_mutex_);
@@ -1437,7 +1440,7 @@ class StreamCallData {
     std::shared_ptr<TableReaderCache::CacheEntry> entry = cache_->GetOrOpen(
         file_number, *rocksdb_options_, stats_, log_mutex_, open_count_);
     if (!entry) {
-      stats_->RecordReason(CheckReason::OPEN_FAIL);
+      // stats_->RecordReason(CheckReason::OPEN_FAIL);
       return true;
     }
 
@@ -1446,35 +1449,35 @@ class StreamCallData {
 
     ROCKSDB_NAMESPACE::TableReader* reader = entry->reader.get();
     if (!reader) {
-      stats_->RecordReason(CheckReason::READER_NULL);
+      // stats_->RecordReason(CheckReason::READER_NULL);
       return true;
     }
 
     ROCKSDB_NAMESPACE::BlockBasedTable* bb_table =
         static_cast<ROCKSDB_NAMESPACE::BlockBasedTable*>(reader);
     if (!bb_table) {
-      stats_->RecordReason(CheckReason::BB_TABLE_NULL);
+      // stats_->RecordReason(CheckReason::BB_TABLE_NULL);
       return true;
     }
 
     const ROCKSDB_NAMESPACE::BlockBasedTable::Rep* rep = bb_table->get_rep();
     if (!rep) {
-      stats_->RecordReason(CheckReason::REP_NULL);
+      // stats_->RecordReason(CheckReason::REP_NULL);
       return true;
     }
     if (!rep->filter) {
-      stats_->RecordReason(CheckReason::FILTER_NULL);
+      // stats_->RecordReason(CheckReason::FILTER_NULL);
       return true;
     }
     if (!rep->whole_key_filtering) {
-      stats_->RecordReason(CheckReason::WHOLE_KEY_FILTERING_FALSE);
+      // stats_->RecordReason(CheckReason::WHOLE_KEY_FILTERING_FALSE);
       return true;
     }
 
     const ROCKSDB_NAMESPACE::Comparator* ucmp =
         rep->internal_comparator.user_comparator();
     if (!ucmp) {
-      stats_->RecordReason(CheckReason::UCOMP_NULL);
+      // stats_->RecordReason(CheckReason::UCOMP_NULL);
       return true;
     }
 
@@ -1506,13 +1509,13 @@ class StreamCallData {
     try {
       may_match = rep->filter->KeyMayMatch(user_key_without_ts, const_ikey_ptr,
                                            &get_context, &lookup_context, read_options);
-      if (may_match) {
-        stats_->RecordReason(CheckReason::KEYMAYMATCH_TRUE);
-      } else {
-        stats_->RecordReason(CheckReason::KEYMAYMATCH_FALSE);
-      }
+      // if (may_match) {
+      //   stats_->RecordReason(CheckReason::KEYMAYMATCH_TRUE);
+      // } else {
+      //   stats_->RecordReason(CheckReason::KEYMAYMATCH_FALSE);
+      // }
     } catch (...) {
-      stats_->RecordReason(CheckReason::KEYMAYMATCH_EXCEPTION);
+      // stats_->RecordReason(CheckReason::KEYMAYMATCH_EXCEPTION);
       return true;
     }
     return may_match;
@@ -1705,50 +1708,51 @@ class BloomCheckServiceImpl {
       std::chrono::steady_clock::time_point::min()};
   
   void StartStatsThread() {
-    stats_thread_ = std::thread([this]() {
-      size_t last_total_rpc = 0;
-      auto last_time = std::chrono::steady_clock::now();
-      
-      while (!stop_stats_thread_.load()) {
-        // 1초마다 QPS 계산
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        
-        auto now = std::chrono::steady_clock::now();
-        size_t current_total_rpc = total_rpc_count_.load();
-        size_t current_active_rpc = active_rpc_count_.load();
-        
-        // Delta 계산
-        size_t delta_rpc = current_total_rpc - last_total_rpc;
-        auto delta_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - last_time).count();
-        
-        // QPS 계산 (delta_rpc / delta_time_seconds)
-        double qps = 0.0;
-        if (delta_time > 0) {
-          qps = (delta_rpc * 1000.0) / delta_time;
-        }
-        
-        // QPS 로그 출력 (매 1초)
-        // {
-        //   std::lock_guard<std::mutex> log_lock(log_mutex_);
-        //   std::cerr << "[QPS] rpc_qps=" << static_cast<size_t>(qps)
-        //             << " active_rpcs=" << current_active_rpc
-        //             << " total_rpcs=" << current_total_rpc
-        //             << " (qps=" << std::fixed << std::setprecision(1) << qps << ")"
-        //             << std::endl;
-        // }
-        
-        last_total_rpc = current_total_rpc;
-        last_time = now;
-        
-        // 5초마다 상세 통계 출력
-        // static int detail_counter = 0;
-        // if (++detail_counter >= 5) {
-        //   detail_counter = 0;
-        //   stats_.PrintStats(log_mutex_, open_count_.load(), current_active_rpc);
-        // }
-      }
-    });
+    // Statistics collection thread disabled for performance
+    // stats_thread_ = std::thread([this]() {
+    //   size_t last_total_rpc = 0;
+    //   auto last_time = std::chrono::steady_clock::now();
+    //   
+    //   while (!stop_stats_thread_.load()) {
+    //     // 1초마다 QPS 계산
+    //     std::this_thread::sleep_for(std::chrono::seconds(1));
+    //     
+    //     auto now = std::chrono::steady_clock::now();
+    //     size_t current_total_rpc = total_rpc_count_.load();
+    //     size_t current_active_rpc = active_rpc_count_.load();
+    //     
+    //     // Delta 계산
+    //     size_t delta_rpc = current_total_rpc - last_total_rpc;
+    //     auto delta_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+    //         now - last_time).count();
+    //     
+    //     // QPS 계산 (delta_rpc / delta_time_seconds)
+    //     double qps = 0.0;
+    //     if (delta_time > 0) {
+    //       qps = (delta_rpc * 1000.0) / delta_time;
+    //     }
+    //     
+    //     // QPS 로그 출력 (매 1초)
+    //     // {
+    //     //   std::lock_guard<std::mutex> log_lock(log_mutex_);
+    //     //   std::cerr << "[QPS] rpc_qps=" << static_cast<size_t>(qps)
+    //     //             << " active_rpcs=" << current_active_rpc
+    //     //             << " total_rpcs=" << current_total_rpc
+    //     //             << " (qps=" << std::fixed << std::setprecision(1) << qps << ")"
+    //     //             << std::endl;
+    //     // }
+    //     
+    //     last_total_rpc = current_total_rpc;
+    //     last_time = now;
+    //     
+    //     // 5초마다 상세 통계 출력
+    //     // static int detail_counter = 0;
+    //     // if (++detail_counter >= 5) {
+    //     //   detail_counter = 0;
+    //     //   stats_.PrintStats(log_mutex_, open_count_.load(), current_active_rpc);
+    //     // }
+    //   }
+    // });
   }
   
   void StopStatsThread() {
