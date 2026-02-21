@@ -15,6 +15,7 @@
 #include <ctime>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <future>
 #include <iomanip>
 #include <iostream>
@@ -580,28 +581,59 @@ class TableReaderCache {
 class CallDataBase {
  public:
   virtual ~CallDataBase() = default;
-  virtual void Proceed() = 0;
+  virtual void Proceed(bool ok) = 0;
 };
 
 // Forward declaration
 class CheckCallData;
+class StreamCallData;
 
 // Per-CQ worker queue (lock-free structure)
 // Each CQ has its own worker queue and dedicated worker threads
 class PerCQWorkerQueue {
  public:
   struct WorkItem {
+    enum class Kind {
+      kUnaryCheck,
+      kStreamCheck,
+    };
+
+    Kind kind;
     CheckCallData* call_data;
+    StreamCallData* stream_call_data;
     BatchRequest request;
-    std::chrono::steady_clock::time_point handler_start;
+    uint64_t stream_request_id;
+    std::string stream_user_key;
+    std::vector<uint64_t> stream_sst_file_numbers;
     size_t req_id;
     size_t active_count;
+    uint64_t accept_wait_us;
+    std::chrono::steady_clock::time_point enqueue_ts;
     
     WorkItem(CheckCallData* cd, const BatchRequest& req,
-             std::chrono::steady_clock::time_point start,
-             size_t id, size_t active)
-        : call_data(cd), request(req), handler_start(start),
-          req_id(id), active_count(active) {}
+             size_t id, size_t active, uint64_t accept_wait,
+             std::chrono::steady_clock::time_point enqueue_time)
+        : kind(Kind::kUnaryCheck),
+          call_data(cd),
+          stream_call_data(nullptr),
+          request(req),
+          stream_request_id(0),
+          req_id(id), active_count(active), accept_wait_us(accept_wait),
+          enqueue_ts(enqueue_time) {}
+
+    WorkItem(StreamCallData* stream_cd, uint64_t request_id,
+             std::string user_key, std::vector<uint64_t> sst_numbers,
+             std::chrono::steady_clock::time_point enqueue_time)
+        : kind(Kind::kStreamCheck),
+          call_data(nullptr),
+          stream_call_data(stream_cd),
+          stream_request_id(request_id),
+          stream_user_key(std::move(user_key)),
+          stream_sst_file_numbers(std::move(sst_numbers)),
+          req_id(0),
+          active_count(0),
+          accept_wait_us(0),
+          enqueue_ts(enqueue_time) {}
   };
   
   explicit PerCQWorkerQueue(size_t num_workers)
@@ -654,6 +686,41 @@ class PerCQWorkerQueue {
 // Per-RPC state machine for Check RPC
 class CheckCallData : public CallDataBase {
  public:
+  struct SstTraceSnapshot {
+    bool valid = false;
+    size_t call_id = 0;
+    uint64_t file_number = 0;
+    const char* stage = "na";
+    uint64_t get_or_open_us = 0;
+    uint64_t keymaymatch_us = 0;
+    uint64_t total_check_us = 0;
+  };
+
+  struct CheckLogSnapshot {
+    bool should_log = false;
+    size_t req_id = 0;
+    size_t keys = 0;
+    uint64_t total_candidates = 0;
+    uint64_t checked = 0;
+    uint64_t may_match = 0;
+    uint64_t handler_us = 0;
+    uint64_t work_avg_us = 0;
+    uint64_t sst_get_or_open_avg_us = 0;
+    uint64_t sst_keymaymatch_avg_us = 0;
+    size_t sst_call_id = 0;
+    uint64_t sst_file_number = 0;
+    const char* sst_stage = "na";
+    uint64_t sst_get_or_open_us = 0;
+    uint64_t sst_keymaymatch_us = 0;
+    uint64_t sst_total_check_us = 0;
+    uint64_t accept_wait_us = 0;
+    uint64_t queue_wait_us = 0;
+    uint64_t finish_call_us = 0;
+    uint64_t finish_to_cq_pop_us = 0;
+    uint64_t finish_cq_handle_us = 0;
+    uint64_t rpc_e2e_us = 0;
+  };
+
   CheckCallData(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* cq,
                 TableReaderCache* cache, ROCKSDB_NAMESPACE::Options* rocksdb_options,
                 Stats* stats, std::mutex* log_mutex, std::atomic<size_t>* open_count,
@@ -666,10 +733,16 @@ class CheckCallData : public CallDataBase {
         active_rpc_count_(active_rpc_count), total_rpc_count_(total_rpc_count),
         clock_(clock), fs_(fs), worker_queue_(worker_queue),
         responder_(&ctx_), status_(CREATE) {
-    Proceed();
+    Proceed(true);
   }
 
-  void Proceed() override {
+  void Proceed(bool ok) override {
+    if (!ok) {
+      if (status_ == FINISH) {
+        delete this;
+      }
+      return;
+    }
     if (status_ == CREATE) {
       // ACCEPT: 새로운 RPC 요청 수락
       status_ = PROCESS;
@@ -678,8 +751,6 @@ class CheckCallData : public CallDataBase {
       // Active RPC 카운터 증가
       active_count_ = active_rpc_count_->fetch_add(1) + 1;
       total_rpc_count_->fetch_add(1);
-      
-      handler_start_ = std::chrono::steady_clock::now();
       req_id_ = request_count_.fetch_add(1) + 1;
       
       if (req_id_ <= 10 || req_id_ % 100 == 0) {
@@ -687,6 +758,9 @@ class CheckCallData : public CallDataBase {
         //           << " received: " << request_.reqs_size() << " key request(s)" << std::flush << std::endl;
       }
     } else if (status_ == PROCESS) {
+      // 실제 요청이 CQ에 도착한 시점부터 서버 경로 타이밍 측정 시작
+      accept_start_ = std::chrono::steady_clock::now();
+
       // READ 완료, PROCESS 시작
       // 새로운 CallData를 생성하여 다음 요청을 받을 준비
       new CheckCallData(service_, cq_, cache_, rocksdb_options_, stats_, log_mutex_,
@@ -695,14 +769,63 @@ class CheckCallData : public CallDataBase {
       
       // CQ poller thread: Enqueue work to per-CQ worker queue and return immediately
       // DO NOT perform bloom filter checks here - that happens in worker thread
+      auto enqueue_ts = std::chrono::steady_clock::now();
+      uint64_t accept_wait_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              enqueue_ts - accept_start_).count());
       worker_queue_->Enqueue(PerCQWorkerQueue::WorkItem(
-          this, request_, handler_start_, req_id_, active_count_));
+          this, request_, req_id_, active_count_, accept_wait_us, enqueue_ts));
       
       // Return immediately - worker thread will call Finish() directly
       // No need for WORK_DONE state or Alarm
     } else {
       // FINISH 완료
       GPR_ASSERT(status_ == FINISH);
+      auto finish_handle_start = std::chrono::steady_clock::now();
+      CheckLogSnapshot snapshot_copy;
+      {
+        std::lock_guard<std::mutex> snapshot_lock(log_snapshot_mutex_);
+        snapshot_copy = log_snapshot_;
+        if (snapshot_copy.should_log &&
+            finish_call_done_ts_ > std::chrono::steady_clock::time_point::min()) {
+          snapshot_copy.finish_to_cq_pop_us = static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  finish_handle_start - finish_call_done_ts_).count());
+        }
+      }
+
+      auto finish_handle_end = std::chrono::steady_clock::now();
+      if (snapshot_copy.should_log) {
+        snapshot_copy.rpc_e2e_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                finish_handle_start - accept_start_).count());
+        snapshot_copy.finish_cq_handle_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                finish_handle_end - finish_handle_start).count());
+        std::lock_guard<std::mutex> log_lock(*log_mutex_);
+        std::cerr << "[CHECK] req_id=" << snapshot_copy.req_id
+                  << " keys=" << snapshot_copy.keys
+                  << " total_candidates=" << snapshot_copy.total_candidates
+                  << " checked=" << snapshot_copy.checked
+                  << " may_match=" << snapshot_copy.may_match
+                  << " handler_us=" << snapshot_copy.handler_us
+                  << " work_avg_us=" << snapshot_copy.work_avg_us
+                  << " sst_get_or_open_avg_us=" << snapshot_copy.sst_get_or_open_avg_us
+                  << " sst_keymaymatch_avg_us=" << snapshot_copy.sst_keymaymatch_avg_us
+                  << " sst_call_id=" << snapshot_copy.sst_call_id
+                  << " sst_file_number=" << snapshot_copy.sst_file_number
+                  << " sst_stage=" << snapshot_copy.sst_stage
+                  << " sst_get_or_open_us=" << snapshot_copy.sst_get_or_open_us
+                  << " sst_keymaymatch_us=" << snapshot_copy.sst_keymaymatch_us
+                  << " sst_total_check_us=" << snapshot_copy.sst_total_check_us
+                  << " accept_wait_us=" << snapshot_copy.accept_wait_us
+                  << " queue_wait_us=" << snapshot_copy.queue_wait_us
+                  << " finish_call_us=" << snapshot_copy.finish_call_us
+                  << " finish_to_cq_pop_us=" << snapshot_copy.finish_to_cq_pop_us
+                  << " finish_cq_handle_us=" << snapshot_copy.finish_cq_handle_us
+                  << " rpc_e2e_us=" << snapshot_copy.rpc_e2e_us
+                  << std::endl;
+      }
       delete this;
     }
   }
@@ -710,21 +833,43 @@ class CheckCallData : public CallDataBase {
   // Called from worker thread - performs actual bloom filter processing
   // Worker thread directly calls Finish() - no Alarm needed
   void ProcessInWorkerThread(PerCQWorkerQueue::WorkItem item) {
+    auto& sst_trace = ThreadLocalSstTrace();
+    sst_trace.valid = false;
+    {
+      std::lock_guard<std::mutex> snapshot_lock(log_snapshot_mutex_);
+      log_snapshot_.should_log = false;
+    }
+    auto handler_start = std::chrono::steady_clock::now();
+    uint64_t queue_wait_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            handler_start - item.enqueue_ts).count());
     // This runs in worker thread, NOT in CQ poller thread
     response_.clear_resps();
     response_.mutable_resps()->Reserve(item.request.reqs_size());
 
     // Process each key request (bloom filter checks happen here)
+    auto work_start = std::chrono::steady_clock::now();
+    uint64_t total_candidates = 0;
+    uint64_t total_checked = 0;
+    uint64_t total_may_match = 0;
     for (const auto& key_req : item.request.reqs()) {
       KeyResponse key_resp;
       ProcessKeyRequest(key_req, &key_resp);
+      total_candidates += key_resp.total_candidates();
+      total_checked += key_resp.checked_count();
+      total_may_match += key_resp.may_match_sst_file_numbers_size();
       *response_.add_resps() = key_resp;
     }
+    auto work_end = std::chrono::steady_clock::now();
     
     // Handler 종료 시간 측정
-    auto handler_end = std::chrono::steady_clock::now();
-    auto handler_us = std::chrono::duration_cast<std::chrono::microseconds>(
-        handler_end - item.handler_start).count();
+    auto handler_before_finish = std::chrono::steady_clock::now();
+    auto work_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            work_end - work_start).count());
+    auto handler_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            handler_before_finish - handler_start).count());
     
     // if (item.req_id <= 10 || item.req_id % 100 == 0) {
     //   std::lock_guard<std::mutex> log_lock(*log_mutex_);
@@ -739,16 +884,81 @@ class CheckCallData : public CallDataBase {
     
     // Worker thread directly calls Finish() - gRPC responder is thread-safe
     // No need for Alarm or CQ notification
+    auto finish_call_start = std::chrono::steady_clock::now();
     status_ = FINISH;
     responder_.Finish(response_, grpc::Status::OK, this);
+    auto finish_call_end = std::chrono::steady_clock::now();
+    uint64_t finish_call_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            finish_call_end - finish_call_start).count());
+    {
+      std::lock_guard<std::mutex> snapshot_lock(log_snapshot_mutex_);
+      finish_call_done_ts_ = finish_call_end;
+    }
     
     // Active RPC 카운터 감소
     active_rpc_count_->fetch_sub(1);
+
+    // eRPC 로그와 동일한 형태의 누적 평균 타이밍 출력
+    check_timing_req_count_.fetch_add(1, std::memory_order_relaxed);
+    check_timing_work_us_sum_.fetch_add(work_us, std::memory_order_relaxed);
+    check_timing_handler_us_sum_.fetch_add(handler_us, std::memory_order_relaxed);
+    bool check_log_enabled = []() {
+      const char* env = std::getenv("BLOOMD_CHECK_TIMING_LOG");
+      return env && std::string(env) == "1";
+    }();
+    bool should_log = check_log_enabled && (item.req_id <= 10 || item.req_id % 1000 == 0);
+    if (should_log) {
+      const uint64_t req_cnt =
+          check_timing_req_count_.load(std::memory_order_relaxed);
+      const uint64_t sst_cnt =
+          check_timing_sst_count_.load(std::memory_order_relaxed);
+      const uint64_t work_avg_us =
+          req_cnt == 0 ? 0
+                       : check_timing_work_us_sum_.load(std::memory_order_relaxed) / req_cnt;
+      const uint64_t handler_avg_us =
+          req_cnt == 0 ? 0
+                       : check_timing_handler_us_sum_.load(std::memory_order_relaxed) / req_cnt;
+      const uint64_t sst_get_or_open_avg_us =
+          sst_cnt == 0
+              ? 0
+              : check_timing_sst_get_or_open_us_sum_.load(std::memory_order_relaxed) / sst_cnt;
+      const uint64_t sst_keymaymatch_avg_us =
+          sst_cnt == 0
+              ? 0
+              : check_timing_sst_keymaymatch_us_sum_.load(std::memory_order_relaxed) / sst_cnt;
+
+      std::lock_guard<std::mutex> snapshot_lock(log_snapshot_mutex_);
+      log_snapshot_.should_log = true;
+      log_snapshot_.req_id = item.req_id;
+      log_snapshot_.keys = item.request.reqs_size();
+      log_snapshot_.total_candidates = total_candidates;
+      log_snapshot_.checked = total_checked;
+      log_snapshot_.may_match = total_may_match;
+      log_snapshot_.handler_us = handler_us;
+      log_snapshot_.work_avg_us = work_avg_us;
+      log_snapshot_.sst_get_or_open_avg_us = sst_get_or_open_avg_us;
+      log_snapshot_.sst_keymaymatch_avg_us = sst_keymaymatch_avg_us;
+      log_snapshot_.sst_call_id = sst_trace.call_id;
+      log_snapshot_.sst_file_number = sst_trace.file_number;
+      log_snapshot_.sst_stage = sst_trace.stage;
+      log_snapshot_.sst_get_or_open_us = sst_trace.get_or_open_us;
+      log_snapshot_.sst_keymaymatch_us = sst_trace.keymaymatch_us;
+      log_snapshot_.sst_total_check_us = sst_trace.total_check_us;
+      log_snapshot_.accept_wait_us = item.accept_wait_us;
+      log_snapshot_.queue_wait_us = queue_wait_us;
+      log_snapshot_.finish_call_us = finish_call_us;
+    }
     
     // Note: CallData will be deleted when FINISH event is processed by CQ poller
   }
 
  private:
+  static SstTraceSnapshot& ThreadLocalSstTrace() {
+    static thread_local SstTraceSnapshot trace;
+    return trace;
+  }
+
   void ProcessKeyRequest(const KeyRequest& req, KeyResponse* resp) {
     // ProcessKeyRequest 시작 시간 측정
     auto process_start = std::chrono::steady_clock::now();
@@ -818,6 +1028,21 @@ class CheckCallData : public CallDataBase {
     
     static std::atomic<size_t> call_count{0};
     size_t call_id = call_count.fetch_add(1) + 1;
+    uint64_t keymaymatch_us = 0;
+    
+    auto maybe_log_timing = [&](const char* stage, uint64_t get_entry_us_val) {
+      auto now = std::chrono::steady_clock::now();
+      uint64_t total_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(now - check_start).count());
+      auto& sst_trace = ThreadLocalSstTrace();
+      sst_trace.valid = true;
+      sst_trace.call_id = call_id;
+      sst_trace.file_number = file_number;
+      sst_trace.stage = stage;
+      sst_trace.get_or_open_us = get_entry_us_val;
+      sst_trace.keymaymatch_us = keymaymatch_us;
+      sst_trace.total_check_us = total_us;
+    };
     
     // Get or open TableReader - returns shared_ptr to guarantee lifetime
     auto get_entry_start = std::chrono::steady_clock::now();
@@ -828,6 +1053,7 @@ class CheckCallData : public CallDataBase {
         get_entry_end - get_entry_start).count();
     if (!entry) {
       stats_->RecordReason(CheckReason::OPEN_FAIL);
+      maybe_log_timing("open_fail", static_cast<uint64_t>(get_entry_us));
       return true;
     }
 
@@ -838,6 +1064,7 @@ class CheckCallData : public CallDataBase {
     ROCKSDB_NAMESPACE::TableReader* reader = entry->reader.get();
     if (!reader) {
       stats_->RecordReason(CheckReason::READER_NULL);
+      maybe_log_timing("reader_null", static_cast<uint64_t>(get_entry_us));
       return true;
     }
 
@@ -846,6 +1073,7 @@ class CheckCallData : public CallDataBase {
         static_cast<ROCKSDB_NAMESPACE::BlockBasedTable*>(reader);
     if (!bb_table) {
       stats_->RecordReason(CheckReason::BB_TABLE_NULL);
+      maybe_log_timing("bb_table_null", static_cast<uint64_t>(get_entry_us));
       return true;
     }
 
@@ -853,22 +1081,26 @@ class CheckCallData : public CallDataBase {
     const ROCKSDB_NAMESPACE::BlockBasedTable::Rep* rep = bb_table->get_rep();
     if (!rep) {
       stats_->RecordReason(CheckReason::REP_NULL);
+      maybe_log_timing("rep_null", static_cast<uint64_t>(get_entry_us));
       return true;
     }
     
     if (!rep->ioptions.fs || !rep->ioptions.fs.get()) {
       stats_->RecordReason(CheckReason::FILTER_NULL);
+      maybe_log_timing("fs_null", static_cast<uint64_t>(get_entry_us));
       return true;
     }
     
     if (!rep->filter) {
       stats_->RecordReason(CheckReason::FILTER_NULL);
+      maybe_log_timing("filter_null", static_cast<uint64_t>(get_entry_us));
       return true;
     }
 
     // Check whole_key_filtering
     if (!rep->whole_key_filtering) {
       stats_->RecordReason(CheckReason::WHOLE_KEY_FILTERING_FALSE);
+      maybe_log_timing("whole_key_filtering_false", static_cast<uint64_t>(get_entry_us));
       return true;
     }
 
@@ -881,6 +1113,7 @@ class CheckCallData : public CallDataBase {
         rep->internal_comparator.user_comparator();
     if (!ucmp) {
       stats_->RecordReason(CheckReason::UCOMP_NULL);
+      maybe_log_timing("ucmp_null", static_cast<uint64_t>(get_entry_us));
       return true;
     }
 
@@ -918,9 +1151,14 @@ class CheckCallData : public CallDataBase {
     // Check filter
     bool may_match = false;
     try {
+      auto keymaymatch_start = std::chrono::steady_clock::now();
       may_match = rep->filter->KeyMayMatch(
           user_key_without_ts, const_ikey_ptr, &get_context,
           &lookup_context, read_options);
+      auto keymaymatch_end = std::chrono::steady_clock::now();
+      keymaymatch_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              keymaymatch_end - keymaymatch_start).count());
       
       if (may_match) {
         stats_->RecordReason(CheckReason::KEYMAYMATCH_TRUE);
@@ -929,6 +1167,7 @@ class CheckCallData : public CallDataBase {
       }
     } catch (...) {
       stats_->RecordReason(CheckReason::KEYMAYMATCH_EXCEPTION);
+      maybe_log_timing("keymaymatch_exception", static_cast<uint64_t>(get_entry_us));
       return true;  // Safe default on exception
     }
     
@@ -936,6 +1175,12 @@ class CheckCallData : public CallDataBase {
     auto check_end = std::chrono::steady_clock::now();
     auto check_us = std::chrono::duration_cast<std::chrono::microseconds>(
         check_end - check_start).count();
+    check_timing_sst_count_.fetch_add(1, std::memory_order_relaxed);
+    check_timing_sst_get_or_open_us_sum_.fetch_add(
+        static_cast<uint64_t>(get_entry_us), std::memory_order_relaxed);
+    check_timing_sst_keymaymatch_us_sum_.fetch_add(
+        keymaymatch_us, std::memory_order_relaxed);
+    maybe_log_timing("ok", static_cast<uint64_t>(get_entry_us));
     
     // if (call_id <= 10 || call_id % 1000 == 0) {
     //   std::lock_guard<std::mutex> log_lock(*log_mutex_);
@@ -969,14 +1214,342 @@ class CheckCallData : public CallDataBase {
   std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs_;
   PerCQWorkerQueue* worker_queue_;
   
-  std::chrono::steady_clock::time_point handler_start_;
+  std::chrono::steady_clock::time_point accept_start_;
+  std::chrono::steady_clock::time_point finish_call_done_ts_ =
+      std::chrono::steady_clock::time_point::min();
   size_t req_id_;
   size_t active_count_;
+  std::mutex log_snapshot_mutex_;
+  CheckLogSnapshot log_snapshot_;
   
   static std::atomic<size_t> request_count_;
+  static std::atomic<uint64_t> check_timing_req_count_;
+  static std::atomic<uint64_t> check_timing_work_us_sum_;
+  static std::atomic<uint64_t> check_timing_handler_us_sum_;
+  static std::atomic<uint64_t> check_timing_sst_count_;
+  static std::atomic<uint64_t> check_timing_sst_get_or_open_us_sum_;
+  static std::atomic<uint64_t> check_timing_sst_keymaymatch_us_sum_;
 };
 
 std::atomic<size_t> CheckCallData::request_count_{0};
+std::atomic<uint64_t> CheckCallData::check_timing_req_count_{0};
+std::atomic<uint64_t> CheckCallData::check_timing_work_us_sum_{0};
+std::atomic<uint64_t> CheckCallData::check_timing_handler_us_sum_{0};
+std::atomic<uint64_t> CheckCallData::check_timing_sst_count_{0};
+std::atomic<uint64_t> CheckCallData::check_timing_sst_get_or_open_us_sum_{0};
+std::atomic<uint64_t> CheckCallData::check_timing_sst_keymaymatch_us_sum_{0};
+
+class StreamCallData {
+ public:
+  enum class OpType {
+    kRequest,
+    kRead,
+    kWrite,
+    kFinish,
+  };
+
+  StreamCallData(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* cq,
+                 TableReaderCache* cache, ROCKSDB_NAMESPACE::Options* rocksdb_options,
+                 Stats* stats, std::mutex* log_mutex, std::atomic<size_t>* open_count,
+                 std::atomic<size_t>* active_rpc_count, std::atomic<size_t>* total_rpc_count,
+                 std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock,
+                 std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs,
+                 PerCQWorkerQueue* worker_queue)
+      : service_(service),
+        cq_(cq),
+        stream_(&ctx_),
+        cache_(cache),
+        rocksdb_options_(rocksdb_options),
+        stats_(stats),
+        log_mutex_(log_mutex),
+        open_count_(open_count),
+        active_rpc_count_(active_rpc_count),
+        total_rpc_count_(total_rpc_count),
+        clock_(clock),
+        fs_(fs),
+        worker_queue_(worker_queue),
+        request_tag_(this, OpType::kRequest),
+        read_tag_(this, OpType::kRead),
+        write_tag_(this, OpType::kWrite),
+        finish_tag_(this, OpType::kFinish) {
+    service_->RequestCheckBatchStream(&ctx_, &stream_, cq_, cq_, &request_tag_);
+  }
+
+  void OnOpComplete(OpType op, bool ok) {
+    if (op == OpType::kRequest) {
+      HandleRequest(ok);
+      return;
+    }
+    if (op == OpType::kRead) {
+      HandleRead(ok);
+      return;
+    }
+    if (op == OpType::kWrite) {
+      HandleWrite(ok);
+      return;
+    }
+    HandleFinish();
+  }
+
+  void ProcessInWorkerThread(PerCQWorkerQueue::WorkItem item) {
+    StreamResponse response;
+    response.set_request_id(item.stream_request_id);
+
+    const ROCKSDB_NAMESPACE::Slice user_key(item.stream_user_key);
+    for (uint64_t file_number : item.stream_sst_file_numbers) {
+      if (CheckKeyInSST(user_key, file_number)) {
+        response.add_may_match_sst_file_numbers(file_number);
+      }
+    }
+
+    EnqueueResponse(std::move(response));
+  }
+
+ private:
+  class StreamOpTag : public CallDataBase {
+   public:
+    StreamOpTag(StreamCallData* owner, OpType type) : owner_(owner), type_(type) {}
+    void Proceed(bool ok) override { owner_->OnOpComplete(type_, ok); }
+
+   private:
+    StreamCallData* owner_;
+    OpType type_;
+  };
+
+  void HandleRequest(bool ok) {
+    if (!ok) {
+      delete this;
+      return;
+    }
+
+    new StreamCallData(service_, cq_, cache_, rocksdb_options_, stats_, log_mutex_,
+                       open_count_, active_rpc_count_, total_rpc_count_, clock_, fs_,
+                       worker_queue_);
+
+    active_rpc_count_->fetch_add(1);
+    total_rpc_count_->fetch_add(1);
+
+    std::lock_guard<std::mutex> lock(mu_);
+    StartReadLocked();
+  }
+
+  void StartReadLocked() {
+    if (read_in_flight_ || read_closed_ || write_closed_) {
+      return;
+    }
+    read_in_flight_ = true;
+    stream_.Read(&read_request_, &read_tag_);
+  }
+
+  void HandleRead(bool ok) {
+    uint64_t request_id = 0;
+    std::string user_key;
+    std::vector<uint64_t> sst_numbers;
+
+    if (ok) {
+      request_id = read_request_.request_id();
+      user_key = std::move(*read_request_.mutable_user_key());
+      sst_numbers.reserve(read_request_.sst_file_numbers_size());
+      for (uint64_t file_number : read_request_.sst_file_numbers()) {
+        sst_numbers.push_back(file_number);
+      }
+      read_request_.Clear();
+    }
+
+    auto enqueue_ts = std::chrono::steady_clock::now();
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      read_in_flight_ = false;
+      if (!ok) {
+        read_closed_ = true;
+        MaybeStartFinishLocked();
+        return;
+      }
+      ++pending_work_items_;
+      StartReadLocked();
+    }
+
+    worker_queue_->Enqueue(PerCQWorkerQueue::WorkItem(
+        this, request_id, std::move(user_key), std::move(sst_numbers), enqueue_ts));
+  }
+
+  void EnqueueResponse(StreamResponse response) {
+    std::lock_guard<std::mutex> lock(mu_);
+    GPR_ASSERT(pending_work_items_ > 0);
+    --pending_work_items_;
+    if (write_closed_) {
+      MaybeStartFinishLocked();
+      return;
+    }
+    write_queue_.push_back(std::move(response));
+    if (!write_in_flight_) {
+      StartNextWriteLocked();
+    }
+  }
+
+  void StartNextWriteLocked() {
+    if (write_queue_.empty() || write_in_flight_ || write_closed_) {
+      MaybeStartFinishLocked();
+      return;
+    }
+    write_in_flight_ = true;
+    writing_response_ = std::move(write_queue_.front());
+    write_queue_.pop_front();
+    stream_.Write(writing_response_, &write_tag_);
+  }
+
+  void HandleWrite(bool ok) {
+    std::lock_guard<std::mutex> lock(mu_);
+    write_in_flight_ = false;
+    if (!ok) {
+      read_closed_ = true;
+      write_closed_ = true;
+      read_in_flight_ = false;
+      MaybeStartFinishLocked();
+      return;
+    }
+    StartNextWriteLocked();
+  }
+
+  void MaybeStartFinishLocked() {
+    if (finish_in_flight_) {
+      return;
+    }
+    if (!read_closed_) {
+      return;
+    }
+    if (pending_work_items_ != 0) {
+      return;
+    }
+    if (write_in_flight_ || !write_queue_.empty()) {
+      return;
+    }
+    finish_in_flight_ = true;
+    stream_.Finish(grpc::Status::OK, &finish_tag_);
+  }
+
+  void HandleFinish() {
+    active_rpc_count_->fetch_sub(1);
+    delete this;
+  }
+
+  bool CheckKeyInSST(const ROCKSDB_NAMESPACE::Slice& user_key, uint64_t file_number) {
+    std::shared_ptr<TableReaderCache::CacheEntry> entry = cache_->GetOrOpen(
+        file_number, *rocksdb_options_, stats_, log_mutex_, open_count_);
+    if (!entry) {
+      stats_->RecordReason(CheckReason::OPEN_FAIL);
+      return true;
+    }
+
+    std::lock_guard<std::mutex> lock(entry->mutex);
+    entry->last_access = std::chrono::steady_clock::now();
+
+    ROCKSDB_NAMESPACE::TableReader* reader = entry->reader.get();
+    if (!reader) {
+      stats_->RecordReason(CheckReason::READER_NULL);
+      return true;
+    }
+
+    ROCKSDB_NAMESPACE::BlockBasedTable* bb_table =
+        static_cast<ROCKSDB_NAMESPACE::BlockBasedTable*>(reader);
+    if (!bb_table) {
+      stats_->RecordReason(CheckReason::BB_TABLE_NULL);
+      return true;
+    }
+
+    const ROCKSDB_NAMESPACE::BlockBasedTable::Rep* rep = bb_table->get_rep();
+    if (!rep) {
+      stats_->RecordReason(CheckReason::REP_NULL);
+      return true;
+    }
+    if (!rep->filter) {
+      stats_->RecordReason(CheckReason::FILTER_NULL);
+      return true;
+    }
+    if (!rep->whole_key_filtering) {
+      stats_->RecordReason(CheckReason::WHOLE_KEY_FILTERING_FALSE);
+      return true;
+    }
+
+    const ROCKSDB_NAMESPACE::Comparator* ucmp =
+        rep->internal_comparator.user_comparator();
+    if (!ucmp) {
+      stats_->RecordReason(CheckReason::UCOMP_NULL);
+      return true;
+    }
+
+    ROCKSDB_NAMESPACE::ReadOptions read_options;
+    read_options.read_tier = ROCKSDB_NAMESPACE::kReadAllTier;
+    size_t ts_sz = ucmp->timestamp_size();
+    ROCKSDB_NAMESPACE::Slice user_key_without_ts =
+        ROCKSDB_NAMESPACE::StripTimestampFromUserKey(user_key, ts_sz);
+
+    ROCKSDB_NAMESPACE::PinnableSlice dummy_value;
+    bool dummy_value_found = false;
+    ROCKSDB_NAMESPACE::MergeContext dummy_merge_context;
+    ROCKSDB_NAMESPACE::SequenceNumber dummy_max_covering_tombstone_seq = 0;
+    ROCKSDB_NAMESPACE::GetContext get_context(
+        ucmp, nullptr /* merge_operator */, nullptr /* logger */,
+        nullptr /* statistics */, ROCKSDB_NAMESPACE::GetContext::kNotFound,
+        user_key_without_ts, &dummy_value, nullptr /* columns */,
+        &dummy_value_found, &dummy_merge_context, false /* do_merge */,
+        &dummy_max_covering_tombstone_seq, clock_.get());
+    ROCKSDB_NAMESPACE::BlockCacheLookupContext lookup_context(
+        ROCKSDB_NAMESPACE::TableReaderCaller::kUserGet, 0, false);
+    ROCKSDB_NAMESPACE::InternalKey ikey_for_seek(
+        user_key_without_ts, ROCKSDB_NAMESPACE::kMaxSequenceNumber,
+        ROCKSDB_NAMESPACE::kValueTypeForSeek);
+    ROCKSDB_NAMESPACE::Slice ikey_slice = ikey_for_seek.Encode();
+    const ROCKSDB_NAMESPACE::Slice* const_ikey_ptr = &ikey_slice;
+
+    bool may_match = false;
+    try {
+      may_match = rep->filter->KeyMayMatch(user_key_without_ts, const_ikey_ptr,
+                                           &get_context, &lookup_context, read_options);
+      if (may_match) {
+        stats_->RecordReason(CheckReason::KEYMAYMATCH_TRUE);
+      } else {
+        stats_->RecordReason(CheckReason::KEYMAYMATCH_FALSE);
+      }
+    } catch (...) {
+      stats_->RecordReason(CheckReason::KEYMAYMATCH_EXCEPTION);
+      return true;
+    }
+    return may_match;
+  }
+
+  BloomCheck::AsyncService* service_;
+  grpc::ServerCompletionQueue* cq_;
+  grpc::ServerContext ctx_;
+  grpc::ServerAsyncReaderWriter<StreamResponse, StreamRequest> stream_;
+  StreamRequest read_request_;
+
+  TableReaderCache* cache_;
+  ROCKSDB_NAMESPACE::Options* rocksdb_options_;
+  Stats* stats_;
+  std::mutex* log_mutex_;
+  std::atomic<size_t>* open_count_;
+  std::atomic<size_t>* active_rpc_count_;
+  std::atomic<size_t>* total_rpc_count_;
+  std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock_;
+  std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs_;
+  PerCQWorkerQueue* worker_queue_;
+
+  std::mutex mu_;
+  std::deque<StreamResponse> write_queue_;
+  StreamResponse writing_response_;
+  size_t pending_work_items_ = 0;
+  bool read_in_flight_ = false;
+  bool read_closed_ = false;
+  bool write_in_flight_ = false;
+  bool write_closed_ = false;
+  bool finish_in_flight_ = false;
+
+  StreamOpTag request_tag_;
+  StreamOpTag read_tag_;
+  StreamOpTag write_tag_;
+  StreamOpTag finish_tag_;
+};
 
 // PerCQWorkerQueue::WorkerLoop implementation (after CheckCallData definition)
 void PerCQWorkerQueue::WorkerLoop() {
@@ -992,11 +1565,12 @@ void PerCQWorkerQueue::WorkerLoop() {
       WorkItem item = std::move(work_queue_.front());
       work_queue_.pop();
       lock.unlock();
-      
-      // Perform actual work in worker thread
-      // This calls ProcessInWorkerThread which performs bloom filter checks
-      // Worker thread directly calls Finish() - no Alarm needed
-      item.call_data->ProcessInWorkerThread(std::move(item));
+
+      if (item.kind == WorkItem::Kind::kUnaryCheck) {
+        item.call_data->ProcessInWorkerThread(std::move(item));
+      } else {
+        item.stream_call_data->ProcessInWorkerThread(std::move(item));
+      }
     }
   }
 }
@@ -1006,10 +1580,16 @@ class NoopCallData : public CallDataBase {
  public:
   NoopCallData(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* cq)
       : service_(service), cq_(cq), responder_(&ctx_), status_(CREATE) {
-    Proceed();
+    Proceed(true);
   }
 
-  void Proceed() override {
+  void Proceed(bool ok) override {
+    if (!ok) {
+      if (status_ == FINISH) {
+        delete this;
+      }
+      return;
+    }
     if (status_ == CREATE) {
       // ACCEPT: 새로운 RPC 요청 수락
       status_ = PROCESS;
@@ -1189,6 +1769,9 @@ void HandleRpcs(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* 
                    impl->log_mutex(), impl->open_count(), impl->active_rpc_count(),
                    impl->total_rpc_count(), impl->clock(), impl->fs(), worker_queue);
   new NoopCallData(service, cq);
+  new StreamCallData(service, cq, impl->cache(), impl->rocksdb_options(), impl->stats(),
+                     impl->log_mutex(), impl->open_count(), impl->active_rpc_count(),
+                     impl->total_rpc_count(), impl->clock(), impl->fs(), worker_queue);
   
   void* tag;
   bool ok;
@@ -1197,12 +1780,8 @@ void HandleRpcs(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* 
   // This loop runs in CQ poller thread - must be fast and non-blocking
   while (true) {
     GPR_ASSERT(cq->Next(&tag, &ok));
-    GPR_ASSERT(ok);
-    
-    // CallData의 Proceed() 호출하여 state machine 진행
-    // Proceed() should only do state transitions and enqueue work, NOT execute bloom filters
-    // Worker thread will call Finish() directly - no WORK_DONE state needed
-    static_cast<CallDataBase*>(tag)->Proceed();
+
+    static_cast<CallDataBase*>(tag)->Proceed(ok);
   }
 }
 
@@ -1239,6 +1818,9 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   
   // 2. HTTP/2 stream concurrency 증가 (connection당)
   builder.AddChannelArgument(GRPC_ARG_MAX_CONCURRENT_STREAMS, 1000);
+  builder.AddChannelArgument("grpc.tcp_nodelay", 1);
+  builder.AddChannelArgument("grpc.http2.initial_stream_window_size", 1 << 20);
+  builder.AddChannelArgument("grpc.http2.initial_connection_window_size", 16 << 20);
   
   // 3. 메시지 크기 제한
   builder.SetMaxReceiveMessageSize(4 * 1024 * 1024);  // 4MB
@@ -1273,11 +1855,14 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   
   // CQ 폴러 스레드 생성 (각 CQ당 1개 스레드)
   // CQ poller threads: 빠른 이벤트 처리만 수행 (bloom filter 체크 안 함)
+  const size_t NUM_POLLERS_PER_CQ = 1;
   std::vector<std::thread> cq_threads;
   for (int i = 0; i < NUM_CQS; i++) {
-    cq_threads.emplace_back(std::thread(bloomcheck::HandleRpcs, 
-                                        service.service(), cqs[i].get(), &service, 
-                                        worker_queues[i].get()));
+    for (size_t p = 0; p < NUM_POLLERS_PER_CQ; ++p) {
+      cq_threads.emplace_back(std::thread(bloomcheck::HandleRpcs,
+                                          service.service(), cqs[i].get(), &service,
+                                          worker_queues[i].get()));
+    }
   }
   
   // 서버 종료 대기

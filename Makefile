@@ -1342,7 +1342,23 @@ bloomcheck_client: tools/bloomcheck.pb.cc tools/bloomcheck.grpc.pb.cc $(OBJ_DIR)
 	  $(OBJ_DIR)/tools/bloomcheck_client.o \
 	  tools/bloomcheck.pb.cc tools/bloomcheck.grpc.pb.cc \
 	  $(EXEC_LDFLAGS) \
-	  -lgrpc++ -lprotobuf -lgpr -labsl_synchronization -labsl_strings -pthread -o $@ $(LDFLAGS)
+	  -lgrpc++ -lgrpc -lprotobuf -lgpr -labsl_synchronization -labsl_strings -pthread -o $@ $(LDFLAGS)
+
+bloomstream_smoketest: tools/bloomcheck.pb.cc tools/bloomcheck.grpc.pb.cc $(OBJ_DIR)/tools/bloomstream_smoketest.o
+	$(AM_V_CCLD)$(shell which g++-13 g++-12 g++-11 g++ 2>/dev/null | head -1) -std=c++20 $(CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) \
+	  -I. -Itools \
+	  $(OBJ_DIR)/tools/bloomstream_smoketest.o \
+	  tools/bloomcheck.pb.cc tools/bloomcheck.grpc.pb.cc \
+	  $(EXEC_LDFLAGS) \
+	  -lgrpc++ -lgrpc -lprotobuf -lgpr -labsl_synchronization -labsl_strings -pthread -o $@ $(LDFLAGS)
+
+bloomstream_100k_test: tools/bloomcheck.pb.cc tools/bloomcheck.grpc.pb.cc $(OBJ_DIR)/tools/bloomstream_100k_test.o
+	$(AM_V_CCLD)$(shell which g++-13 g++-12 g++-11 g++ 2>/dev/null | head -1) -std=c++20 $(CXXFLAGS) $(PLATFORM_SHARED_CFLAGS) \
+	  -I. -Itools \
+	  $(OBJ_DIR)/tools/bloomstream_100k_test.o \
+	  tools/bloomcheck.pb.cc tools/bloomcheck.grpc.pb.cc \
+	  $(EXEC_LDFLAGS) \
+	  -lgrpc++ -lgrpc -lprotobuf -lgpr -labsl_synchronization -labsl_strings -pthread -o $@ $(LDFLAGS)
 
 define MakeTestRule
 $(notdir $(1:%.cc=%)): $(1:%.cc=$$(OBJ_DIR)/%.o) $$(TEST_LIBRARY) $$(LIBRARY)
