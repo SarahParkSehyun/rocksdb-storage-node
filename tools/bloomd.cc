@@ -64,6 +64,11 @@ uint64_t SteadyNowMicros() {
           .count());
 }
 
+bool ShouldSampleLockWait() {
+  static thread_local uint32_t sample_counter = 0;
+  return ((++sample_counter) & 1023u) == 0;
+}
+
 // Reason codes for why CheckKeyInSST returned true/false
 enum class CheckReason {
   OPEN_FAIL,              // GetOrOpen returned nullptr
@@ -117,6 +122,10 @@ struct Stats {
   std::atomic<uint64_t> read_req_event_count{0};
   std::atomic<uint64_t> write_resp_event_count{0};
   std::atomic<uint64_t> pending_work_items_max{0};
+  std::atomic<uint64_t> total_entry_rw_lock_wait_us{0};
+  std::atomic<uint64_t> entry_rw_lock_wait_samples{0};
+  std::atomic<uint64_t> total_shard_lru_lock_wait_us{0};
+  std::atomic<uint64_t> shard_lru_lock_wait_samples{0};
 
   static void UpdateMax(std::atomic<uint64_t>& m, uint64_t val) {
     uint64_t cur = m.load(std::memory_order_relaxed);
@@ -146,6 +155,14 @@ struct Stats {
     write_resp_event_count.fetch_add(1, std::memory_order_relaxed);
   }
   void AddPendingWorkItems(uint64_t depth) { UpdateMax(pending_work_items_max, depth); }
+  void AddEntryRwLockWaitUs(uint64_t us) {
+    total_entry_rw_lock_wait_us.fetch_add(us, std::memory_order_relaxed);
+    entry_rw_lock_wait_samples.fetch_add(1, std::memory_order_relaxed);
+  }
+  void AddShardLruLockWaitUs(uint64_t us) {
+    total_shard_lru_lock_wait_us.fetch_add(us, std::memory_order_relaxed);
+    shard_lru_lock_wait_samples.fetch_add(1, std::memory_order_relaxed);
+  }
   
   void RecordReason(CheckReason reason) {
     // Statistics collection disabled for performance
@@ -310,7 +327,9 @@ class TableReaderCache {
   static constexpr size_t N_SHARDS = 16;  // 2^4 shards for better distribution
 
   explicit TableReaderCache(size_t max_size)
-      : max_size_(max_size), lru_update_every_(ParseLruUpdateEveryEnv()) {
+      : max_size_(max_size),
+        lru_update_every_(ParseLruUpdateEveryEnv()),
+        server_stats_enabled_(ParseServerStatsEnabledEnv()) {
     // Initialize shards
     size_t max_size_per_shard = (max_size + N_SHARDS - 1) / N_SHARDS;
     for (size_t i = 0; i < N_SHARDS; ++i) {
@@ -354,7 +373,17 @@ class TableReaderCache {
       if (!ShouldUpdateLruOnHit()) {
         return cached_entry;
       }
+      bool sample_lru_lock_wait = server_stats_enabled_ && stats && ShouldSampleLockWait();
+      auto lock_wait_start = sample_lru_lock_wait ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
       std::unique_lock<std::shared_mutex> lock(shard.mutex);
+      if (sample_lru_lock_wait) {
+        uint64_t wait_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - lock_wait_start)
+                .count());
+        stats->AddShardLruLockWaitUs(wait_us);
+      }
       // Double-check cache still exists (might have been evicted)
       if (shard.cache.find(file_number) != shard.cache.end()) {
         UpdateLRU(shard, file_number);
@@ -369,11 +398,21 @@ class TableReaderCache {
     std::shared_ptr<InflightOpen> inflight;
     bool is_waiting = false;
     {
+      bool sample_lru_lock_wait = server_stats_enabled_ && stats && ShouldSampleLockWait();
+      auto lock_wait_start = sample_lru_lock_wait ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
       std::unique_lock<std::shared_mutex> lock(shard.mutex);
       
       // Double-check cache (might have been inserted by another thread)
       auto it = shard.cache.find(file_number);
       if (it != shard.cache.end()) {
+        if (sample_lru_lock_wait) {
+          uint64_t wait_us = static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - lock_wait_start)
+                  .count());
+          stats->AddShardLruLockWaitUs(wait_us);
+        }
         UpdateLRU(shard, file_number);
         // if (stats) stats->cache_hits++;
         return it->second;
@@ -581,7 +620,17 @@ class TableReaderCache {
     
     // Phase C: Insert into cache under lock (short duration)
     {
+      bool sample_lru_lock_wait = server_stats_enabled_ && stats && ShouldSampleLockWait();
+      auto lock_wait_start = sample_lru_lock_wait ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
       std::unique_lock<std::shared_mutex> lock(shard.mutex);
+      if (sample_lru_lock_wait) {
+        uint64_t wait_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - lock_wait_start)
+                .count());
+        stats->AddShardLruLockWaitUs(wait_us);
+      }
       
       // Double-check cache (might have been inserted by another thread during Phase B)
       auto it = shard.cache.find(file_number);
@@ -608,6 +657,11 @@ class TableReaderCache {
   }
 
  private:
+  static bool ParseServerStatsEnabledEnv() {
+    const char* env = std::getenv("BLOOMCHECK_SERVER_STATS");
+    return env && std::strcmp(env, "1") == 0;
+  }
+
   static uint32_t ParseLruUpdateEveryEnv() {
     const char* env = std::getenv("BLOOMD_LRU_UPDATE_EVERY");
     if (!env || *env == '\0') {
@@ -672,6 +726,7 @@ class TableReaderCache {
   std::array<std::unique_ptr<Shard>, N_SHARDS> shards_;
   size_t max_size_;
   uint32_t lru_update_every_;
+  bool server_stats_enabled_;
 };
 
 // Base class for all CallData (for polymorphic Proceed() call)
@@ -1163,7 +1218,17 @@ class CheckCallData : public CallDataBase {
 
     // Immutable SST reader path: allow concurrent readers.
     entry->last_access_us.store(SteadyNowMicros(), std::memory_order_relaxed);
+    bool sample_entry_lock_wait = server_stats_enabled_ && ShouldSampleLockWait();
+    auto lock_wait_start = sample_entry_lock_wait ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
     std::shared_lock<std::shared_mutex> lock(entry->rw_mutex);
+    if (sample_entry_lock_wait) {
+      uint64_t wait_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - lock_wait_start)
+              .count());
+      stats_->AddEntryRwLockWaitUs(wait_us);
+    }
 
     ROCKSDB_NAMESPACE::TableReader* reader = entry->reader.get();
     if (!reader) {
@@ -1573,7 +1638,17 @@ class StreamCallData {
     }
 
     entry->last_access_us.store(SteadyNowMicros(), std::memory_order_relaxed);
+    bool sample_entry_lock_wait = server_stats_enabled_ && ShouldSampleLockWait();
+    auto lock_wait_start = sample_entry_lock_wait ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
     std::shared_lock<std::shared_mutex> lock(entry->rw_mutex);
+    if (sample_entry_lock_wait) {
+      uint64_t wait_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - lock_wait_start)
+              .count());
+      stats_->AddEntryRwLockWaitUs(wait_us);
+    }
 
     ROCKSDB_NAMESPACE::TableReader* reader = entry->reader.get();
     if (!reader) {
@@ -1854,6 +1929,8 @@ class BloomCheckServiceImpl {
       uint64_t last_writeq_sum = 0, last_writeq_count = 0;
       uint64_t last_write_done = 0, last_finish_or_close = 0;
       uint64_t last_read_req_event = 0, last_write_resp_event = 0;
+      uint64_t last_entry_lock_wait_us = 0, last_entry_lock_wait_samples = 0;
+      uint64_t last_shard_lru_lock_wait_us = 0, last_shard_lru_lock_wait_samples = 0;
       while (!stop_stats_thread_.load()) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         if (stop_stats_thread_.load()) break;
@@ -1875,6 +1952,14 @@ class BloomCheckServiceImpl {
             stats_.write_resp_event_count.load(std::memory_order_relaxed);
         uint64_t pending_work_items_max =
             stats_.pending_work_items_max.exchange(0, std::memory_order_relaxed);
+        uint64_t entry_lock_wait_us =
+            stats_.total_entry_rw_lock_wait_us.load(std::memory_order_relaxed);
+        uint64_t entry_lock_wait_samples =
+            stats_.entry_rw_lock_wait_samples.load(std::memory_order_relaxed);
+        uint64_t shard_lru_lock_wait_us =
+            stats_.total_shard_lru_lock_wait_us.load(std::memory_order_relaxed);
+        uint64_t shard_lru_lock_wait_samples =
+            stats_.shard_lru_lock_wait_samples.load(std::memory_order_relaxed);
 
         uint64_t recv_req_per_s = recv - last_recv_req;
         uint64_t worker_deq_per_s = deq - last_worker_deq;
@@ -1887,12 +1972,33 @@ class BloomCheckServiceImpl {
         uint64_t finish_or_close_per_s = finish_close - last_finish_or_close;
         uint64_t read_req_per_s = read_req_event - last_read_req_event;
         uint64_t write_resp_per_s = write_resp_event - last_write_resp_event;
+        uint64_t entry_lock_wait_sample_delta =
+            (entry_lock_wait_samples >= last_entry_lock_wait_samples)
+                ? (entry_lock_wait_samples - last_entry_lock_wait_samples)
+                : 0;
+        uint64_t entry_rw_lock_wait_avg_us =
+            entry_lock_wait_sample_delta
+                ? (entry_lock_wait_us - last_entry_lock_wait_us) / entry_lock_wait_sample_delta
+                : 0;
+        uint64_t shard_lru_lock_wait_sample_delta =
+            (shard_lru_lock_wait_samples >= last_shard_lru_lock_wait_samples)
+                ? (shard_lru_lock_wait_samples - last_shard_lru_lock_wait_samples)
+                : 0;
+        uint64_t shard_lru_lock_wait_avg_us =
+            shard_lru_lock_wait_sample_delta
+                ? (shard_lru_lock_wait_us - last_shard_lru_lock_wait_us) /
+                      shard_lru_lock_wait_sample_delta
+                : 0;
 
         last_recv_req = recv; last_worker_deq = deq; last_depth_sum = depth_sum; last_depth_count = depth_count;
         last_check_loop_us = check_us; last_check_loop_count = check_n;
         last_writeq_sum = wq_sum; last_writeq_count = wq_count;
         last_write_done = write_done; last_finish_or_close = finish_close;
         last_read_req_event = read_req_event; last_write_resp_event = write_resp_event;
+        last_entry_lock_wait_us = entry_lock_wait_us;
+        last_entry_lock_wait_samples = entry_lock_wait_samples;
+        last_shard_lru_lock_wait_us = shard_lru_lock_wait_us;
+        last_shard_lru_lock_wait_samples = shard_lru_lock_wait_samples;
 
         {
           std::lock_guard<std::mutex> log_lock(log_mutex_);
@@ -1906,6 +2012,8 @@ class BloomCheckServiceImpl {
                     << " max_pending_work_items=" << pending_work_items_max
                     << " read_req_per_s=" << read_req_per_s
                     << " write_resp_per_s=" << write_resp_per_s
+                    << " entry_rw_lock_wait_avg_us=" << entry_rw_lock_wait_avg_us
+                    << " shard_lru_lock_wait_avg_us=" << shard_lru_lock_wait_avg_us
                     << " write_done_per_s=" << write_done_per_s
                     << " finish_or_close_per_s=" << finish_or_close_per_s
                     << std::endl;
