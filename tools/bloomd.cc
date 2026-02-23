@@ -329,6 +329,7 @@ class TableReaderCache {
   explicit TableReaderCache(size_t max_size)
       : max_size_(max_size),
         lru_update_every_(ParseLruUpdateEveryEnv()),
+        last_access_update_every_(ParseLastAccessUpdateEveryEnv()),
         entry_lock_enabled_(ParseEntryLockEnv()),
         server_stats_enabled_(ParseServerStatsEnabledEnv()) {
     // Initialize shards
@@ -350,6 +351,10 @@ class TableReaderCache {
 
   bool entry_lock_enabled() const { return entry_lock_enabled_; }
   uint32_t lru_update_every() const { return lru_update_every_; }
+  uint32_t last_access_update_every() const { return last_access_update_every_; }
+  bool ShouldUpdateLastAccessOnCheck() const {
+    return ShouldUpdateLastAccessOnCheckImpl();
+  }
 
   // Get or create TableReader for SST file (by file_number)
   // Returns nullptr on error (safe to treat as may_match=true)
@@ -690,6 +695,22 @@ class TableReaderCache {
     return static_cast<uint32_t>(parsed);
   }
 
+  static uint32_t ParseLastAccessUpdateEveryEnv() {
+    const char* env = std::getenv("BLOOMD_LAST_ACCESS_UPDATE_EVERY");
+    if (!env || *env == '\0') {
+      return 256;
+    }
+    char* end = nullptr;
+    unsigned long parsed = std::strtoul(env, &end, 10);
+    if (end == env || parsed == 0) {
+      return 256;
+    }
+    if (parsed > static_cast<unsigned long>(std::numeric_limits<uint32_t>::max())) {
+      return std::numeric_limits<uint32_t>::max();
+    }
+    return static_cast<uint32_t>(parsed);
+  }
+
   bool ShouldUpdateLruOnHit() const {
     if (lru_update_every_ <= 1) {
       return true;
@@ -697,6 +718,15 @@ class TableReaderCache {
     static thread_local uint32_t hit_counter = 0;
     hit_counter++;
     return (hit_counter % lru_update_every_) == 0;
+  }
+
+  bool ShouldUpdateLastAccessOnCheckImpl() const {
+    if (last_access_update_every_ <= 1) {
+      return true;
+    }
+    static thread_local uint32_t update_counter = 0;
+    update_counter++;
+    return (update_counter % last_access_update_every_) == 0;
   }
 
   // Update LRU list: move file_number to front (MRU)
@@ -738,6 +768,7 @@ class TableReaderCache {
   std::array<std::unique_ptr<Shard>, N_SHARDS> shards_;
   size_t max_size_;
   uint32_t lru_update_every_;
+  uint32_t last_access_update_every_;
   bool entry_lock_enabled_;
   bool server_stats_enabled_;
 };
@@ -1230,7 +1261,9 @@ class CheckCallData : public CallDataBase {
     }
 
     // Immutable SST reader path: allow concurrent readers.
-    entry->last_access_us.store(SteadyNowMicros(), std::memory_order_relaxed);
+    if (cache_->ShouldUpdateLastAccessOnCheck()) {
+      entry->last_access_us.store(SteadyNowMicros(), std::memory_order_relaxed);
+    }
     std::shared_lock<std::shared_mutex> lock(entry->rw_mutex, std::defer_lock);
     if (cache_->entry_lock_enabled()) {
       bool sample_entry_lock_wait = server_stats_enabled_ && ShouldSampleLockWait();
@@ -1653,7 +1686,9 @@ class StreamCallData {
       return true;
     }
 
-    entry->last_access_us.store(SteadyNowMicros(), std::memory_order_relaxed);
+    if (cache_->ShouldUpdateLastAccessOnCheck()) {
+      entry->last_access_us.store(SteadyNowMicros(), std::memory_order_relaxed);
+    }
     std::shared_lock<std::shared_mutex> lock(entry->rw_mutex, std::defer_lock);
     if (cache_->entry_lock_enabled()) {
       bool sample_entry_lock_wait = server_stats_enabled_ && ShouldSampleLockWait();
