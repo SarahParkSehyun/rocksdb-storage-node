@@ -22,7 +22,9 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <queue>
+#include <sched.h>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -43,6 +45,16 @@
 #include "util/cast_util.h"
 
 namespace bloomcheck {
+
+bool PinCurrentThreadToCpu(int cpu_id) {
+  if (cpu_id < 0) {
+    return false;
+  }
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(cpu_id, &cpuset);
+  return pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0;
+}
 
 // Reason codes for why CheckKeyInSST returned true/false
 enum class CheckReason {
@@ -80,6 +92,52 @@ struct Stats {
   std::atomic<size_t> cache_hits{0};
   std::atomic<size_t> cache_misses{0};
   std::atomic<size_t> evictions{0};
+
+  // Server stats (BLOOMCHECK_SERVER_STATS=1 only; callers must check before calling)
+  std::atomic<uint64_t> recv_req_count{0};
+  std::atomic<uint64_t> worker_deq_count{0};
+  std::atomic<uint64_t> worker_queue_depth_sum{0};
+  std::atomic<uint64_t> worker_queue_depth_count{0};
+  std::atomic<uint64_t> worker_queue_depth_max{0};
+  std::atomic<uint64_t> total_check_loop_us{0};
+  std::atomic<uint64_t> check_loop_sample_count{0};
+  std::atomic<uint64_t> writeq_sum{0};
+  std::atomic<uint64_t> writeq_count{0};
+  std::atomic<uint64_t> writeq_max{0};
+  std::atomic<uint64_t> write_done_count{0};
+  std::atomic<uint64_t> finish_or_close_count{0};
+  std::atomic<uint64_t> read_req_event_count{0};
+  std::atomic<uint64_t> write_resp_event_count{0};
+  std::atomic<uint64_t> pending_work_items_max{0};
+
+  static void UpdateMax(std::atomic<uint64_t>& m, uint64_t val) {
+    uint64_t cur = m.load(std::memory_order_relaxed);
+    while (val > cur && !m.compare_exchange_weak(cur, val, std::memory_order_relaxed)) {}
+  }
+
+  void AddRecvReq() { recv_req_count.fetch_add(1, std::memory_order_relaxed); }
+  void AddWorkerDeq(uint64_t depth) {
+    worker_deq_count.fetch_add(1, std::memory_order_relaxed);
+    worker_queue_depth_sum.fetch_add(depth, std::memory_order_relaxed);
+    worker_queue_depth_count.fetch_add(1, std::memory_order_relaxed);
+    UpdateMax(worker_queue_depth_max, depth);
+  }
+  void AddCheckLoopUs(uint64_t us) {
+    total_check_loop_us.fetch_add(us, std::memory_order_relaxed);
+    check_loop_sample_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  void AddWriteqSample(uint64_t len) {
+    writeq_sum.fetch_add(len, std::memory_order_relaxed);
+    writeq_count.fetch_add(1, std::memory_order_relaxed);
+    UpdateMax(writeq_max, len);
+  }
+  void AddWriteDone() { write_done_count.fetch_add(1, std::memory_order_relaxed); }
+  void AddFinishOrClose() { finish_or_close_count.fetch_add(1, std::memory_order_relaxed); }
+  void AddReadReqEvent() { read_req_event_count.fetch_add(1, std::memory_order_relaxed); }
+  void AddWriteRespEvent() {
+    write_resp_event_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  void AddPendingWorkItems(uint64_t depth) { UpdateMax(pending_work_items_max, depth); }
   
   void RecordReason(CheckReason reason) {
     // Statistics collection disabled for performance
@@ -637,8 +695,9 @@ class PerCQWorkerQueue {
           enqueue_ts(enqueue_time) {}
   };
   
-  explicit PerCQWorkerQueue(size_t num_workers)
-      : num_workers_(num_workers), shutdown_(false) {
+  PerCQWorkerQueue(size_t num_workers, Stats* stats, bool server_stats_enabled)
+      : num_workers_(num_workers), stats_(stats), server_stats_enabled_(server_stats_enabled),
+        shutdown_(false) {
     for (size_t i = 0; i < num_workers_; i++) {
       workers_.emplace_back([this]() { WorkerLoop(); });
     }
@@ -675,8 +734,10 @@ class PerCQWorkerQueue {
   
  private:
   void WorkerLoop();
-  
+
   size_t num_workers_;
+  Stats* stats_;
+  bool server_stats_enabled_;
   std::atomic<bool> shutdown_;
   std::queue<WorkItem> work_queue_;
   std::mutex queue_mutex_;
@@ -728,11 +789,12 @@ class CheckCallData : public CallDataBase {
                 std::atomic<size_t>* active_rpc_count, std::atomic<size_t>* total_rpc_count,
                 std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock,
                 std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs,
-                PerCQWorkerQueue* worker_queue)
+                PerCQWorkerQueue* worker_queue, bool server_stats_enabled)
       : service_(service), cq_(cq), cache_(cache), rocksdb_options_(rocksdb_options),
         stats_(stats), log_mutex_(log_mutex), open_count_(open_count),
         active_rpc_count_(active_rpc_count), total_rpc_count_(total_rpc_count),
         clock_(clock), fs_(fs), worker_queue_(worker_queue),
+        server_stats_enabled_(server_stats_enabled),
         responder_(&ctx_), status_(CREATE) {
     Proceed(true);
   }
@@ -766,10 +828,11 @@ class CheckCallData : public CallDataBase {
       // 새로운 CallData를 생성하여 다음 요청을 받을 준비
       new CheckCallData(service_, cq_, cache_, rocksdb_options_, stats_, log_mutex_,
                        open_count_, active_rpc_count_, total_rpc_count_, clock_, fs_,
-                       worker_queue_);
+                       worker_queue_, server_stats_enabled_);
       
       // CQ poller thread: Enqueue work to per-CQ worker queue and return immediately
       // DO NOT perform bloom filter checks here - that happens in worker thread
+      if (server_stats_enabled_) stats_->AddRecvReq();
       auto enqueue_ts = std::chrono::steady_clock::now();
       uint64_t accept_wait_us = static_cast<uint64_t>(
           std::chrono::duration_cast<std::chrono::microseconds>(
@@ -997,7 +1060,8 @@ class CheckCallData : public CallDataBase {
         resp->add_may_match_sst_file_numbers(file_number);
       }
     }
-    
+    if (server_stats_enabled_) stats_->AddCheckLoopUs(total_check_us);
+
     // checked_count 설정
     resp->set_checked_count(checked_count);
     
@@ -1216,7 +1280,8 @@ class CheckCallData : public CallDataBase {
   std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock_;
   std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs_;
   PerCQWorkerQueue* worker_queue_;
-  
+  bool server_stats_enabled_;
+
   std::chrono::steady_clock::time_point accept_start_;
   std::chrono::steady_clock::time_point finish_call_done_ts_ =
       std::chrono::steady_clock::time_point::min();
@@ -1257,7 +1322,7 @@ class StreamCallData {
                  std::atomic<size_t>* active_rpc_count, std::atomic<size_t>* total_rpc_count,
                  std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock,
                  std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs,
-                 PerCQWorkerQueue* worker_queue)
+                 PerCQWorkerQueue* worker_queue, bool server_stats_enabled)
       : service_(service),
         cq_(cq),
         stream_(&ctx_),
@@ -1271,6 +1336,7 @@ class StreamCallData {
         clock_(clock),
         fs_(fs),
         worker_queue_(worker_queue),
+        server_stats_enabled_(server_stats_enabled),
         request_tag_(this, OpType::kRequest),
         read_tag_(this, OpType::kRead),
         write_tag_(this, OpType::kWrite),
@@ -1299,10 +1365,18 @@ class StreamCallData {
     response.set_request_id(item.stream_request_id);
 
     const ROCKSDB_NAMESPACE::Slice user_key(item.stream_user_key);
+    auto check_loop_start = std::chrono::steady_clock::now();
     for (uint64_t file_number : item.stream_sst_file_numbers) {
       if (CheckKeyInSST(user_key, file_number)) {
         response.add_may_match_sst_file_numbers(file_number);
       }
+    }
+    auto check_loop_end = std::chrono::steady_clock::now();
+    if (server_stats_enabled_) {
+      uint64_t check_loop_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              check_loop_end - check_loop_start).count());
+      stats_->AddCheckLoopUs(check_loop_us);
     }
 
     EnqueueResponse(std::move(response));
@@ -1327,7 +1401,7 @@ class StreamCallData {
 
     new StreamCallData(service_, cq_, cache_, rocksdb_options_, stats_, log_mutex_,
                        open_count_, active_rpc_count_, total_rpc_count_, clock_, fs_,
-                       worker_queue_);
+                       worker_queue_, server_stats_enabled_);
 
     active_rpc_count_->fetch_add(1);
     total_rpc_count_->fetch_add(1);
@@ -1365,13 +1439,21 @@ class StreamCallData {
       read_in_flight_ = false;
       if (!ok) {
         read_closed_ = true;
+        if (server_stats_enabled_) stats_->AddFinishOrClose();
         MaybeStartFinishLocked();
         return;
       }
       ++pending_work_items_;
+      if (server_stats_enabled_) {
+        stats_->AddPendingWorkItems(static_cast<uint64_t>(pending_work_items_));
+      }
       StartReadLocked();
     }
 
+    if (server_stats_enabled_) {
+      stats_->AddRecvReq();
+      stats_->AddReadReqEvent();
+    }
     worker_queue_->Enqueue(PerCQWorkerQueue::WorkItem(
         this, request_id, std::move(user_key), std::move(sst_numbers), enqueue_ts));
   }
@@ -1385,6 +1467,9 @@ class StreamCallData {
       return;
     }
     write_queue_.push_back(std::move(response));
+    if (server_stats_enabled_) {
+      stats_->AddWriteqSample(static_cast<uint64_t>(write_queue_.size()));
+    }
     if (!write_in_flight_) {
       StartNextWriteLocked();
     }
@@ -1411,6 +1496,10 @@ class StreamCallData {
       MaybeStartFinishLocked();
       return;
     }
+    if (server_stats_enabled_) {
+      stats_->AddWriteDone();
+      stats_->AddWriteRespEvent();
+    }
     StartNextWriteLocked();
   }
 
@@ -1432,6 +1521,7 @@ class StreamCallData {
   }
 
   void HandleFinish() {
+    if (server_stats_enabled_) stats_->AddFinishOrClose();
     active_rpc_count_->fetch_sub(1);
     delete this;
   }
@@ -1537,6 +1627,7 @@ class StreamCallData {
   std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock_;
   std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs_;
   PerCQWorkerQueue* worker_queue_;
+  bool server_stats_enabled_;
 
   std::mutex mu_;
   std::deque<StreamResponse> write_queue_;
@@ -1565,10 +1656,14 @@ void PerCQWorkerQueue::WorkerLoop() {
     }
     
     if (!work_queue_.empty()) {
+      uint64_t depth = work_queue_.size();
       WorkItem item = std::move(work_queue_.front());
       work_queue_.pop();
       lock.unlock();
 
+      if (server_stats_enabled_ && stats_) {
+        stats_->AddWorkerDeq(depth);
+      }
       if (item.kind == WorkItem::Kind::kUnaryCheck) {
         item.call_data->ProcessInWorkerThread(std::move(item));
       } else {
@@ -1652,7 +1747,11 @@ class BloomCheckServiceImpl {
   explicit BloomCheckServiceImpl(size_t cache_size)
       : cache_(cache_size), rocksdb_options_(),
         clock_(ROCKSDB_NAMESPACE::SystemClock::Default()),
-        fs_(ROCKSDB_NAMESPACE::Env::Default()->GetFileSystem()) {
+        fs_(ROCKSDB_NAMESPACE::Env::Default()->GetFileSystem()),
+        server_stats_enabled_([]() {
+          const char* v = std::getenv("BLOOMCHECK_SERVER_STATS");
+          return v && std::strcmp(v, "1") == 0;
+        }()) {
     // Configure RocksDB options for filter-only access
     rocksdb_options_.env = ROCKSDB_NAMESPACE::Env::Default();
     
@@ -1685,6 +1784,7 @@ class BloomCheckServiceImpl {
   std::atomic<size_t>* total_rpc_count() { return &total_rpc_count_; }
   std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock() { return clock_; }
   std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs() { return fs_; }
+  bool server_stats_enabled() const { return server_stats_enabled_; }
 
  private:
   BloomCheck::AsyncService service_;
@@ -1698,8 +1798,9 @@ class BloomCheckServiceImpl {
   std::atomic<size_t> total_rpc_count_{0};   // 총 처리된 RPC 개수 (QPS 계산용)
   std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock_;
   std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs_;
-  
-  // Stats printing thread
+  const bool server_stats_enabled_;
+
+  // Stats printing thread (runs only when server_stats_enabled_)
   std::thread stats_thread_;
   std::atomic<bool> stop_stats_thread_{false};
   
@@ -1708,51 +1809,71 @@ class BloomCheckServiceImpl {
       std::chrono::steady_clock::time_point::min()};
   
   void StartStatsThread() {
-    // Statistics collection thread disabled for performance
-    // stats_thread_ = std::thread([this]() {
-    //   size_t last_total_rpc = 0;
-    //   auto last_time = std::chrono::steady_clock::now();
-    //   
-    //   while (!stop_stats_thread_.load()) {
-    //     // 1초마다 QPS 계산
-    //     std::this_thread::sleep_for(std::chrono::seconds(1));
-    //     
-    //     auto now = std::chrono::steady_clock::now();
-    //     size_t current_total_rpc = total_rpc_count_.load();
-    //     size_t current_active_rpc = active_rpc_count_.load();
-    //     
-    //     // Delta 계산
-    //     size_t delta_rpc = current_total_rpc - last_total_rpc;
-    //     auto delta_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-    //         now - last_time).count();
-    //     
-    //     // QPS 계산 (delta_rpc / delta_time_seconds)
-    //     double qps = 0.0;
-    //     if (delta_time > 0) {
-    //       qps = (delta_rpc * 1000.0) / delta_time;
-    //     }
-    //     
-    //     // QPS 로그 출력 (매 1초)
-    //     // {
-    //     //   std::lock_guard<std::mutex> log_lock(log_mutex_);
-    //     //   std::cerr << "[QPS] rpc_qps=" << static_cast<size_t>(qps)
-    //     //             << " active_rpcs=" << current_active_rpc
-    //     //             << " total_rpcs=" << current_total_rpc
-    //     //             << " (qps=" << std::fixed << std::setprecision(1) << qps << ")"
-    //     //             << std::endl;
-    //     // }
-    //     
-    //     last_total_rpc = current_total_rpc;
-    //     last_time = now;
-    //     
-    //     // 5초마다 상세 통계 출력
-    //     // static int detail_counter = 0;
-    //     // if (++detail_counter >= 5) {
-    //     //   detail_counter = 0;
-    //     //   stats_.PrintStats(log_mutex_, open_count_.load(), current_active_rpc);
-    //     // }
-    //   }
-    // });
+    if (!server_stats_enabled_) return;
+    stats_thread_ = std::thread([this]() {
+      uint64_t last_recv_req = 0, last_worker_deq = 0, last_depth_sum = 0, last_depth_count = 0;
+      uint64_t last_check_loop_us = 0, last_check_loop_count = 0;
+      uint64_t last_writeq_sum = 0, last_writeq_count = 0;
+      uint64_t last_write_done = 0, last_finish_or_close = 0;
+      uint64_t last_read_req_event = 0, last_write_resp_event = 0;
+      while (!stop_stats_thread_.load()) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (stop_stats_thread_.load()) break;
+
+        uint64_t recv = stats_.recv_req_count.load(std::memory_order_relaxed);
+        uint64_t deq = stats_.worker_deq_count.load(std::memory_order_relaxed);
+        uint64_t depth_sum = stats_.worker_queue_depth_sum.load(std::memory_order_relaxed);
+        uint64_t depth_count = stats_.worker_queue_depth_count.load(std::memory_order_relaxed);
+        uint64_t depth_max = stats_.worker_queue_depth_max.exchange(0, std::memory_order_relaxed);
+        uint64_t check_us = stats_.total_check_loop_us.load(std::memory_order_relaxed);
+        uint64_t check_n = stats_.check_loop_sample_count.load(std::memory_order_relaxed);
+        uint64_t wq_sum = stats_.writeq_sum.load(std::memory_order_relaxed);
+        uint64_t wq_count = stats_.writeq_count.load(std::memory_order_relaxed);
+        uint64_t wq_max = stats_.writeq_max.exchange(0, std::memory_order_relaxed);
+        uint64_t write_done = stats_.write_done_count.load(std::memory_order_relaxed);
+        uint64_t finish_close = stats_.finish_or_close_count.load(std::memory_order_relaxed);
+        uint64_t read_req_event = stats_.read_req_event_count.load(std::memory_order_relaxed);
+        uint64_t write_resp_event =
+            stats_.write_resp_event_count.load(std::memory_order_relaxed);
+        uint64_t pending_work_items_max =
+            stats_.pending_work_items_max.exchange(0, std::memory_order_relaxed);
+
+        uint64_t recv_req_per_s = recv - last_recv_req;
+        uint64_t worker_deq_per_s = deq - last_worker_deq;
+        uint64_t depth_count_delta = (depth_count >= last_depth_count) ? (depth_count - last_depth_count) : 0;
+        uint64_t worker_queue_depth_avg = depth_count_delta ? (depth_sum - last_depth_sum) / depth_count_delta : 0;
+        uint64_t check_loop_avg_us = (check_n > last_check_loop_count) ? (check_us - last_check_loop_us) / (check_n - last_check_loop_count) : 0;
+        uint64_t wq_count_delta = (wq_count >= last_writeq_count) ? (wq_count - last_writeq_count) : 0;
+        uint64_t writeq_avg = wq_count_delta ? (wq_sum - last_writeq_sum) / wq_count_delta : 0;
+        uint64_t write_done_per_s = write_done - last_write_done;
+        uint64_t finish_or_close_per_s = finish_close - last_finish_or_close;
+        uint64_t read_req_per_s = read_req_event - last_read_req_event;
+        uint64_t write_resp_per_s = write_resp_event - last_write_resp_event;
+
+        last_recv_req = recv; last_worker_deq = deq; last_depth_sum = depth_sum; last_depth_count = depth_count;
+        last_check_loop_us = check_us; last_check_loop_count = check_n;
+        last_writeq_sum = wq_sum; last_writeq_count = wq_count;
+        last_write_done = write_done; last_finish_or_close = finish_close;
+        last_read_req_event = read_req_event; last_write_resp_event = write_resp_event;
+
+        {
+          std::lock_guard<std::mutex> log_lock(log_mutex_);
+          std::cerr << "[STATS] recv_req_per_s=" << recv_req_per_s
+                    << " worker_deq_per_s=" << worker_deq_per_s
+                    << " worker_queue_depth_avg=" << worker_queue_depth_avg
+                    << " worker_queue_depth_max=" << depth_max
+                    << " check_loop_avg_us=" << check_loop_avg_us
+                    << " writeq_avg=" << writeq_avg
+                    << " writeq_max=" << wq_max
+                    << " max_pending_work_items=" << pending_work_items_max
+                    << " read_req_per_s=" << read_req_per_s
+                    << " write_resp_per_s=" << write_resp_per_s
+                    << " write_done_per_s=" << write_done_per_s
+                    << " finish_or_close_per_s=" << finish_or_close_per_s
+                    << std::endl;
+        }
+      }
+    });
   }
   
   void StopStatsThread() {
@@ -1771,11 +1892,13 @@ void HandleRpcs(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* 
   // 초기 CallData 생성 (ACCEPT 단계)
   new CheckCallData(service, cq, impl->cache(), impl->rocksdb_options(), impl->stats(),
                    impl->log_mutex(), impl->open_count(), impl->active_rpc_count(),
-                   impl->total_rpc_count(), impl->clock(), impl->fs(), worker_queue);
+                   impl->total_rpc_count(), impl->clock(), impl->fs(), worker_queue,
+                   impl->server_stats_enabled());
   new NoopCallData(service, cq);
   new StreamCallData(service, cq, impl->cache(), impl->rocksdb_options(), impl->stats(),
                      impl->log_mutex(), impl->open_count(), impl->active_rpc_count(),
-                     impl->total_rpc_count(), impl->clock(), impl->fs(), worker_queue);
+                     impl->total_rpc_count(), impl->clock(), impl->fs(), worker_queue,
+                     impl->server_stats_enabled());
   
   void* tag;
   bool ok;
@@ -1850,8 +1973,8 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   const size_t NUM_WORKER_THREADS_PER_CQ = 8;  // CQ당 worker thread 개수
   std::vector<std::unique_ptr<bloomcheck::PerCQWorkerQueue>> worker_queues;
   for (int i = 0; i < NUM_CQS; i++) {
-    worker_queues.emplace_back(
-        std::make_unique<bloomcheck::PerCQWorkerQueue>(NUM_WORKER_THREADS_PER_CQ));
+    worker_queues.emplace_back(std::make_unique<bloomcheck::PerCQWorkerQueue>(
+        NUM_WORKER_THREADS_PER_CQ, service.stats(), service.server_stats_enabled()));
   }
   // std::cout << "Using " << NUM_WORKER_THREADS_PER_CQ 
   //           << " worker threads per CQ (total: " 
@@ -1860,12 +1983,19 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   // CQ 폴러 스레드 생성 (각 CQ당 1개 스레드)
   // CQ poller threads: 빠른 이벤트 처리만 수행 (bloom filter 체크 안 함)
   const size_t NUM_POLLERS_PER_CQ = 1;
+  const int POLLER_PIN_START_CPU = 15;  // Pin order: 15 -> 14 -> 13 -> ...
+  std::atomic<int> poller_pin_index{0};
   std::vector<std::thread> cq_threads;
   for (int i = 0; i < NUM_CQS; i++) {
     for (size_t p = 0; p < NUM_POLLERS_PER_CQ; ++p) {
-      cq_threads.emplace_back(std::thread(bloomcheck::HandleRpcs,
-                                          service.service(), cqs[i].get(), &service,
-                                          worker_queues[i].get()));
+      cq_threads.emplace_back(std::thread(
+          [&, i]() {
+            const int pin_idx = poller_pin_index.fetch_add(1, std::memory_order_relaxed);
+            const int cpu_id = POLLER_PIN_START_CPU - pin_idx;
+            (void)bloomcheck::PinCurrentThreadToCpu(cpu_id);
+            bloomcheck::HandleRpcs(service.service(), cqs[i].get(), &service,
+                                   worker_queues[i].get());
+          }));
     }
   }
   
