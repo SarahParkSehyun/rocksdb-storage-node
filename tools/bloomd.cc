@@ -329,6 +329,7 @@ class TableReaderCache {
   explicit TableReaderCache(size_t max_size)
       : max_size_(max_size),
         lru_update_every_(ParseLruUpdateEveryEnv()),
+        entry_lock_enabled_(ParseEntryLockEnv()),
         server_stats_enabled_(ParseServerStatsEnabledEnv()) {
     // Initialize shards
     size_t max_size_per_shard = (max_size + N_SHARDS - 1) / N_SHARDS;
@@ -346,6 +347,9 @@ class TableReaderCache {
   Shard& GetShard(uint64_t file_number) {
     return *shards_[GetShardIndex(file_number)];
   }
+
+  bool entry_lock_enabled() const { return entry_lock_enabled_; }
+  uint32_t lru_update_every() const { return lru_update_every_; }
 
   // Get or create TableReader for SST file (by file_number)
   // Returns nullptr on error (safe to treat as may_match=true)
@@ -657,6 +661,14 @@ class TableReaderCache {
   }
 
  private:
+  static bool ParseEntryLockEnv() {
+    const char* env = std::getenv("BLOOMD_ENTRY_LOCK");
+    if (!env || *env == '\0') {
+      return false;
+    }
+    return std::strcmp(env, "1") == 0;
+  }
+
   static bool ParseServerStatsEnabledEnv() {
     const char* env = std::getenv("BLOOMCHECK_SERVER_STATS");
     return env && std::strcmp(env, "1") == 0;
@@ -726,6 +738,7 @@ class TableReaderCache {
   std::array<std::unique_ptr<Shard>, N_SHARDS> shards_;
   size_t max_size_;
   uint32_t lru_update_every_;
+  bool entry_lock_enabled_;
   bool server_stats_enabled_;
 };
 
@@ -1218,16 +1231,19 @@ class CheckCallData : public CallDataBase {
 
     // Immutable SST reader path: allow concurrent readers.
     entry->last_access_us.store(SteadyNowMicros(), std::memory_order_relaxed);
-    bool sample_entry_lock_wait = server_stats_enabled_ && ShouldSampleLockWait();
-    auto lock_wait_start = sample_entry_lock_wait ? std::chrono::steady_clock::now()
-                                                  : std::chrono::steady_clock::time_point{};
-    std::shared_lock<std::shared_mutex> lock(entry->rw_mutex);
-    if (sample_entry_lock_wait) {
-      uint64_t wait_us = static_cast<uint64_t>(
-          std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::steady_clock::now() - lock_wait_start)
-              .count());
-      stats_->AddEntryRwLockWaitUs(wait_us);
+    std::shared_lock<std::shared_mutex> lock(entry->rw_mutex, std::defer_lock);
+    if (cache_->entry_lock_enabled()) {
+      bool sample_entry_lock_wait = server_stats_enabled_ && ShouldSampleLockWait();
+      auto lock_wait_start = sample_entry_lock_wait ? std::chrono::steady_clock::now()
+                                                    : std::chrono::steady_clock::time_point{};
+      lock.lock();
+      if (sample_entry_lock_wait) {
+        uint64_t wait_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - lock_wait_start)
+                .count());
+        stats_->AddEntryRwLockWaitUs(wait_us);
+      }
     }
 
     ROCKSDB_NAMESPACE::TableReader* reader = entry->reader.get();
@@ -1638,16 +1654,19 @@ class StreamCallData {
     }
 
     entry->last_access_us.store(SteadyNowMicros(), std::memory_order_relaxed);
-    bool sample_entry_lock_wait = server_stats_enabled_ && ShouldSampleLockWait();
-    auto lock_wait_start = sample_entry_lock_wait ? std::chrono::steady_clock::now()
-                                                  : std::chrono::steady_clock::time_point{};
-    std::shared_lock<std::shared_mutex> lock(entry->rw_mutex);
-    if (sample_entry_lock_wait) {
-      uint64_t wait_us = static_cast<uint64_t>(
-          std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::steady_clock::now() - lock_wait_start)
-              .count());
-      stats_->AddEntryRwLockWaitUs(wait_us);
+    std::shared_lock<std::shared_mutex> lock(entry->rw_mutex, std::defer_lock);
+    if (cache_->entry_lock_enabled()) {
+      bool sample_entry_lock_wait = server_stats_enabled_ && ShouldSampleLockWait();
+      auto lock_wait_start = sample_entry_lock_wait ? std::chrono::steady_clock::now()
+                                                    : std::chrono::steady_clock::time_point{};
+      lock.lock();
+      if (sample_entry_lock_wait) {
+        uint64_t wait_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - lock_wait_start)
+                .count());
+        stats_->AddEntryRwLockWaitUs(wait_us);
+      }
     }
 
     ROCKSDB_NAMESPACE::TableReader* reader = entry->reader.get();
