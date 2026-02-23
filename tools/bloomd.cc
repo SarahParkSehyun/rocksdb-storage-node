@@ -20,6 +20,7 @@
 #include <iomanip>
 #include <iostream>
 #include <list>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <pthread.h>
@@ -308,7 +309,8 @@ class TableReaderCache {
 
   static constexpr size_t N_SHARDS = 16;  // 2^4 shards for better distribution
 
-  explicit TableReaderCache(size_t max_size) : max_size_(max_size) {
+  explicit TableReaderCache(size_t max_size)
+      : max_size_(max_size), lru_update_every_(ParseLruUpdateEveryEnv()) {
     // Initialize shards
     size_t max_size_per_shard = (max_size + N_SHARDS - 1) / N_SHARDS;
     for (size_t i = 0; i < N_SHARDS; ++i) {
@@ -349,6 +351,9 @@ class TableReaderCache {
     
     // Update LRU outside shared_lock (requires unique_lock)
     if (cached_entry) {
+      if (!ShouldUpdateLruOnHit()) {
+        return cached_entry;
+      }
       std::unique_lock<std::shared_mutex> lock(shard.mutex);
       // Double-check cache still exists (might have been evicted)
       if (shard.cache.find(file_number) != shard.cache.end()) {
@@ -603,6 +608,31 @@ class TableReaderCache {
   }
 
  private:
+  static uint32_t ParseLruUpdateEveryEnv() {
+    const char* env = std::getenv("BLOOMD_LRU_UPDATE_EVERY");
+    if (!env || *env == '\0') {
+      return 64;
+    }
+    char* end = nullptr;
+    unsigned long parsed = std::strtoul(env, &end, 10);
+    if (end == env || parsed == 0) {
+      return 64;
+    }
+    if (parsed > static_cast<unsigned long>(std::numeric_limits<uint32_t>::max())) {
+      return std::numeric_limits<uint32_t>::max();
+    }
+    return static_cast<uint32_t>(parsed);
+  }
+
+  bool ShouldUpdateLruOnHit() const {
+    if (lru_update_every_ <= 1) {
+      return true;
+    }
+    static thread_local uint32_t hit_counter = 0;
+    hit_counter++;
+    return (hit_counter % lru_update_every_) == 0;
+  }
+
   // Update LRU list: move file_number to front (MRU)
   // Requires: caller must hold unique_lock on shard.mutex
   void UpdateLRU(Shard& shard, uint64_t file_number) {
@@ -641,6 +671,7 @@ class TableReaderCache {
 
   std::array<std::unique_ptr<Shard>, N_SHARDS> shards_;
   size_t max_size_;
+  uint32_t lru_update_every_;
 };
 
 // Base class for all CallData (for polymorphic Proceed() call)
