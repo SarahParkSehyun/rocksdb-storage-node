@@ -56,6 +56,13 @@ bool PinCurrentThreadToCpu(int cpu_id) {
   return pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0;
 }
 
+uint64_t SteadyNowMicros() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
 // Reason codes for why CheckKeyInSST returned true/false
 enum class CheckReason {
   OPEN_FAIL,              // GetOrOpen returned nullptr
@@ -267,13 +274,13 @@ class TableReaderCache {
     std::unique_ptr<ROCKSDB_NAMESPACE::TableReader> reader;
     ROCKSDB_NAMESPACE::InternalKeyComparator internal_comparator;
     ROCKSDB_NAMESPACE::ImmutableOptions ioptions;
-    std::chrono::steady_clock::time_point last_access;
-    std::mutex mutex;  // Per-entry lock for thread safety
+    std::atomic<uint64_t> last_access_us{0};
+    mutable std::shared_mutex rw_mutex;
     
     explicit CacheEntry(const ROCKSDB_NAMESPACE::Options& opt)
         : internal_comparator(opt.comparator),
           ioptions(opt),
-          last_access(std::chrono::steady_clock::now()) {
+          last_access_us(SteadyNowMicros()) {
       // ImmutableOptions constructor sets fs from env automatically
       // (ImmutableDBOptions constructor sets: fs = env->GetFileSystem())
     }
@@ -1123,9 +1130,9 @@ class CheckCallData : public CallDataBase {
       return true;
     }
 
-    // Lock entry for thread-safe access
-    std::lock_guard<std::mutex> lock(entry->mutex);
-    entry->last_access = std::chrono::steady_clock::now();
+    // Immutable SST reader path: allow concurrent readers.
+    entry->last_access_us.store(SteadyNowMicros(), std::memory_order_relaxed);
+    std::shared_lock<std::shared_mutex> lock(entry->rw_mutex);
 
     ROCKSDB_NAMESPACE::TableReader* reader = entry->reader.get();
     if (!reader) {
@@ -1534,8 +1541,8 @@ class StreamCallData {
       return true;
     }
 
-    std::lock_guard<std::mutex> lock(entry->mutex);
-    entry->last_access = std::chrono::steady_clock::now();
+    entry->last_access_us.store(SteadyNowMicros(), std::memory_order_relaxed);
+    std::shared_lock<std::shared_mutex> lock(entry->rw_mutex);
 
     ROCKSDB_NAMESPACE::TableReader* reader = entry->reader.get();
     if (!reader) {
