@@ -9,6 +9,7 @@
 #include <grpc/support/log.h>
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -26,6 +27,7 @@
 #include <pthread.h>
 #include <queue>
 #include <sched.h>
+#include <sstream>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -69,6 +71,90 @@ bool ShouldSampleLockWait() {
   return ((++sample_counter) & 1023u) == 0;
 }
 
+bool ShouldSampleGetOrOpen() {
+  static thread_local uint32_t get_or_open_sample_counter = 0;
+  return ((++get_or_open_sample_counter) & 1023u) == 0;
+}
+
+bool ShouldSampleEnqueueLock() {
+  static thread_local uint32_t enqueue_lock_sample_counter = 0;
+  return ((++enqueue_lock_sample_counter) & 1023u) == 0;
+}
+
+bool ShouldSampleDequeueLock() {
+  static thread_local uint32_t dequeue_lock_sample_counter = 0;
+  return ((++dequeue_lock_sample_counter) & 1023u) == 0;
+}
+
+bool IsSstListLogEnabled() {
+  // static const bool enabled = []() {
+  //   const char* env = std::getenv("BLOOMD_SST_LIST_LOG");
+  //   return env == nullptr || std::string(env) != "0";
+  // }();
+  // return enabled;
+  return false;
+}
+
+bool IsSstReasonLogEnabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("BLOOMD_SST_REASON_LOG");
+    return env && std::string(env) == "1";
+  }();
+  return enabled;
+}
+
+bool IsOpenFailLogEnabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("BLOOMD_OPEN_FAIL_LOG");
+    return env && std::string(env) == "1";
+  }();
+  return enabled;
+}
+
+struct OpenFailDetail {
+  bool valid = false;
+  std::string stage;
+  std::string path;
+  std::string status;
+  std::string io_status;
+};
+
+thread_local OpenFailDetail g_last_open_fail_detail;
+
+void ResetLastOpenFailDetail() {
+  g_last_open_fail_detail = OpenFailDetail{};
+}
+
+void SetLastOpenFailDetail(const char* stage, const std::string* path,
+                           const ROCKSDB_NAMESPACE::Status* st,
+                           const ROCKSDB_NAMESPACE::IOStatus* ios) {
+  g_last_open_fail_detail.valid = true;
+  g_last_open_fail_detail.stage = stage ? stage : "";
+  g_last_open_fail_detail.path = path ? *path : "";
+  g_last_open_fail_detail.status = st ? st->ToString() : "";
+  g_last_open_fail_detail.io_status = ios ? ios->ToString() : "";
+}
+
+const OpenFailDetail& GetLastOpenFailDetail() {
+  return g_last_open_fail_detail;
+}
+
+template <typename Iterable>
+std::string FormatSstList(const Iterable& values) {
+  std::ostringstream oss;
+  oss << "[";
+  bool first = true;
+  for (const auto& v : values) {
+    if (!first) {
+      oss << ",";
+    }
+    first = false;
+    oss << v;
+  }
+  oss << "]";
+  return oss.str();
+}
+
 // Reason codes for why CheckKeyInSST returned true/false
 enum class CheckReason {
   OPEN_FAIL,              // GetOrOpen returned nullptr
@@ -83,8 +169,35 @@ enum class CheckReason {
   KEYMAYMATCH_FALSE       // KeyMayMatch returned false
 };
 
+const char* CheckReasonToString(CheckReason reason) {
+  switch (reason) {
+    case CheckReason::OPEN_FAIL:
+      return "open_fail";
+    case CheckReason::READER_NULL:
+      return "reader_null";
+    case CheckReason::BB_TABLE_NULL:
+      return "bb_table_null";
+    case CheckReason::REP_NULL:
+      return "rep_null";
+    case CheckReason::FILTER_NULL:
+      return "filter_null";
+    case CheckReason::WHOLE_KEY_FILTERING_FALSE:
+      return "whole_key_filtering_false";
+    case CheckReason::UCOMP_NULL:
+      return "ucomp_null";
+    case CheckReason::KEYMAYMATCH_EXCEPTION:
+      return "keymaymatch_exception";
+    case CheckReason::KEYMAYMATCH_TRUE:
+      return "keymaymatch_true";
+    case CheckReason::KEYMAYMATCH_FALSE:
+      return "keymaymatch_false";
+  }
+  return "unknown";
+}
+
 // Statistics counters
 struct Stats {
+  static constexpr size_t kMaxTrackedCqs = 32;
   std::atomic<size_t> total_checks{0};
   std::atomic<size_t> open_fail_getfilesize{0};
   std::atomic<size_t> open_fail_newfile{0};
@@ -126,6 +239,28 @@ struct Stats {
   std::atomic<uint64_t> entry_rw_lock_wait_samples{0};
   std::atomic<uint64_t> total_shard_lru_lock_wait_us{0};
   std::atomic<uint64_t> shard_lru_lock_wait_samples{0};
+  std::atomic<uint64_t> last_access_update_count{0};
+  std::atomic<uint64_t> cache_hit_count{0};
+  std::atomic<uint64_t> cache_miss_count{0};
+  std::atomic<uint64_t> cache_lookup_hit_count{0};
+  std::atomic<uint64_t> inflight_wait_count{0};
+  std::atomic<uint64_t> new_table_reader_count{0};
+  std::atomic<uint64_t> total_get_or_open_us{0};
+  std::atomic<uint64_t> get_or_open_sample_count{0};
+  std::atomic<uint64_t> eviction_count{0};
+  std::atomic<uint64_t> total_enqueue_lock_wait_us{0};
+  std::atomic<uint64_t> enqueue_lock_sample_count{0};
+  std::atomic<uint64_t> total_enqueue_lock_hold_us{0};
+  std::atomic<uint64_t> total_dequeue_lock_wait_us{0};
+  std::atomic<uint64_t> dequeue_lock_sample_count{0};
+  std::atomic<uint64_t> total_dequeue_lock_hold_us{0};
+  std::atomic<uint64_t> cq_next_count{0};
+  std::atomic<uint64_t> cq_read_events{0};
+  std::atomic<uint64_t> cq_write_events{0};
+  std::atomic<uint64_t> cq_finish_events{0};
+  std::array<std::atomic<uint64_t>, kMaxTrackedCqs> cq_pop_by_idx{};
+  std::array<std::atomic<uint64_t>, kMaxTrackedCqs> enq_to_worker_by_idx{};
+  std::array<std::atomic<uint64_t>, kMaxTrackedCqs> done_by_worker_by_idx{};
 
   static void UpdateMax(std::atomic<uint64_t>& m, uint64_t val) {
     uint64_t cur = m.load(std::memory_order_relaxed);
@@ -163,7 +298,55 @@ struct Stats {
     total_shard_lru_lock_wait_us.fetch_add(us, std::memory_order_relaxed);
     shard_lru_lock_wait_samples.fetch_add(1, std::memory_order_relaxed);
   }
-  
+  void AddLastAccessUpdate() {
+    last_access_update_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  void AddCacheHit() { cache_hit_count.fetch_add(1, std::memory_order_relaxed); }
+  void AddCacheMiss() { cache_miss_count.fetch_add(1, std::memory_order_relaxed); }
+  void AddCacheLookupHit() {
+    cache_lookup_hit_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  void AddInflightWait() {
+    inflight_wait_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  void AddNewTableReader() {
+    new_table_reader_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  void AddEviction() { eviction_count.fetch_add(1, std::memory_order_relaxed); }
+  void AddGetOrOpenUs(uint64_t us) {
+    total_get_or_open_us.fetch_add(us, std::memory_order_relaxed);
+    get_or_open_sample_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  void AddEnqueueLockUs(uint64_t wait_us, uint64_t hold_us) {
+    total_enqueue_lock_wait_us.fetch_add(wait_us, std::memory_order_relaxed);
+    total_enqueue_lock_hold_us.fetch_add(hold_us, std::memory_order_relaxed);
+    enqueue_lock_sample_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  void AddDequeueLockUs(uint64_t wait_us, uint64_t hold_us) {
+    total_dequeue_lock_wait_us.fetch_add(wait_us, std::memory_order_relaxed);
+    total_dequeue_lock_hold_us.fetch_add(hold_us, std::memory_order_relaxed);
+    dequeue_lock_sample_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  void AddCqNext() { cq_next_count.fetch_add(1, std::memory_order_relaxed); }
+  void AddCqEventRead() { cq_read_events.fetch_add(1, std::memory_order_relaxed); }
+  void AddCqEventWrite() { cq_write_events.fetch_add(1, std::memory_order_relaxed); }
+  void AddCqEventFinish() { cq_finish_events.fetch_add(1, std::memory_order_relaxed); }
+  void AddCqPop(size_t cq_idx) {
+    if (cq_idx < kMaxTrackedCqs) {
+      cq_pop_by_idx[cq_idx].fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  void AddEnqToWorker(size_t cq_idx) {
+    if (cq_idx < kMaxTrackedCqs) {
+      enq_to_worker_by_idx[cq_idx].fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  void AddDoneByWorker(size_t cq_idx) {
+    if (cq_idx < kMaxTrackedCqs) {
+      done_by_worker_by_idx[cq_idx].fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   void RecordReason(CheckReason reason) {
     // Statistics collection disabled for performance
     // total_checks++;
@@ -232,7 +415,7 @@ static std::string MakeSstPath(uint64_t file_number) {
       base_path += '/';
     }
   } else {
-    base_path = "/mnt/kvafa/db_bench/";
+    base_path = "/mnt/kvafa/db_bench_1TB_re_gold/";
   }
   
   // First try: plain format (e.g., "16916.sst")
@@ -253,7 +436,7 @@ static std::string TryOpenSstPath(uint64_t file_number,
       base_path += '/';
     }
   } else {
-    base_path = "/mnt/kvafa/db_bench/";
+    base_path = "/mnt/kvafa/db_bench_1TB_re_gold/";
   }
   
   // Try 1: plain format (e.g., "16916.sst")
@@ -332,7 +515,9 @@ class TableReaderCache {
         last_access_update_every_(ParseLastAccessUpdateEveryEnv()),
         entry_lock_enabled_(ParseEntryLockEnv()),
         server_stats_enabled_(ParseServerStatsEnabledEnv()) {
-    // Initialize shards
+    // Initialize shards: per-shard cap = ceil(max_size/N_SHARDS) so that
+    // each shard.cache.size() <= shard.max_size and sum never exceeds
+    // N_SHARDS * ceil(max_size/N_SHARDS) (equals max_size when divisible).
     size_t max_size_per_shard = (max_size + N_SHARDS - 1) / N_SHARDS;
     for (size_t i = 0; i < N_SHARDS; ++i) {
       shards_[i] = std::make_unique<Shard>(max_size_per_shard);
@@ -349,6 +534,20 @@ class TableReaderCache {
     return *shards_[GetShardIndex(file_number)];
   }
 
+  // Sum of shard.cache.size() over all shards (for stats). Each shard enforces
+  // max_size_per_shard = ceil(max_size_/N_SHARDS), so total can be up to
+  // N_SHARDS * ceil(max_size_/N_SHARDS) (e.g. 512 when max_size_=512).
+  size_t GetTotalCacheSize() const {
+    size_t total = 0;
+    for (const auto& shard : shards_) {
+      std::shared_lock<std::shared_mutex> lock(shard->mutex);
+      total += shard->cache.size();
+    }
+    return total;
+  }
+
+  size_t max_size() const { return max_size_; }
+
   bool entry_lock_enabled() const { return entry_lock_enabled_; }
   uint32_t lru_update_every() const { return lru_update_every_; }
   uint32_t last_access_update_every() const { return last_access_update_every_; }
@@ -362,7 +561,52 @@ class TableReaderCache {
                                         const ROCKSDB_NAMESPACE::Options& options,
                                         Stats* stats, std::mutex* log_mutex, std::atomic<size_t>* open_count) {
     Shard& shard = GetShard(file_number);
-    
+    ResetLastOpenFailDetail();
+    auto get_or_open_start = std::chrono::steady_clock::now();
+    bool sample_get_or_open = stats && server_stats_enabled_ && ShouldSampleGetOrOpen();
+    auto log_open_fallback = [&](const char* stage,
+                                 const std::string* path,
+                                 const ROCKSDB_NAMESPACE::Status* st,
+                                 const ROCKSDB_NAMESPACE::IOStatus* ios) {
+      const bool sst_reason_log_enabled = IsSstReasonLogEnabled();
+      const bool open_fail_log_enabled = IsOpenFailLogEnabled();
+      if ((!sst_reason_log_enabled && !open_fail_log_enabled) || !log_mutex) {
+        return;
+      }
+      if (!open_fail_log_enabled) {
+        if (!open_count) {
+          return;
+        }
+        const size_t id = open_count->load(std::memory_order_relaxed);
+        if (!(id <= 200 || (id % 10000) == 0)) {
+          return;
+        }
+      }
+      std::lock_guard<std::mutex> lg(*log_mutex);
+      std::cerr << (open_fail_log_enabled ? "[OPEN_FAIL][get_or_open] stage="
+                                          : "[SST_REASON][get_or_open] stage=")
+                << stage
+                << " file_number=" << file_number;
+      if (path) {
+        std::cerr << " path=" << *path;
+      }
+      if (st) {
+        std::cerr << " status=" << st->ToString();
+      }
+      if (ios) {
+        std::cerr << " io_status=" << ios->ToString();
+      }
+      std::cerr << std::endl;
+    };
+    auto record_get_or_open_duration = [get_or_open_start, sample_get_or_open, stats]() {
+      if (sample_get_or_open && stats) {
+        uint64_t us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - get_or_open_start).count());
+        stats->AddGetOrOpenUs(us);
+      }
+    };
+
     // Phase A: Check cache hit with shared_lock (read-heavy optimization)
     std::shared_ptr<CacheEntry> cached_entry;
     {
@@ -380,6 +624,8 @@ class TableReaderCache {
     // Update LRU outside shared_lock (requires unique_lock)
     if (cached_entry) {
       if (!ShouldUpdateLruOnHit()) {
+        if (stats) stats->AddCacheLookupHit();
+        record_get_or_open_duration();
         return cached_entry;
       }
       bool sample_lru_lock_wait = server_stats_enabled_ && stats && ShouldSampleLockWait();
@@ -397,6 +643,8 @@ class TableReaderCache {
       if (shard.cache.find(file_number) != shard.cache.end()) {
         UpdateLRU(shard, file_number);
       }
+      if (stats) stats->AddCacheLookupHit();
+      record_get_or_open_duration();
       return cached_entry;
     }
 
@@ -423,10 +671,11 @@ class TableReaderCache {
           stats->AddShardLruLockWaitUs(wait_us);
         }
         UpdateLRU(shard, file_number);
-        // if (stats) stats->cache_hits++;
+        if (stats) stats->AddCacheLookupHit();
+        record_get_or_open_duration();
         return it->second;
       }
-      
+
       // Check if another thread is already opening this file
       auto inflight_it = shard.inflight.find(file_number);
       if (inflight_it != shard.inflight.end()) {
@@ -450,9 +699,13 @@ class TableReaderCache {
     if (is_waiting && inflight) {
       try {
         std::shared_ptr<CacheEntry> result = inflight->future.get();
+        if (stats) stats->AddInflightWait();
+        record_get_or_open_duration();
         return result;
       } catch (...) {
         // Promise was broken (shouldn't happen, but handle gracefully)
+        if (stats) stats->AddCacheMiss();
+        record_get_or_open_duration();
         return nullptr;
       }
     }
@@ -486,7 +739,7 @@ class TableReaderCache {
     // Note: TryOpenSstPath already called GetFileSize, so we check file_size here
     if (actual_path.empty() || file_size == 0) {
       // TryOpenSstPath failed to find any matching file
-      // if (stats) stats->open_fail_getfilesize++;
+      if (stats) stats->open_fail_getfilesize.fetch_add(1, std::memory_order_relaxed);
       // 샘플 로그 (초기 50회 + 매 1000회) - 락 밖에서
       // if (open_id <= 50 || open_id % 1000 == 0) {
       //   std::lock_guard<std::mutex> log_lock(*log_mutex);
@@ -501,12 +754,16 @@ class TableReaderCache {
         shard.inflight.erase(file_number);
         inflight->promise.set_value(nullptr);
       }
+      if (stats) stats->AddCacheMiss();
+      SetLastOpenFailDetail("path_not_found", &actual_path, nullptr, nullptr);
+      log_open_fallback("path_not_found", &actual_path, nullptr, nullptr);
+      record_get_or_open_duration();
       return nullptr;
     }
 
     ROCKSDB_NAMESPACE::IOStatus s = fs->NewRandomAccessFile(actual_path, fopts, &file, nullptr);
     if (!s.ok()) {
-      // if (stats) stats->open_fail_newfile++;
+      if (stats) stats->open_fail_newfile.fetch_add(1, std::memory_order_relaxed);
       // 샘플 로그 - 락 밖에서
       // if (open_id <= 50 || open_id % 1000 == 0) {
       //   std::lock_guard<std::mutex> log_lock(*log_mutex);
@@ -523,6 +780,10 @@ class TableReaderCache {
         shard.inflight.erase(file_number);
         inflight->promise.set_value(nullptr);
       }
+      if (stats) stats->AddCacheMiss();
+      SetLastOpenFailDetail("new_random_access_file_fail", &actual_path, nullptr, &s);
+      log_open_fallback("new_random_access_file_fail", &actual_path, nullptr, &s);
+      record_get_or_open_duration();
       return nullptr;
     }
 
@@ -553,7 +814,7 @@ class TableReaderCache {
         false /* prefetch_index_and_filter_in_cache */);
     
     if (!table_status.ok() || !table_reader) {
-      // if (stats) stats->open_fail_newreader++;
+      if (stats) stats->open_fail_newreader.fetch_add(1, std::memory_order_relaxed);
       // 샘플 로그 - 락 밖에서
       // if (open_id <= 50 || open_id % 1000 == 0) {
       //   std::lock_guard<std::mutex> log_lock(*log_mutex);
@@ -570,6 +831,10 @@ class TableReaderCache {
         shard.inflight.erase(file_number);
         inflight->promise.set_value(nullptr);
       }
+      if (stats) stats->AddCacheMiss();
+      SetLastOpenFailDetail("new_table_reader_fail", &actual_path, &table_status, nullptr);
+      log_open_fallback("new_table_reader_fail", &actual_path, &table_status, nullptr);
+      record_get_or_open_duration();
       return nullptr;
     }
 
@@ -646,17 +911,23 @@ class TableReaderCache {
       if (it != shard.cache.end()) {
         // Another thread already inserted - use existing entry
         UpdateLRU(shard, file_number);
-        // if (stats) stats->cache_hits++;
-        // Clean up inflight entry
+        if (stats) stats->AddCacheLookupHit();
+        record_get_or_open_duration();
         shard.inflight.erase(file_number);
         inflight->promise.set_value(it->second);
         return it->second;
       }
-      
-      // Cache by file_number and update LRU
+
+      // Enforce cap at insert time: other threads may have inserted while we opened,
+      // so we can exceed max_size_per_shard if we only evicted in Phase A.
+      while (shard.cache.size() >= shard.max_size) {
+        EvictLRUOne(shard, stats);
+      }
+      // Cache by file_number and update LRU (open created)
       shard.cache[file_number] = entry_ptr;
       UpdateLRU(shard, file_number);
-      
+      if (stats) stats->AddNewTableReader();
+      record_get_or_open_duration();
       // Clean up inflight entry and notify waiters
       shard.inflight.erase(file_number);
       inflight->promise.set_value(entry_ptr);
@@ -761,7 +1032,7 @@ class TableReaderCache {
     auto cache_it = shard.cache.find(lru_file_number);
     if (cache_it != shard.cache.end()) {
       shard.cache.erase(cache_it);
-      // if (stats) stats->evictions++;
+      if (stats) stats->AddEviction();
     }
   }
 
@@ -832,8 +1103,8 @@ class PerCQWorkerQueue {
           enqueue_ts(enqueue_time) {}
   };
   
-  PerCQWorkerQueue(size_t num_workers, Stats* stats, bool server_stats_enabled)
-      : num_workers_(num_workers), stats_(stats), server_stats_enabled_(server_stats_enabled),
+  PerCQWorkerQueue(size_t cq_idx, size_t num_workers, Stats* stats, bool server_stats_enabled)
+      : cq_idx_(cq_idx), num_workers_(num_workers), stats_(stats), server_stats_enabled_(server_stats_enabled),
         shutdown_(false) {
     for (size_t i = 0; i < num_workers_; i++) {
       workers_.emplace_back([this]() { WorkerLoop(); });
@@ -844,13 +1115,22 @@ class PerCQWorkerQueue {
     Shutdown();
   }
   
-  // Lock-free enqueue using atomic operations
   void Enqueue(WorkItem item) {
-    // Use atomic operations for lock-free enqueue
-    // For simplicity, we use a lock here but can be optimized with lock-free queue
+    if (stats_) stats_->AddEnqToWorker(cq_idx_);
+    bool sample = server_stats_enabled_ && stats_ && ShouldSampleEnqueueLock();
+    auto t0 = sample ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
+      auto t1 = sample ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       work_queue_.push(std::move(item));
+      auto t2 = sample ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+      if (sample && stats_) {
+        uint64_t wait_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+        uint64_t hold_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count());
+        stats_->AddEnqueueLockUs(wait_us, hold_us);
+      }
     }
     queue_cv_.notify_one();
   }
@@ -872,6 +1152,7 @@ class PerCQWorkerQueue {
  private:
   void WorkerLoop();
 
+  size_t cq_idx_;
   size_t num_workers_;
   Stats* stats_;
   bool server_stats_enabled_;
@@ -937,6 +1218,10 @@ class CheckCallData : public CallDataBase {
   }
 
   void Proceed(bool ok) override {
+    if (server_stats_enabled_ && stats_) {
+      if (status_ == PROCESS) stats_->AddCqEventRead();
+      else if (status_ == FINISH) stats_->AddCqEventFinish();
+    }
     if (!ok) {
       if (status_ == FINISH) {
         delete this;
@@ -1205,6 +1490,17 @@ class CheckCallData : public CallDataBase {
     // complete: 모든 candidate 파일을 검사했는지 여부
     bool complete = (checked_count == total_candidates);
     resp->set_complete(complete);
+
+    if (IsSstListLogEnabled()) {
+      const std::string input_sst_list = FormatSstList(req.sst_file_numbers());
+      const std::string output_sst_list =
+          FormatSstList(resp->may_match_sst_file_numbers());
+      std::lock_guard<std::mutex> log_lock(*log_mutex_);
+      std::cerr << "[SST_LIST][check] key_req_id=" << key_req_id
+                << " candidates=" << total_candidates
+                << " input=" << input_sst_list
+                << " output=" << output_sst_list << std::endl;
+    }
     
     // ProcessKeyRequest 종료 시간 측정
     auto process_end = std::chrono::steady_clock::now();
@@ -1231,6 +1527,43 @@ class CheckCallData : public CallDataBase {
     static std::atomic<size_t> call_count{0};
     size_t call_id = call_count.fetch_add(1) + 1;
     uint64_t keymaymatch_us = 0;
+    auto log_check_reason = [&](CheckReason reason) {
+      const bool sst_reason_log_enabled = IsSstReasonLogEnabled();
+      const bool open_fail_log_enabled = IsOpenFailLogEnabled();
+      if (!sst_reason_log_enabled && !open_fail_log_enabled) {
+        return;
+      }
+      if (open_fail_log_enabled && reason != CheckReason::OPEN_FAIL) {
+        return;
+      }
+      if (!open_fail_log_enabled && !(call_id <= 200 || (call_id % 10000) == 0)) {
+        return;
+      }
+      std::lock_guard<std::mutex> log_lock(*log_mutex_);
+      if (open_fail_log_enabled && reason == CheckReason::OPEN_FAIL) {
+        const OpenFailDetail& d = GetLastOpenFailDetail();
+        std::cerr << "[OPEN_FAIL][check] call_id=" << call_id
+                  << " file_number=" << file_number
+                  << " reason=" << CheckReasonToString(reason);
+        if (d.valid) {
+          std::cerr << " stage=" << d.stage;
+          if (!d.path.empty()) {
+            std::cerr << " path=" << d.path;
+          }
+          if (!d.status.empty()) {
+            std::cerr << " status=" << d.status;
+          }
+          if (!d.io_status.empty()) {
+            std::cerr << " io_status=" << d.io_status;
+          }
+        }
+        std::cerr << std::endl;
+        return;
+      }
+      std::cerr << "[SST_REASON][check] call_id=" << call_id
+                << " file_number=" << file_number
+                << " reason=" << CheckReasonToString(reason) << std::endl;
+    };
     
     // Statistics collection disabled for performance
     // auto maybe_log_timing = [&](const char* stage, uint64_t get_entry_us_val) {
@@ -1257,12 +1590,14 @@ class CheckCallData : public CallDataBase {
     if (!entry) {
       // stats_->RecordReason(CheckReason::OPEN_FAIL);
       // maybe_log_timing("open_fail", static_cast<uint64_t>(get_entry_us));
+      log_check_reason(CheckReason::OPEN_FAIL);
       return true;
     }
 
     // Immutable SST reader path: allow concurrent readers.
     if (cache_->ShouldUpdateLastAccessOnCheck()) {
       entry->last_access_us.store(SteadyNowMicros(), std::memory_order_relaxed);
+      if (server_stats_enabled_) stats_->AddLastAccessUpdate();
     }
     std::shared_lock<std::shared_mutex> lock(entry->rw_mutex, std::defer_lock);
     if (cache_->entry_lock_enabled()) {
@@ -1283,6 +1618,7 @@ class CheckCallData : public CallDataBase {
     if (!reader) {
       // stats_->RecordReason(CheckReason::READER_NULL);
       // maybe_log_timing("reader_null", static_cast<uint64_t>(get_entry_us));
+      log_check_reason(CheckReason::READER_NULL);
       return true;
     }
 
@@ -1292,6 +1628,7 @@ class CheckCallData : public CallDataBase {
     if (!bb_table) {
       // stats_->RecordReason(CheckReason::BB_TABLE_NULL);
       // maybe_log_timing("bb_table_null", static_cast<uint64_t>(get_entry_us));
+      log_check_reason(CheckReason::BB_TABLE_NULL);
       return true;
     }
 
@@ -1300,18 +1637,21 @@ class CheckCallData : public CallDataBase {
     if (!rep) {
       // stats_->RecordReason(CheckReason::REP_NULL);
       // maybe_log_timing("rep_null", static_cast<uint64_t>(get_entry_us));
+      log_check_reason(CheckReason::REP_NULL);
       return true;
     }
     
     if (!rep->ioptions.fs || !rep->ioptions.fs.get()) {
       // stats_->RecordReason(CheckReason::FILTER_NULL);
       // maybe_log_timing("fs_null", static_cast<uint64_t>(get_entry_us));
+      log_check_reason(CheckReason::FILTER_NULL);
       return true;
     }
     
     if (!rep->filter) {
       // stats_->RecordReason(CheckReason::FILTER_NULL);
       // maybe_log_timing("filter_null", static_cast<uint64_t>(get_entry_us));
+      log_check_reason(CheckReason::FILTER_NULL);
       return true;
     }
 
@@ -1319,6 +1659,7 @@ class CheckCallData : public CallDataBase {
     if (!rep->whole_key_filtering) {
       // stats_->RecordReason(CheckReason::WHOLE_KEY_FILTERING_FALSE);
       // maybe_log_timing("whole_key_filtering_false", static_cast<uint64_t>(get_entry_us));
+      log_check_reason(CheckReason::WHOLE_KEY_FILTERING_FALSE);
       return true;
     }
 
@@ -1332,6 +1673,7 @@ class CheckCallData : public CallDataBase {
     if (!ucmp) {
       // stats_->RecordReason(CheckReason::UCOMP_NULL);
       // maybe_log_timing("ucmp_null", static_cast<uint64_t>(get_entry_us));
+      log_check_reason(CheckReason::UCOMP_NULL);
       return true;
     }
 
@@ -1386,6 +1728,7 @@ class CheckCallData : public CallDataBase {
     } catch (...) {
       // stats_->RecordReason(CheckReason::KEYMAYMATCH_EXCEPTION);
       // maybe_log_timing("keymaymatch_exception", static_cast<uint64_t>(get_entry_us));
+      log_check_reason(CheckReason::KEYMAYMATCH_EXCEPTION);
       return true;  // Safe default on exception
     }
     
@@ -1497,6 +1840,11 @@ class StreamCallData {
   }
 
   void OnOpComplete(OpType op, bool ok) {
+    if (server_stats_enabled_ && stats_) {
+      if (op == OpType::kRequest || op == OpType::kRead) stats_->AddCqEventRead();
+      else if (op == OpType::kWrite) stats_->AddCqEventWrite();
+      else if (op == OpType::kFinish) stats_->AddCqEventFinish();
+    }
     if (op == OpType::kRequest) {
       HandleRequest(ok);
       return;
@@ -1529,6 +1877,17 @@ class StreamCallData {
           std::chrono::duration_cast<std::chrono::microseconds>(
               check_loop_end - check_loop_start).count());
       stats_->AddCheckLoopUs(check_loop_us);
+    }
+
+    if (IsSstListLogEnabled()) {
+      const std::string input_sst_list = FormatSstList(item.stream_sst_file_numbers);
+      const std::string output_sst_list =
+          FormatSstList(response.may_match_sst_file_numbers());
+      std::lock_guard<std::mutex> log_lock(*log_mutex_);
+      std::cerr << "[SST_LIST][stream] request_id=" << item.stream_request_id
+                << " candidates=" << item.stream_sst_file_numbers.size()
+                << " input=" << input_sst_list
+                << " output=" << output_sst_list << std::endl;
     }
 
     EnqueueResponse(std::move(response));
@@ -1679,15 +2038,57 @@ class StreamCallData {
   }
 
   bool CheckKeyInSST(const ROCKSDB_NAMESPACE::Slice& user_key, uint64_t file_number) {
+    static std::atomic<size_t> call_count{0};
+    const size_t call_id = call_count.fetch_add(1) + 1;
+    auto log_check_reason = [&](CheckReason reason) {
+      const bool sst_reason_log_enabled = IsSstReasonLogEnabled();
+      const bool open_fail_log_enabled = IsOpenFailLogEnabled();
+      if ((!sst_reason_log_enabled && !open_fail_log_enabled) || !log_mutex_) {
+        return;
+      }
+      if (open_fail_log_enabled && reason != CheckReason::OPEN_FAIL) {
+        return;
+      }
+      if (!open_fail_log_enabled && !(call_id <= 200 || (call_id % 10000) == 0)) {
+        return;
+      }
+      std::lock_guard<std::mutex> log_lock(*log_mutex_);
+      if (open_fail_log_enabled && reason == CheckReason::OPEN_FAIL) {
+        const OpenFailDetail& d = GetLastOpenFailDetail();
+        std::cerr << "[OPEN_FAIL][stream_check] call_id=" << call_id
+                  << " file_number=" << file_number
+                  << " reason=" << CheckReasonToString(reason);
+        if (d.valid) {
+          std::cerr << " stage=" << d.stage;
+          if (!d.path.empty()) {
+            std::cerr << " path=" << d.path;
+          }
+          if (!d.status.empty()) {
+            std::cerr << " status=" << d.status;
+          }
+          if (!d.io_status.empty()) {
+            std::cerr << " io_status=" << d.io_status;
+          }
+        }
+        std::cerr << std::endl;
+        return;
+      }
+      std::cerr << "[SST_REASON][stream_check] call_id=" << call_id
+                << " file_number=" << file_number
+                << " reason=" << CheckReasonToString(reason) << std::endl;
+    };
+
     std::shared_ptr<TableReaderCache::CacheEntry> entry = cache_->GetOrOpen(
         file_number, *rocksdb_options_, stats_, log_mutex_, open_count_);
     if (!entry) {
       // stats_->RecordReason(CheckReason::OPEN_FAIL);
+      log_check_reason(CheckReason::OPEN_FAIL);
       return true;
     }
 
     if (cache_->ShouldUpdateLastAccessOnCheck()) {
       entry->last_access_us.store(SteadyNowMicros(), std::memory_order_relaxed);
+      if (server_stats_enabled_) stats_->AddLastAccessUpdate();
     }
     std::shared_lock<std::shared_mutex> lock(entry->rw_mutex, std::defer_lock);
     if (cache_->entry_lock_enabled()) {
@@ -1707,6 +2108,7 @@ class StreamCallData {
     ROCKSDB_NAMESPACE::TableReader* reader = entry->reader.get();
     if (!reader) {
       // stats_->RecordReason(CheckReason::READER_NULL);
+      log_check_reason(CheckReason::READER_NULL);
       return true;
     }
 
@@ -1714,20 +2116,24 @@ class StreamCallData {
         static_cast<ROCKSDB_NAMESPACE::BlockBasedTable*>(reader);
     if (!bb_table) {
       // stats_->RecordReason(CheckReason::BB_TABLE_NULL);
+      log_check_reason(CheckReason::BB_TABLE_NULL);
       return true;
     }
 
     const ROCKSDB_NAMESPACE::BlockBasedTable::Rep* rep = bb_table->get_rep();
     if (!rep) {
       // stats_->RecordReason(CheckReason::REP_NULL);
+      log_check_reason(CheckReason::REP_NULL);
       return true;
     }
     if (!rep->filter) {
       // stats_->RecordReason(CheckReason::FILTER_NULL);
+      log_check_reason(CheckReason::FILTER_NULL);
       return true;
     }
     if (!rep->whole_key_filtering) {
       // stats_->RecordReason(CheckReason::WHOLE_KEY_FILTERING_FALSE);
+      log_check_reason(CheckReason::WHOLE_KEY_FILTERING_FALSE);
       return true;
     }
 
@@ -1735,6 +2141,7 @@ class StreamCallData {
         rep->internal_comparator.user_comparator();
     if (!ucmp) {
       // stats_->RecordReason(CheckReason::UCOMP_NULL);
+      log_check_reason(CheckReason::UCOMP_NULL);
       return true;
     }
 
@@ -1773,6 +2180,7 @@ class StreamCallData {
       // }
     } catch (...) {
       // stats_->RecordReason(CheckReason::KEYMAYMATCH_EXCEPTION);
+      log_check_reason(CheckReason::KEYMAYMATCH_EXCEPTION);
       return true;
     }
     return may_match;
@@ -1815,19 +2223,30 @@ class StreamCallData {
 // PerCQWorkerQueue::WorkerLoop implementation (after CheckCallData definition)
 void PerCQWorkerQueue::WorkerLoop() {
   while (true) {
+    bool sample_deq = server_stats_enabled_ && stats_ && ShouldSampleDequeueLock();
+    auto t0 = sample_deq ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::unique_lock<std::mutex> lock(queue_mutex_);
     queue_cv_.wait(lock, [this]() { return !work_queue_.empty() || shutdown_; });
-    
+    auto t2 = sample_deq ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
     if (shutdown_ && work_queue_.empty()) {
       break;
     }
-    
+
     if (!work_queue_.empty()) {
       uint64_t depth = work_queue_.size();
       WorkItem item = std::move(work_queue_.front());
       work_queue_.pop();
+      auto t3 = sample_deq ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       lock.unlock();
 
+      if (sample_deq && stats_) {
+        uint64_t wait_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(t2 - t0).count());
+        uint64_t hold_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count());
+        stats_->AddDequeueLockUs(wait_us, hold_us);
+      }
       if (server_stats_enabled_ && stats_) {
         stats_->AddWorkerDeq(depth);
       }
@@ -1836,6 +2255,7 @@ void PerCQWorkerQueue::WorkerLoop() {
       } else {
         item.stream_call_data->ProcessInWorkerThread(std::move(item));
       }
+      if (stats_) stats_->AddDoneByWorker(cq_idx_);
     }
   }
 }
@@ -1952,6 +2372,7 @@ class BloomCheckServiceImpl {
   std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock() { return clock_; }
   std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs() { return fs_; }
   bool server_stats_enabled() const { return server_stats_enabled_; }
+  void SetNumCqs(size_t n) { num_cqs_ = n; }
 
  private:
   BloomCheck::AsyncService service_;
@@ -1966,6 +2387,7 @@ class BloomCheckServiceImpl {
   std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock_;
   std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs_;
   const bool server_stats_enabled_;
+  std::atomic<size_t> num_cqs_{0};
 
   // Stats printing thread (runs only when server_stats_enabled_)
   std::thread stats_thread_;
@@ -1985,9 +2407,26 @@ class BloomCheckServiceImpl {
       uint64_t last_read_req_event = 0, last_write_resp_event = 0;
       uint64_t last_entry_lock_wait_us = 0, last_entry_lock_wait_samples = 0;
       uint64_t last_shard_lru_lock_wait_us = 0, last_shard_lru_lock_wait_samples = 0;
+      uint64_t last_last_access_updates = 0;
+      uint64_t last_cache_hit = 0, last_cache_miss = 0;
+      uint64_t last_cache_lookup_hit = 0, last_inflight_wait = 0, last_new_table_reader = 0;
+      uint64_t last_eviction = 0;
+      uint64_t last_get_or_open_us = 0, last_get_or_open_samples = 0;
+      uint64_t last_open_fail_getfilesize = 0;
+      uint64_t last_open_fail_newfile = 0;
+      uint64_t last_open_fail_newreader = 0;
+      uint64_t last_enqueue_lock_wait_us = 0, last_enqueue_lock_samples = 0;
+      uint64_t last_enqueue_lock_hold_us = 0;
+      uint64_t last_dequeue_lock_wait_us = 0, last_dequeue_lock_samples = 0;
+      uint64_t last_dequeue_lock_hold_us = 0;
+      uint64_t last_cq_next = 0, last_cq_read = 0, last_cq_write = 0, last_cq_finish = 0;
+      uint64_t last_write_resp_event_10s = 0, last_write_done_10s = 0;
+      uint64_t last_computed_write_resp_event_per_10s = 0, last_computed_write_done_per_10s = 0;
+      uint64_t sec = 0;
       while (!stop_stats_thread_.load()) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         if (stop_stats_thread_.load()) break;
+        sec++;
 
         uint64_t recv = stats_.recv_req_count.load(std::memory_order_relaxed);
         uint64_t deq = stats_.worker_deq_count.load(std::memory_order_relaxed);
@@ -2014,6 +2453,43 @@ class BloomCheckServiceImpl {
             stats_.total_shard_lru_lock_wait_us.load(std::memory_order_relaxed);
         uint64_t shard_lru_lock_wait_samples =
             stats_.shard_lru_lock_wait_samples.load(std::memory_order_relaxed);
+        uint64_t last_access_updates =
+            stats_.last_access_update_count.load(std::memory_order_relaxed);
+        uint64_t cache_hit = stats_.cache_hit_count.load(std::memory_order_relaxed);
+        uint64_t cache_miss = stats_.cache_miss_count.load(std::memory_order_relaxed);
+        uint64_t cache_lookup_hit =
+            stats_.cache_lookup_hit_count.load(std::memory_order_relaxed);
+        uint64_t inflight_wait =
+            stats_.inflight_wait_count.load(std::memory_order_relaxed);
+        uint64_t new_table_reader =
+            stats_.new_table_reader_count.load(std::memory_order_relaxed);
+        uint64_t eviction = stats_.eviction_count.load(std::memory_order_relaxed);
+        uint64_t get_or_open_us =
+            stats_.total_get_or_open_us.load(std::memory_order_relaxed);
+        uint64_t get_or_open_samples =
+            stats_.get_or_open_sample_count.load(std::memory_order_relaxed);
+        uint64_t open_fail_getfilesize =
+            stats_.open_fail_getfilesize.load(std::memory_order_relaxed);
+        uint64_t open_fail_newfile =
+            stats_.open_fail_newfile.load(std::memory_order_relaxed);
+        uint64_t open_fail_newreader =
+            stats_.open_fail_newreader.load(std::memory_order_relaxed);
+        uint64_t enqueue_lock_wait_us =
+            stats_.total_enqueue_lock_wait_us.load(std::memory_order_relaxed);
+        uint64_t enqueue_lock_samples =
+            stats_.enqueue_lock_sample_count.load(std::memory_order_relaxed);
+        uint64_t enqueue_lock_hold_us =
+            stats_.total_enqueue_lock_hold_us.load(std::memory_order_relaxed);
+        uint64_t dequeue_lock_wait_us =
+            stats_.total_dequeue_lock_wait_us.load(std::memory_order_relaxed);
+        uint64_t dequeue_lock_samples =
+            stats_.dequeue_lock_sample_count.load(std::memory_order_relaxed);
+        uint64_t dequeue_lock_hold_us =
+            stats_.total_dequeue_lock_hold_us.load(std::memory_order_relaxed);
+        uint64_t cq_next = stats_.cq_next_count.load(std::memory_order_relaxed);
+        uint64_t cq_read = stats_.cq_read_events.load(std::memory_order_relaxed);
+        uint64_t cq_write = stats_.cq_write_events.load(std::memory_order_relaxed);
+        uint64_t cq_finish = stats_.cq_finish_events.load(std::memory_order_relaxed);
 
         uint64_t recv_req_per_s = recv - last_recv_req;
         uint64_t worker_deq_per_s = deq - last_worker_deq;
@@ -2043,6 +2519,71 @@ class BloomCheckServiceImpl {
                 ? (shard_lru_lock_wait_us - last_shard_lru_lock_wait_us) /
                       shard_lru_lock_wait_sample_delta
                 : 0;
+        uint64_t last_access_updates_per_s = last_access_updates - last_last_access_updates;
+        uint64_t cache_miss_per_s = cache_miss - last_cache_miss;
+        uint64_t cache_lookup_hit_per_s = cache_lookup_hit - last_cache_lookup_hit;
+        uint64_t inflight_wait_per_s = inflight_wait - last_inflight_wait;
+        uint64_t new_table_reader_per_s = new_table_reader - last_new_table_reader;
+        uint64_t evictions_per_s = eviction - last_eviction;
+        uint64_t cache_size_current = cache_.GetTotalCacheSize();
+        uint64_t get_or_open_sample_delta =
+            (get_or_open_samples >= last_get_or_open_samples)
+                ? (get_or_open_samples - last_get_or_open_samples)
+                : 0;
+        uint64_t get_or_open_avg_us =
+            get_or_open_sample_delta
+                ? (get_or_open_us - last_get_or_open_us) / get_or_open_sample_delta
+                : 0;
+        uint64_t open_fail_getfilesize_per_s =
+            open_fail_getfilesize - last_open_fail_getfilesize;
+        uint64_t open_fail_newfile_per_s = open_fail_newfile - last_open_fail_newfile;
+        uint64_t open_fail_newreader_per_s =
+            open_fail_newreader - last_open_fail_newreader;
+        uint64_t open_fail_total_per_s = open_fail_getfilesize_per_s +
+                                         open_fail_newfile_per_s +
+                                         open_fail_newreader_per_s;
+        uint64_t open_fail_total = open_fail_getfilesize + open_fail_newfile +
+                                   open_fail_newreader;
+        uint64_t enqueue_lock_sample_delta =
+            (enqueue_lock_samples >= last_enqueue_lock_samples)
+                ? (enqueue_lock_samples - last_enqueue_lock_samples)
+                : 0;
+        uint64_t enqueue_lock_wait_avg_us =
+            enqueue_lock_sample_delta
+                ? (enqueue_lock_wait_us - last_enqueue_lock_wait_us) / enqueue_lock_sample_delta
+                : 0;
+        uint64_t enqueue_lock_hold_avg_us =
+            enqueue_lock_sample_delta
+                ? (enqueue_lock_hold_us - last_enqueue_lock_hold_us) / enqueue_lock_sample_delta
+                : 0;
+        uint64_t dequeue_lock_sample_delta =
+            (dequeue_lock_samples >= last_dequeue_lock_samples)
+                ? (dequeue_lock_samples - last_dequeue_lock_samples)
+                : 0;
+        uint64_t dequeue_lock_wait_avg_us =
+            dequeue_lock_sample_delta
+                ? (dequeue_lock_wait_us - last_dequeue_lock_wait_us) / dequeue_lock_sample_delta
+                : 0;
+        uint64_t dequeue_lock_hold_avg_us =
+            dequeue_lock_sample_delta
+                ? (dequeue_lock_hold_us - last_dequeue_lock_hold_us) / dequeue_lock_sample_delta
+                : 0;
+        uint64_t cq_next_per_s = cq_next - last_cq_next;
+        uint64_t cq_read_per_s = cq_read - last_cq_read;
+        uint64_t cq_write_per_s = cq_write - last_cq_write;
+        uint64_t cq_finish_per_s = cq_finish - last_cq_finish;
+
+        if (sec == 1) {
+          last_write_resp_event_10s = write_resp_event;
+          last_write_done_10s = write_done;
+        } else if (sec > 10 && (sec - 1) % 10 == 0) {
+          last_computed_write_resp_event_per_10s = write_resp_event - last_write_resp_event_10s;
+          last_computed_write_done_per_10s = write_done - last_write_done_10s;
+          last_write_resp_event_10s = write_resp_event;
+          last_write_done_10s = write_done;
+        }
+        uint64_t write_resp_event_per_10s = last_computed_write_resp_event_per_10s;
+        uint64_t write_done_per_10s = last_computed_write_done_per_10s;
 
         last_recv_req = recv; last_worker_deq = deq; last_depth_sum = depth_sum; last_depth_count = depth_count;
         last_check_loop_us = check_us; last_check_loop_count = check_n;
@@ -2053,6 +2594,49 @@ class BloomCheckServiceImpl {
         last_entry_lock_wait_samples = entry_lock_wait_samples;
         last_shard_lru_lock_wait_us = shard_lru_lock_wait_us;
         last_shard_lru_lock_wait_samples = shard_lru_lock_wait_samples;
+        last_last_access_updates = last_access_updates;
+        last_cache_hit = cache_hit;
+        last_cache_miss = cache_miss;
+        last_cache_lookup_hit = cache_lookup_hit;
+        last_inflight_wait = inflight_wait;
+        last_new_table_reader = new_table_reader;
+        last_eviction = eviction;
+        last_get_or_open_us = get_or_open_us;
+        last_get_or_open_samples = get_or_open_samples;
+        last_open_fail_getfilesize = open_fail_getfilesize;
+        last_open_fail_newfile = open_fail_newfile;
+        last_open_fail_newreader = open_fail_newreader;
+        last_enqueue_lock_wait_us = enqueue_lock_wait_us;
+        last_enqueue_lock_samples = enqueue_lock_samples;
+        last_enqueue_lock_hold_us = enqueue_lock_hold_us;
+        last_dequeue_lock_wait_us = dequeue_lock_wait_us;
+        last_dequeue_lock_samples = dequeue_lock_samples;
+        last_dequeue_lock_hold_us = dequeue_lock_hold_us;
+        last_cq_next = cq_next;
+        last_cq_read = cq_read;
+        last_cq_write = cq_write;
+        last_cq_finish = cq_finish;
+        const size_t tracked_cqs = std::min(
+            num_cqs_.load(std::memory_order_relaxed), Stats::kMaxTrackedCqs);
+        std::ostringstream cq_pop_ss;
+        std::ostringstream enq_ss;
+        std::ostringstream done_ss;
+        cq_pop_ss << "[";
+        enq_ss << "[";
+        done_ss << "[";
+        for (size_t i = 0; i < tracked_cqs; ++i) {
+          if (i != 0) {
+            cq_pop_ss << ",";
+            enq_ss << ",";
+            done_ss << ",";
+          }
+          cq_pop_ss << stats_.cq_pop_by_idx[i].load(std::memory_order_relaxed);
+          enq_ss << stats_.enq_to_worker_by_idx[i].load(std::memory_order_relaxed);
+          done_ss << stats_.done_by_worker_by_idx[i].load(std::memory_order_relaxed);
+        }
+        cq_pop_ss << "]";
+        enq_ss << "]";
+        done_ss << "]";
 
         {
           std::lock_guard<std::mutex> log_lock(log_mutex_);
@@ -2066,10 +2650,44 @@ class BloomCheckServiceImpl {
                     << " max_pending_work_items=" << pending_work_items_max
                     << " read_req_per_s=" << read_req_per_s
                     << " write_resp_per_s=" << write_resp_per_s
+                    << " write_resp_event_total=" << write_resp_event
+                    << " write_resp_event_per_10s=" << write_resp_event_per_10s
+                    << " write_done_total=" << write_done
+                    << " write_done_per_10s=" << write_done_per_10s
+                    << " last_access_updates_per_s=" << last_access_updates_per_s
+                    << " cache_size_current=" << cache_size_current
+                    << " cache_size_max=" << cache_.max_size()
+                    << " evictions_per_s=" << evictions_per_s
+                    << " cache_lookup_hit_per_s=" << cache_lookup_hit_per_s
+                    << " inflight_wait_per_s=" << inflight_wait_per_s
+                    << " new_table_reader_per_s=" << new_table_reader_per_s
+                    << " cache_miss_per_s=" << cache_miss_per_s
+                    << " get_or_open_avg_us=" << get_or_open_avg_us
+                    << " open_fail_per_s=" << open_fail_total_per_s
+                    << " open_fail_total=" << open_fail_total
+                    << " open_fail_path_not_found_total="
+                    << open_fail_getfilesize
+                    << " open_fail_new_file_total=" << open_fail_newfile
+                    << " open_fail_new_reader_total=" << open_fail_newreader
                     << " entry_rw_lock_wait_avg_us=" << entry_rw_lock_wait_avg_us
                     << " shard_lru_lock_wait_avg_us=" << shard_lru_lock_wait_avg_us
+                    << " entry_lock_enabled=" << (cache_.entry_lock_enabled() ? 1 : 0)
+                    << " last_access_update_every=" << cache_.last_access_update_every()
+                    << " lru_update_every=" << cache_.lru_update_every()
                     << " write_done_per_s=" << write_done_per_s
                     << " finish_or_close_per_s=" << finish_or_close_per_s
+                    << " enqueue_lock_wait_avg_us=" << enqueue_lock_wait_avg_us
+                    << " enqueue_lock_hold_avg_us=" << enqueue_lock_hold_avg_us
+                    << " dequeue_lock_wait_avg_us=" << dequeue_lock_wait_avg_us
+                    << " dequeue_lock_hold_avg_us=" << dequeue_lock_hold_avg_us
+                    << " cq_next_per_s=" << cq_next_per_s
+                    << " cq_read_per_s=" << cq_read_per_s
+                    << " cq_write_per_s=" << cq_write_per_s
+                    << " cq_finish_per_s=" << cq_finish_per_s
+                    << std::endl;
+          std::cerr << "[CQ_FLOW] cq_pop=" << cq_pop_ss.str()
+                    << " enq_to_worker=" << enq_ss.str()
+                    << " done_by_worker=" << done_ss.str()
                     << std::endl;
         }
       }
@@ -2088,7 +2706,8 @@ class BloomCheckServiceImpl {
 // IMPORTANT: This thread MUST NOT perform any application logic (bloom filter checks).
 // It only handles CQ events and state transitions.
 void HandleRpcs(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* cq,
-                BloomCheckServiceImpl* impl, PerCQWorkerQueue* worker_queue) {
+                BloomCheckServiceImpl* impl, PerCQWorkerQueue* worker_queue,
+                size_t cq_idx) {
   // 초기 CallData 생성 (ACCEPT 단계)
   new CheckCallData(service, cq, impl->cache(), impl->rocksdb_options(), impl->stats(),
                    impl->log_mutex(), impl->open_count(), impl->active_rpc_count(),
@@ -2107,7 +2726,8 @@ void HandleRpcs(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* 
   // This loop runs in CQ poller thread - must be fast and non-blocking
   while (true) {
     GPR_ASSERT(cq->Next(&tag, &ok));
-
+    impl->stats()->AddCqPop(cq_idx);
+    if (impl->server_stats_enabled()) impl->stats()->AddCqNext();
     static_cast<CallDataBase*>(tag)->Proceed(ok);
   }
 }
@@ -2133,6 +2753,7 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   
   // CompletionQueue 생성 (여러 CQ 사용 가능)
   const int NUM_CQS = 4;  // CQ 개수 (필요에 따라 조정)
+  service.SetNumCqs(static_cast<size_t>(NUM_CQS));
   std::vector<std::unique_ptr<grpc::ServerCompletionQueue>> cqs;
   for (int i = 0; i < NUM_CQS; i++) {
     cqs.emplace_back(builder.AddCompletionQueue());
@@ -2174,7 +2795,8 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   std::vector<std::unique_ptr<bloomcheck::PerCQWorkerQueue>> worker_queues;
   for (int i = 0; i < NUM_CQS; i++) {
     worker_queues.emplace_back(std::make_unique<bloomcheck::PerCQWorkerQueue>(
-        NUM_WORKER_THREADS_PER_CQ, service.stats(), service.server_stats_enabled()));
+        static_cast<size_t>(i), NUM_WORKER_THREADS_PER_CQ, service.stats(),
+        service.server_stats_enabled()));
   }
   // std::cout << "Using " << NUM_WORKER_THREADS_PER_CQ 
   //           << " worker threads per CQ (total: " 
@@ -2183,7 +2805,7 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   // CQ 폴러 스레드 생성 (각 CQ당 1개 스레드)
   // CQ poller threads: 빠른 이벤트 처리만 수행 (bloom filter 체크 안 함)
   const size_t NUM_POLLERS_PER_CQ = 1;
-  const int POLLER_PIN_START_CPU = 15;  // Pin order: 15 -> 14 -> 13 -> ...
+  const int POLLER_PIN_START_CPU = 16;  // Pin order: 16 -> 17 -> 18 -> 19
   std::atomic<int> poller_pin_index{0};
   std::vector<std::thread> cq_threads;
   for (int i = 0; i < NUM_CQS; i++) {
@@ -2191,10 +2813,11 @@ void RunServer(const std::string& server_address, size_t cache_size) {
       cq_threads.emplace_back(std::thread(
           [&, i]() {
             const int pin_idx = poller_pin_index.fetch_add(1, std::memory_order_relaxed);
-            const int cpu_id = POLLER_PIN_START_CPU - pin_idx;
+            const int cpu_id = POLLER_PIN_START_CPU + pin_idx;
             (void)bloomcheck::PinCurrentThreadToCpu(cpu_id);
             bloomcheck::HandleRpcs(service.service(), cqs[i].get(), &service,
-                                   worker_queues[i].get());
+                                   worker_queues[i].get(),
+                                   static_cast<size_t>(i));
           }));
     }
   }
@@ -2230,6 +2853,8 @@ void RunServer(const std::string& server_address, size_t cache_size) {
 
 
 int main(int argc, char** argv) {
+  setenv("GRPC_POLL_STRATEGY", "epoll1", 1);
+
   std::string server_address = "0.0.0.0:50051";
   size_t cache_size = 512;  // Max 512 SST files in cache
 
@@ -2243,4 +2868,3 @@ int main(int argc, char** argv) {
   RunServer(server_address, cache_size);
   return 0;
 }
-
