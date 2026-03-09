@@ -542,6 +542,7 @@ class KeyResponse final :
 
   enum : int {
     kMayMatchSstFileNumbersFieldNumber = 1,
+    kPathNotFoundSstFileNumbersFieldNumber = 5,
     kCheckedCountFieldNumber = 3,
     kTotalCandidatesFieldNumber = 4,
     kCompleteFieldNumber = 2,
@@ -567,6 +568,28 @@ class KeyResponse final :
       may_match_sst_file_numbers() const;
   ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
       mutable_may_match_sst_file_numbers();
+
+  // repeated uint64 path_not_found_sst_file_numbers = 5;
+  int path_not_found_sst_file_numbers_size() const;
+  private:
+  int _internal_path_not_found_sst_file_numbers_size() const;
+  public:
+  void clear_path_not_found_sst_file_numbers();
+  private:
+  uint64_t _internal_path_not_found_sst_file_numbers(int index) const;
+  const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+      _internal_path_not_found_sst_file_numbers() const;
+  void _internal_add_path_not_found_sst_file_numbers(uint64_t value);
+  ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+      _internal_mutable_path_not_found_sst_file_numbers();
+  public:
+  uint64_t path_not_found_sst_file_numbers(int index) const;
+  void set_path_not_found_sst_file_numbers(int index, uint64_t value);
+  void add_path_not_found_sst_file_numbers(uint64_t value);
+  const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+      path_not_found_sst_file_numbers() const;
+  ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+      mutable_path_not_found_sst_file_numbers();
 
   // uint64 checked_count = 3;
   void clear_checked_count();
@@ -605,6 +628,8 @@ class KeyResponse final :
   struct Impl_ {
     ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t > may_match_sst_file_numbers_;
     mutable std::atomic<int> _may_match_sst_file_numbers_cached_byte_size_;
+    ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t > path_not_found_sst_file_numbers_;
+    mutable std::atomic<int> _path_not_found_sst_file_numbers_cached_byte_size_;
     uint64_t checked_count_;
     uint64_t total_candidates_;
     bool complete_;
@@ -1354,6 +1379,7 @@ class StreamResponse final :
 
   enum : int {
     kMayMatchSstFileNumbersFieldNumber = 2,
+    kPathNotFoundSstFileNumbersFieldNumber = 3,
     kRequestIdFieldNumber = 1,
   };
   // repeated uint64 may_match_sst_file_numbers = 2;
@@ -1378,6 +1404,28 @@ class StreamResponse final :
   ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
       mutable_may_match_sst_file_numbers();
 
+  // repeated uint64 path_not_found_sst_file_numbers = 3;
+  int path_not_found_sst_file_numbers_size() const;
+  private:
+  int _internal_path_not_found_sst_file_numbers_size() const;
+  public:
+  void clear_path_not_found_sst_file_numbers();
+  private:
+  uint64_t _internal_path_not_found_sst_file_numbers(int index) const;
+  const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+      _internal_path_not_found_sst_file_numbers() const;
+  void _internal_add_path_not_found_sst_file_numbers(uint64_t value);
+  ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+      _internal_mutable_path_not_found_sst_file_numbers();
+  public:
+  uint64_t path_not_found_sst_file_numbers(int index) const;
+  void set_path_not_found_sst_file_numbers(int index, uint64_t value);
+  void add_path_not_found_sst_file_numbers(uint64_t value);
+  const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+      path_not_found_sst_file_numbers() const;
+  ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+      mutable_path_not_found_sst_file_numbers();
+
   // uint64 request_id = 1;
   void clear_request_id();
   uint64_t request_id() const;
@@ -1397,6 +1445,8 @@ class StreamResponse final :
   struct Impl_ {
     ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t > may_match_sst_file_numbers_;
     mutable std::atomic<int> _may_match_sst_file_numbers_cached_byte_size_;
+    ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t > path_not_found_sst_file_numbers_;
+    mutable std::atomic<int> _path_not_found_sst_file_numbers_cached_byte_size_;
     uint64_t request_id_;
     mutable ::PROTOBUF_NAMESPACE_ID::internal::CachedSize _cached_size_;
   };
@@ -1664,6 +1714,53 @@ inline void KeyResponse::_internal_set_total_candidates(uint64_t value) {
 inline void KeyResponse::set_total_candidates(uint64_t value) {
   _internal_set_total_candidates(value);
   // @@protoc_insertion_point(field_set:bloomcheck.KeyResponse.total_candidates)
+}
+
+// repeated uint64 path_not_found_sst_file_numbers = 5;
+inline int KeyResponse::_internal_path_not_found_sst_file_numbers_size() const {
+  return _impl_.path_not_found_sst_file_numbers_.size();
+}
+inline int KeyResponse::path_not_found_sst_file_numbers_size() const {
+  return _internal_path_not_found_sst_file_numbers_size();
+}
+inline void KeyResponse::clear_path_not_found_sst_file_numbers() {
+  _impl_.path_not_found_sst_file_numbers_.Clear();
+}
+inline uint64_t KeyResponse::_internal_path_not_found_sst_file_numbers(int index) const {
+  return _impl_.path_not_found_sst_file_numbers_.Get(index);
+}
+inline uint64_t KeyResponse::path_not_found_sst_file_numbers(int index) const {
+  // @@protoc_insertion_point(field_get:bloomcheck.KeyResponse.path_not_found_sst_file_numbers)
+  return _internal_path_not_found_sst_file_numbers(index);
+}
+inline void KeyResponse::set_path_not_found_sst_file_numbers(int index, uint64_t value) {
+  _impl_.path_not_found_sst_file_numbers_.Set(index, value);
+  // @@protoc_insertion_point(field_set:bloomcheck.KeyResponse.path_not_found_sst_file_numbers)
+}
+inline void KeyResponse::_internal_add_path_not_found_sst_file_numbers(uint64_t value) {
+  _impl_.path_not_found_sst_file_numbers_.Add(value);
+}
+inline void KeyResponse::add_path_not_found_sst_file_numbers(uint64_t value) {
+  _internal_add_path_not_found_sst_file_numbers(value);
+  // @@protoc_insertion_point(field_add:bloomcheck.KeyResponse.path_not_found_sst_file_numbers)
+}
+inline const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+KeyResponse::_internal_path_not_found_sst_file_numbers() const {
+  return _impl_.path_not_found_sst_file_numbers_;
+}
+inline const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+KeyResponse::path_not_found_sst_file_numbers() const {
+  // @@protoc_insertion_point(field_list:bloomcheck.KeyResponse.path_not_found_sst_file_numbers)
+  return _internal_path_not_found_sst_file_numbers();
+}
+inline ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+KeyResponse::_internal_mutable_path_not_found_sst_file_numbers() {
+  return &_impl_.path_not_found_sst_file_numbers_;
+}
+inline ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+KeyResponse::mutable_path_not_found_sst_file_numbers() {
+  // @@protoc_insertion_point(field_mutable_list:bloomcheck.KeyResponse.path_not_found_sst_file_numbers)
+  return _internal_mutable_path_not_found_sst_file_numbers();
 }
 
 // -------------------------------------------------------------------
@@ -1936,6 +2033,53 @@ inline ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
 StreamResponse::mutable_may_match_sst_file_numbers() {
   // @@protoc_insertion_point(field_mutable_list:bloomcheck.StreamResponse.may_match_sst_file_numbers)
   return _internal_mutable_may_match_sst_file_numbers();
+}
+
+// repeated uint64 path_not_found_sst_file_numbers = 3;
+inline int StreamResponse::_internal_path_not_found_sst_file_numbers_size() const {
+  return _impl_.path_not_found_sst_file_numbers_.size();
+}
+inline int StreamResponse::path_not_found_sst_file_numbers_size() const {
+  return _internal_path_not_found_sst_file_numbers_size();
+}
+inline void StreamResponse::clear_path_not_found_sst_file_numbers() {
+  _impl_.path_not_found_sst_file_numbers_.Clear();
+}
+inline uint64_t StreamResponse::_internal_path_not_found_sst_file_numbers(int index) const {
+  return _impl_.path_not_found_sst_file_numbers_.Get(index);
+}
+inline uint64_t StreamResponse::path_not_found_sst_file_numbers(int index) const {
+  // @@protoc_insertion_point(field_get:bloomcheck.StreamResponse.path_not_found_sst_file_numbers)
+  return _internal_path_not_found_sst_file_numbers(index);
+}
+inline void StreamResponse::set_path_not_found_sst_file_numbers(int index, uint64_t value) {
+  _impl_.path_not_found_sst_file_numbers_.Set(index, value);
+  // @@protoc_insertion_point(field_set:bloomcheck.StreamResponse.path_not_found_sst_file_numbers)
+}
+inline void StreamResponse::_internal_add_path_not_found_sst_file_numbers(uint64_t value) {
+  _impl_.path_not_found_sst_file_numbers_.Add(value);
+}
+inline void StreamResponse::add_path_not_found_sst_file_numbers(uint64_t value) {
+  _internal_add_path_not_found_sst_file_numbers(value);
+  // @@protoc_insertion_point(field_add:bloomcheck.StreamResponse.path_not_found_sst_file_numbers)
+}
+inline const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+StreamResponse::_internal_path_not_found_sst_file_numbers() const {
+  return _impl_.path_not_found_sst_file_numbers_;
+}
+inline const ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >&
+StreamResponse::path_not_found_sst_file_numbers() const {
+  // @@protoc_insertion_point(field_list:bloomcheck.StreamResponse.path_not_found_sst_file_numbers)
+  return _internal_path_not_found_sst_file_numbers();
+}
+inline ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+StreamResponse::_internal_mutable_path_not_found_sst_file_numbers() {
+  return &_impl_.path_not_found_sst_file_numbers_;
+}
+inline ::PROTOBUF_NAMESPACE_ID::RepeatedField< uint64_t >*
+StreamResponse::mutable_path_not_found_sst_file_numbers() {
+  // @@protoc_insertion_point(field_mutable_list:bloomcheck.StreamResponse.path_not_found_sst_file_numbers)
+  return _internal_mutable_path_not_found_sst_file_numbers();
 }
 
 #ifdef __GNUC__

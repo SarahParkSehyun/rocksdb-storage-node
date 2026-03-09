@@ -53,6 +53,8 @@ PROTOBUF_CONSTEXPR KeyResponse::KeyResponse(
     ::_pbi::ConstantInitialized): _impl_{
     /*decltype(_impl_.may_match_sst_file_numbers_)*/{}
   , /*decltype(_impl_._may_match_sst_file_numbers_cached_byte_size_)*/{0}
+  , /*decltype(_impl_.path_not_found_sst_file_numbers_)*/{}
+  , /*decltype(_impl_._path_not_found_sst_file_numbers_cached_byte_size_)*/{0}
   , /*decltype(_impl_.checked_count_)*/uint64_t{0u}
   , /*decltype(_impl_.total_candidates_)*/uint64_t{0u}
   , /*decltype(_impl_.complete_)*/false
@@ -124,6 +126,8 @@ PROTOBUF_CONSTEXPR StreamResponse::StreamResponse(
     ::_pbi::ConstantInitialized): _impl_{
     /*decltype(_impl_.may_match_sst_file_numbers_)*/{}
   , /*decltype(_impl_._may_match_sst_file_numbers_cached_byte_size_)*/{0}
+  , /*decltype(_impl_.path_not_found_sst_file_numbers_)*/{}
+  , /*decltype(_impl_._path_not_found_sst_file_numbers_cached_byte_size_)*/{0}
   , /*decltype(_impl_.request_id_)*/uint64_t{0u}
   , /*decltype(_impl_._cached_size_)*/{}} {}
 struct StreamResponseDefaultTypeInternal {
@@ -166,6 +170,7 @@ const uint32_t TableStruct_bloomcheck_2eproto::offsets[] PROTOBUF_SECTION_VARIAB
   PROTOBUF_FIELD_OFFSET(::bloomcheck::KeyResponse, _impl_.complete_),
   PROTOBUF_FIELD_OFFSET(::bloomcheck::KeyResponse, _impl_.checked_count_),
   PROTOBUF_FIELD_OFFSET(::bloomcheck::KeyResponse, _impl_.total_candidates_),
+  PROTOBUF_FIELD_OFFSET(::bloomcheck::KeyResponse, _impl_.path_not_found_sst_file_numbers_),
   ~0u,  // no _has_bits_
   PROTOBUF_FIELD_OFFSET(::bloomcheck::BatchResponse, _internal_metadata_),
   ~0u,  // no _extensions_
@@ -204,16 +209,17 @@ const uint32_t TableStruct_bloomcheck_2eproto::offsets[] PROTOBUF_SECTION_VARIAB
   ~0u,  // no _inlined_string_donated_
   PROTOBUF_FIELD_OFFSET(::bloomcheck::StreamResponse, _impl_.request_id_),
   PROTOBUF_FIELD_OFFSET(::bloomcheck::StreamResponse, _impl_.may_match_sst_file_numbers_),
+  PROTOBUF_FIELD_OFFSET(::bloomcheck::StreamResponse, _impl_.path_not_found_sst_file_numbers_),
 };
 static const ::_pbi::MigrationSchema schemas[] PROTOBUF_SECTION_VARIABLE(protodesc_cold) = {
   { 0, -1, -1, sizeof(::bloomcheck::KeyRequest)},
   { 8, -1, -1, sizeof(::bloomcheck::BatchRequest)},
   { 15, -1, -1, sizeof(::bloomcheck::KeyResponse)},
-  { 25, -1, -1, sizeof(::bloomcheck::BatchResponse)},
-  { 32, -1, -1, sizeof(::bloomcheck::NoopRequest)},
-  { 38, 45, -1, sizeof(::bloomcheck::NoopResponse)},
-  { 46, -1, -1, sizeof(::bloomcheck::StreamRequest)},
-  { 55, -1, -1, sizeof(::bloomcheck::StreamResponse)},
+  { 26, -1, -1, sizeof(::bloomcheck::BatchResponse)},
+  { 33, -1, -1, sizeof(::bloomcheck::NoopRequest)},
+  { 39, 46, -1, sizeof(::bloomcheck::NoopResponse)},
+  { 47, -1, -1, sizeof(::bloomcheck::StreamRequest)},
+  { 56, -1, -1, sizeof(::bloomcheck::StreamResponse)},
 };
 
 static const ::_pb::Message* const file_default_instances[] = {
@@ -231,27 +237,29 @@ const char descriptor_table_protodef_bloomcheck_2eproto[] PROTOBUF_SECTION_VARIA
   "\n\020bloomcheck.proto\022\nbloomcheck\"8\n\nKeyReq"
   "uest\022\020\n\010user_key\030\001 \001(\014\022\030\n\020sst_file_numbe"
   "rs\030\002 \003(\004\"4\n\014BatchRequest\022$\n\004reqs\030\001 \003(\0132\026"
-  ".bloomcheck.KeyRequest\"t\n\013KeyResponse\022\"\n"
-  "\032may_match_sst_file_numbers\030\001 \003(\004\022\020\n\010com"
-  "plete\030\002 \001(\010\022\025\n\rchecked_count\030\003 \001(\004\022\030\n\020to"
-  "tal_candidates\030\004 \001(\004\"7\n\rBatchResponse\022&\n"
-  "\005resps\030\001 \003(\0132\027.bloomcheck.KeyResponse\"\r\n"
-  "\013NoopRequest\":\n\014NoopResponse\022\031\n\014server_t"
-  "s_ns\030\001 \001(\004H\000\210\001\001B\017\n\r_server_ts_ns\"O\n\rStre"
-  "amRequest\022\022\n\nrequest_id\030\001 \001(\004\022\020\n\010user_ke"
-  "y\030\002 \001(\014\022\030\n\020sst_file_numbers\030\003 \003(\004\"H\n\016Str"
-  "eamResponse\022\022\n\nrequest_id\030\001 \001(\004\022\"\n\032may_m"
-  "atch_sst_file_numbers\030\002 \003(\0042\324\001\n\nBloomChe"
-  "ck\022<\n\005Check\022\030.bloomcheck.BatchRequest\032\031."
-  "bloomcheck.BatchResponse\0229\n\004Noop\022\027.bloom"
-  "check.NoopRequest\032\030.bloomcheck.NoopRespo"
-  "nse\022M\n\020CheckBatchStream\022\031.bloomcheck.Str"
-  "eamRequest\032\032.bloomcheck.StreamResponse(\001"
-  "0\001b\006proto3"
+  ".bloomcheck.KeyRequest\"\235\001\n\013KeyResponse\022\""
+  "\n\032may_match_sst_file_numbers\030\001 \003(\004\022\020\n\010co"
+  "mplete\030\002 \001(\010\022\025\n\rchecked_count\030\003 \001(\004\022\030\n\020t"
+  "otal_candidates\030\004 \001(\004\022\'\n\037path_not_found_"
+  "sst_file_numbers\030\005 \003(\004\"7\n\rBatchResponse\022"
+  "&\n\005resps\030\001 \003(\0132\027.bloomcheck.KeyResponse\""
+  "\r\n\013NoopRequest\":\n\014NoopResponse\022\031\n\014server"
+  "_ts_ns\030\001 \001(\004H\000\210\001\001B\017\n\r_server_ts_ns\"O\n\rSt"
+  "reamRequest\022\022\n\nrequest_id\030\001 \001(\004\022\020\n\010user_"
+  "key\030\002 \001(\014\022\030\n\020sst_file_numbers\030\003 \003(\004\"q\n\016S"
+  "treamResponse\022\022\n\nrequest_id\030\001 \001(\004\022\"\n\032may"
+  "_match_sst_file_numbers\030\002 \003(\004\022\'\n\037path_no"
+  "t_found_sst_file_numbers\030\003 \003(\0042\324\001\n\nBloom"
+  "Check\022<\n\005Check\022\030.bloomcheck.BatchRequest"
+  "\032\031.bloomcheck.BatchResponse\0229\n\004Noop\022\027.bl"
+  "oomcheck.NoopRequest\032\030.bloomcheck.NoopRe"
+  "sponse\022M\n\020CheckBatchStream\022\031.bloomcheck."
+  "StreamRequest\032\032.bloomcheck.StreamRespons"
+  "e(\0010\001b\006proto3"
   ;
 static ::_pbi::once_flag descriptor_table_bloomcheck_2eproto_once;
 const ::_pbi::DescriptorTable descriptor_table_bloomcheck_2eproto = {
-    false, false, 770, descriptor_table_protodef_bloomcheck_2eproto,
+    false, false, 853, descriptor_table_protodef_bloomcheck_2eproto,
     "bloomcheck.proto",
     &descriptor_table_bloomcheck_2eproto_once, nullptr, 0, 8,
     schemas, file_default_instances, TableStruct_bloomcheck_2eproto::offsets,
@@ -709,6 +717,8 @@ KeyResponse::KeyResponse(const KeyResponse& from)
   new (&_impl_) Impl_{
       decltype(_impl_.may_match_sst_file_numbers_){from._impl_.may_match_sst_file_numbers_}
     , /*decltype(_impl_._may_match_sst_file_numbers_cached_byte_size_)*/{0}
+    , decltype(_impl_.path_not_found_sst_file_numbers_){from._impl_.path_not_found_sst_file_numbers_}
+    , /*decltype(_impl_._path_not_found_sst_file_numbers_cached_byte_size_)*/{0}
     , decltype(_impl_.checked_count_){}
     , decltype(_impl_.total_candidates_){}
     , decltype(_impl_.complete_){}
@@ -728,6 +738,8 @@ inline void KeyResponse::SharedCtor(
   new (&_impl_) Impl_{
       decltype(_impl_.may_match_sst_file_numbers_){arena}
     , /*decltype(_impl_._may_match_sst_file_numbers_cached_byte_size_)*/{0}
+    , decltype(_impl_.path_not_found_sst_file_numbers_){arena}
+    , /*decltype(_impl_._path_not_found_sst_file_numbers_cached_byte_size_)*/{0}
     , decltype(_impl_.checked_count_){uint64_t{0u}}
     , decltype(_impl_.total_candidates_){uint64_t{0u}}
     , decltype(_impl_.complete_){false}
@@ -747,6 +759,7 @@ KeyResponse::~KeyResponse() {
 inline void KeyResponse::SharedDtor() {
   GOOGLE_DCHECK(GetArenaForAllocation() == nullptr);
   _impl_.may_match_sst_file_numbers_.~RepeatedField();
+  _impl_.path_not_found_sst_file_numbers_.~RepeatedField();
 }
 
 void KeyResponse::SetCachedSize(int size) const {
@@ -760,6 +773,7 @@ void KeyResponse::Clear() {
   (void) cached_has_bits;
 
   _impl_.may_match_sst_file_numbers_.Clear();
+  _impl_.path_not_found_sst_file_numbers_.Clear();
   ::memset(&_impl_.checked_count_, 0, static_cast<size_t>(
       reinterpret_cast<char*>(&_impl_.complete_) -
       reinterpret_cast<char*>(&_impl_.checked_count_)) + sizeof(_impl_.complete_));
@@ -803,6 +817,17 @@ const char* KeyResponse::_InternalParse(const char* ptr, ::_pbi::ParseContext* c
       case 4:
         if (PROTOBUF_PREDICT_TRUE(static_cast<uint8_t>(tag) == 32)) {
           _impl_.total_candidates_ = ::PROTOBUF_NAMESPACE_ID::internal::ReadVarint64(&ptr);
+          CHK_(ptr);
+        } else
+          goto handle_unusual;
+        continue;
+      // repeated uint64 path_not_found_sst_file_numbers = 5;
+      case 5:
+        if (PROTOBUF_PREDICT_TRUE(static_cast<uint8_t>(tag) == 42)) {
+          ptr = ::PROTOBUF_NAMESPACE_ID::internal::PackedUInt64Parser(_internal_mutable_path_not_found_sst_file_numbers(), ptr, ctx);
+          CHK_(ptr);
+        } else if (static_cast<uint8_t>(tag) == 40) {
+          _internal_add_path_not_found_sst_file_numbers(::PROTOBUF_NAMESPACE_ID::internal::ReadVarint64(&ptr));
           CHK_(ptr);
         } else
           goto handle_unusual;
@@ -863,6 +888,15 @@ uint8_t* KeyResponse::_InternalSerialize(
     target = ::_pbi::WireFormatLite::WriteUInt64ToArray(4, this->_internal_total_candidates(), target);
   }
 
+  // repeated uint64 path_not_found_sst_file_numbers = 5;
+  {
+    int byte_size = _impl_._path_not_found_sst_file_numbers_cached_byte_size_.load(std::memory_order_relaxed);
+    if (byte_size > 0) {
+      target = stream->WriteUInt64Packed(
+          5, _internal_path_not_found_sst_file_numbers(), byte_size, target);
+    }
+  }
+
   if (PROTOBUF_PREDICT_FALSE(_internal_metadata_.have_unknown_fields())) {
     target = ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
         _internal_metadata_.unknown_fields<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>(::PROTOBUF_NAMESPACE_ID::UnknownFieldSet::default_instance), target, stream);
@@ -889,6 +923,20 @@ size_t KeyResponse::ByteSizeLong() const {
     }
     int cached_size = ::_pbi::ToCachedSize(data_size);
     _impl_._may_match_sst_file_numbers_cached_byte_size_.store(cached_size,
+                                    std::memory_order_relaxed);
+    total_size += data_size;
+  }
+
+  // repeated uint64 path_not_found_sst_file_numbers = 5;
+  {
+    size_t data_size = ::_pbi::WireFormatLite::
+      UInt64Size(this->_impl_.path_not_found_sst_file_numbers_);
+    if (data_size > 0) {
+      total_size += 1 +
+        ::_pbi::WireFormatLite::Int32Size(static_cast<int32_t>(data_size));
+    }
+    int cached_size = ::_pbi::ToCachedSize(data_size);
+    _impl_._path_not_found_sst_file_numbers_cached_byte_size_.store(cached_size,
                                     std::memory_order_relaxed);
     total_size += data_size;
   }
@@ -927,6 +975,7 @@ void KeyResponse::MergeImpl(::PROTOBUF_NAMESPACE_ID::Message& to_msg, const ::PR
   (void) cached_has_bits;
 
   _this->_impl_.may_match_sst_file_numbers_.MergeFrom(from._impl_.may_match_sst_file_numbers_);
+  _this->_impl_.path_not_found_sst_file_numbers_.MergeFrom(from._impl_.path_not_found_sst_file_numbers_);
   if (from._internal_checked_count() != 0) {
     _this->_internal_set_checked_count(from._internal_checked_count());
   }
@@ -954,6 +1003,7 @@ void KeyResponse::InternalSwap(KeyResponse* other) {
   using std::swap;
   _internal_metadata_.InternalSwap(&other->_internal_metadata_);
   _impl_.may_match_sst_file_numbers_.InternalSwap(&other->_impl_.may_match_sst_file_numbers_);
+  _impl_.path_not_found_sst_file_numbers_.InternalSwap(&other->_impl_.path_not_found_sst_file_numbers_);
   ::PROTOBUF_NAMESPACE_ID::internal::memswap<
       PROTOBUF_FIELD_OFFSET(KeyResponse, _impl_.complete_)
       + sizeof(KeyResponse::_impl_.complete_)
@@ -1668,6 +1718,8 @@ StreamResponse::StreamResponse(const StreamResponse& from)
   new (&_impl_) Impl_{
       decltype(_impl_.may_match_sst_file_numbers_){from._impl_.may_match_sst_file_numbers_}
     , /*decltype(_impl_._may_match_sst_file_numbers_cached_byte_size_)*/{0}
+    , decltype(_impl_.path_not_found_sst_file_numbers_){from._impl_.path_not_found_sst_file_numbers_}
+    , /*decltype(_impl_._path_not_found_sst_file_numbers_cached_byte_size_)*/{0}
     , decltype(_impl_.request_id_){}
     , /*decltype(_impl_._cached_size_)*/{}};
 
@@ -1683,6 +1735,8 @@ inline void StreamResponse::SharedCtor(
   new (&_impl_) Impl_{
       decltype(_impl_.may_match_sst_file_numbers_){arena}
     , /*decltype(_impl_._may_match_sst_file_numbers_cached_byte_size_)*/{0}
+    , decltype(_impl_.path_not_found_sst_file_numbers_){arena}
+    , /*decltype(_impl_._path_not_found_sst_file_numbers_cached_byte_size_)*/{0}
     , decltype(_impl_.request_id_){uint64_t{0u}}
     , /*decltype(_impl_._cached_size_)*/{}
   };
@@ -1700,6 +1754,7 @@ StreamResponse::~StreamResponse() {
 inline void StreamResponse::SharedDtor() {
   GOOGLE_DCHECK(GetArenaForAllocation() == nullptr);
   _impl_.may_match_sst_file_numbers_.~RepeatedField();
+  _impl_.path_not_found_sst_file_numbers_.~RepeatedField();
 }
 
 void StreamResponse::SetCachedSize(int size) const {
@@ -1713,6 +1768,7 @@ void StreamResponse::Clear() {
   (void) cached_has_bits;
 
   _impl_.may_match_sst_file_numbers_.Clear();
+  _impl_.path_not_found_sst_file_numbers_.Clear();
   _impl_.request_id_ = uint64_t{0u};
   _internal_metadata_.Clear<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>();
 }
@@ -1738,6 +1794,17 @@ const char* StreamResponse::_InternalParse(const char* ptr, ::_pbi::ParseContext
           CHK_(ptr);
         } else if (static_cast<uint8_t>(tag) == 16) {
           _internal_add_may_match_sst_file_numbers(::PROTOBUF_NAMESPACE_ID::internal::ReadVarint64(&ptr));
+          CHK_(ptr);
+        } else
+          goto handle_unusual;
+        continue;
+      // repeated uint64 path_not_found_sst_file_numbers = 3;
+      case 3:
+        if (PROTOBUF_PREDICT_TRUE(static_cast<uint8_t>(tag) == 26)) {
+          ptr = ::PROTOBUF_NAMESPACE_ID::internal::PackedUInt64Parser(_internal_mutable_path_not_found_sst_file_numbers(), ptr, ctx);
+          CHK_(ptr);
+        } else if (static_cast<uint8_t>(tag) == 24) {
+          _internal_add_path_not_found_sst_file_numbers(::PROTOBUF_NAMESPACE_ID::internal::ReadVarint64(&ptr));
           CHK_(ptr);
         } else
           goto handle_unusual;
@@ -1786,6 +1853,15 @@ uint8_t* StreamResponse::_InternalSerialize(
     }
   }
 
+  // repeated uint64 path_not_found_sst_file_numbers = 3;
+  {
+    int byte_size = _impl_._path_not_found_sst_file_numbers_cached_byte_size_.load(std::memory_order_relaxed);
+    if (byte_size > 0) {
+      target = stream->WriteUInt64Packed(
+          3, _internal_path_not_found_sst_file_numbers(), byte_size, target);
+    }
+  }
+
   if (PROTOBUF_PREDICT_FALSE(_internal_metadata_.have_unknown_fields())) {
     target = ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
         _internal_metadata_.unknown_fields<::PROTOBUF_NAMESPACE_ID::UnknownFieldSet>(::PROTOBUF_NAMESPACE_ID::UnknownFieldSet::default_instance), target, stream);
@@ -1816,6 +1892,20 @@ size_t StreamResponse::ByteSizeLong() const {
     total_size += data_size;
   }
 
+  // repeated uint64 path_not_found_sst_file_numbers = 3;
+  {
+    size_t data_size = ::_pbi::WireFormatLite::
+      UInt64Size(this->_impl_.path_not_found_sst_file_numbers_);
+    if (data_size > 0) {
+      total_size += 1 +
+        ::_pbi::WireFormatLite::Int32Size(static_cast<int32_t>(data_size));
+    }
+    int cached_size = ::_pbi::ToCachedSize(data_size);
+    _impl_._path_not_found_sst_file_numbers_cached_byte_size_.store(cached_size,
+                                    std::memory_order_relaxed);
+    total_size += data_size;
+  }
+
   // uint64 request_id = 1;
   if (this->_internal_request_id() != 0) {
     total_size += ::_pbi::WireFormatLite::UInt64SizePlusOne(this->_internal_request_id());
@@ -1840,6 +1930,7 @@ void StreamResponse::MergeImpl(::PROTOBUF_NAMESPACE_ID::Message& to_msg, const :
   (void) cached_has_bits;
 
   _this->_impl_.may_match_sst_file_numbers_.MergeFrom(from._impl_.may_match_sst_file_numbers_);
+  _this->_impl_.path_not_found_sst_file_numbers_.MergeFrom(from._impl_.path_not_found_sst_file_numbers_);
   if (from._internal_request_id() != 0) {
     _this->_internal_set_request_id(from._internal_request_id());
   }
@@ -1861,6 +1952,7 @@ void StreamResponse::InternalSwap(StreamResponse* other) {
   using std::swap;
   _internal_metadata_.InternalSwap(&other->_internal_metadata_);
   _impl_.may_match_sst_file_numbers_.InternalSwap(&other->_impl_.may_match_sst_file_numbers_);
+  _impl_.path_not_found_sst_file_numbers_.InternalSwap(&other->_impl_.path_not_found_sst_file_numbers_);
   swap(_impl_.request_id_, other->_impl_.request_id_);
 }
 

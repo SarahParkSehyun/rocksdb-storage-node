@@ -89,7 +89,7 @@ bool ShouldSampleDequeueLock() {
 bool IsSstListLogEnabled() {
   // static const bool enabled = []() {
   //   const char* env = std::getenv("BLOOMD_SST_LIST_LOG");
-  //   return env == nullptr || std::string(env) != "0";
+  //   return env && std::string(env) == "1";
   // }();
   // return enabled;
   return false;
@@ -106,6 +106,18 @@ bool IsSstReasonLogEnabled() {
 bool IsOpenFailLogEnabled() {
   static const bool enabled = []() {
     const char* env = std::getenv("BLOOMD_OPEN_FAIL_LOG");
+    return env && std::string(env) == "1";
+  }();
+  return enabled;
+}
+
+bool IsOpenFailCollectionEnabled() {
+  return IsOpenFailLogEnabled();
+}
+
+bool IsPathNotFoundOnlyLogEnabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("BLOOMD_PATH_NOT_FOUND_ONLY_LOG");
     return env && std::string(env) == "1";
   }();
   return enabled;
@@ -128,6 +140,9 @@ void ResetLastOpenFailDetail() {
 void SetLastOpenFailDetail(const char* stage, const std::string* path,
                            const ROCKSDB_NAMESPACE::Status* st,
                            const ROCKSDB_NAMESPACE::IOStatus* ios) {
+  if (!IsOpenFailCollectionEnabled()) {
+    return;
+  }
   g_last_open_fail_detail.valid = true;
   g_last_open_fail_detail.stage = stage ? stage : "";
   g_last_open_fail_detail.path = path ? *path : "";
@@ -137,6 +152,14 @@ void SetLastOpenFailDetail(const char* stage, const std::string* path,
 
 const OpenFailDetail& GetLastOpenFailDetail() {
   return g_last_open_fail_detail;
+}
+
+bool IsLastOpenFailPathNotFound() {
+  if (!IsOpenFailCollectionEnabled()) {
+    return false;
+  }
+  const OpenFailDetail& d = GetLastOpenFailDetail();
+  return d.valid && d.stage == "path_not_found";
 }
 
 template <typename Iterable>
@@ -573,6 +596,10 @@ class TableReaderCache {
       if ((!sst_reason_log_enabled && !open_fail_log_enabled) || !log_mutex) {
         return;
       }
+      if (IsPathNotFoundOnlyLogEnabled() &&
+          (!stage || std::string(stage) != "path_not_found")) {
+        return;
+      }
       if (!open_fail_log_enabled) {
         if (!open_count) {
           return;
@@ -739,7 +766,9 @@ class TableReaderCache {
     // Note: TryOpenSstPath already called GetFileSize, so we check file_size here
     if (actual_path.empty() || file_size == 0) {
       // TryOpenSstPath failed to find any matching file
-      if (stats) stats->open_fail_getfilesize.fetch_add(1, std::memory_order_relaxed);
+      if (stats && IsOpenFailCollectionEnabled()) {
+        stats->open_fail_getfilesize.fetch_add(1, std::memory_order_relaxed);
+      }
       // 샘플 로그 (초기 50회 + 매 1000회) - 락 밖에서
       // if (open_id <= 50 || open_id % 1000 == 0) {
       //   std::lock_guard<std::mutex> log_lock(*log_mutex);
@@ -763,7 +792,9 @@ class TableReaderCache {
 
     ROCKSDB_NAMESPACE::IOStatus s = fs->NewRandomAccessFile(actual_path, fopts, &file, nullptr);
     if (!s.ok()) {
-      if (stats) stats->open_fail_newfile.fetch_add(1, std::memory_order_relaxed);
+      if (stats && IsOpenFailCollectionEnabled()) {
+        stats->open_fail_newfile.fetch_add(1, std::memory_order_relaxed);
+      }
       // 샘플 로그 - 락 밖에서
       // if (open_id <= 50 || open_id % 1000 == 0) {
       //   std::lock_guard<std::mutex> log_lock(*log_mutex);
@@ -814,7 +845,9 @@ class TableReaderCache {
         false /* prefetch_index_and_filter_in_cache */);
     
     if (!table_status.ok() || !table_reader) {
-      if (stats) stats->open_fail_newreader.fetch_add(1, std::memory_order_relaxed);
+      if (stats && IsOpenFailCollectionEnabled()) {
+        stats->open_fail_newreader.fetch_add(1, std::memory_order_relaxed);
+      }
       // 샘플 로그 - 락 밖에서
       // if (open_id <= 50 || open_id % 1000 == 0) {
       //   std::lock_guard<std::mutex> log_lock(*log_mutex);
@@ -1477,8 +1510,10 @@ class CheckCallData : public CallDataBase {
       total_check_us += sst_check_us;
       
       checked_count++;  // CheckKeyInSST 호출 시도 (성공/실패 무관)
-      
-      if (may_match) {
+
+      if (may_match && IsLastOpenFailPathNotFound()) {
+        resp->add_path_not_found_sst_file_numbers(file_number);
+      } else if (may_match) {
         resp->add_may_match_sst_file_numbers(file_number);
       }
     }
@@ -1491,16 +1526,20 @@ class CheckCallData : public CallDataBase {
     bool complete = (checked_count == total_candidates);
     resp->set_complete(complete);
 
-    if (IsSstListLogEnabled()) {
-      const std::string input_sst_list = FormatSstList(req.sst_file_numbers());
-      const std::string output_sst_list =
-          FormatSstList(resp->may_match_sst_file_numbers());
-      std::lock_guard<std::mutex> log_lock(*log_mutex_);
-      std::cerr << "[SST_LIST][check] key_req_id=" << key_req_id
-                << " candidates=" << total_candidates
-                << " input=" << input_sst_list
-                << " output=" << output_sst_list << std::endl;
-    }
+    // if (IsSstListLogEnabled()) {
+    //   const std::string input_sst_list = FormatSstList(req.sst_file_numbers());
+    //   const std::string output_may_match_sst_list =
+    //       FormatSstList(resp->may_match_sst_file_numbers());
+    //   const std::string output_path_not_found_sst_list =
+    //       FormatSstList(resp->path_not_found_sst_file_numbers());
+    //   std::lock_guard<std::mutex> log_lock(*log_mutex_);
+    //   std::cerr << "[SST_LIST][check] key_req_id=" << key_req_id
+    //             << " candidates=" << total_candidates
+    //             << " input=" << input_sst_list
+    //             << " output_may_match=" << output_may_match_sst_list
+    //             << " output_path_not_found="
+    //             << output_path_not_found_sst_list << std::endl;
+    // }
     
     // ProcessKeyRequest 종료 시간 측정
     auto process_end = std::chrono::steady_clock::now();
@@ -1526,6 +1565,7 @@ class CheckCallData : public CallDataBase {
     
     static std::atomic<size_t> call_count{0};
     size_t call_id = call_count.fetch_add(1) + 1;
+    ResetLastOpenFailDetail();
     uint64_t keymaymatch_us = 0;
     auto log_check_reason = [&](CheckReason reason) {
       const bool sst_reason_log_enabled = IsSstReasonLogEnabled();
@@ -1542,6 +1582,10 @@ class CheckCallData : public CallDataBase {
       std::lock_guard<std::mutex> log_lock(*log_mutex_);
       if (open_fail_log_enabled && reason == CheckReason::OPEN_FAIL) {
         const OpenFailDetail& d = GetLastOpenFailDetail();
+        if (IsPathNotFoundOnlyLogEnabled() &&
+            (!d.valid || d.stage != "path_not_found")) {
+          return;
+        }
         std::cerr << "[OPEN_FAIL][check] call_id=" << call_id
                   << " file_number=" << file_number
                   << " reason=" << CheckReasonToString(reason);
@@ -1868,6 +1912,10 @@ class StreamCallData {
     auto check_loop_start = std::chrono::steady_clock::now();
     for (uint64_t file_number : item.stream_sst_file_numbers) {
       if (CheckKeyInSST(user_key, file_number)) {
+        if (IsLastOpenFailPathNotFound()) {
+          response.add_path_not_found_sst_file_numbers(file_number);
+          continue;
+        }
         response.add_may_match_sst_file_numbers(file_number);
       }
     }
@@ -1879,16 +1927,20 @@ class StreamCallData {
       stats_->AddCheckLoopUs(check_loop_us);
     }
 
-    if (IsSstListLogEnabled()) {
-      const std::string input_sst_list = FormatSstList(item.stream_sst_file_numbers);
-      const std::string output_sst_list =
-          FormatSstList(response.may_match_sst_file_numbers());
-      std::lock_guard<std::mutex> log_lock(*log_mutex_);
-      std::cerr << "[SST_LIST][stream] request_id=" << item.stream_request_id
-                << " candidates=" << item.stream_sst_file_numbers.size()
-                << " input=" << input_sst_list
-                << " output=" << output_sst_list << std::endl;
-    }
+    // if (IsSstListLogEnabled()) {
+    //   const std::string input_sst_list = FormatSstList(item.stream_sst_file_numbers);
+    //   const std::string output_may_match_sst_list =
+    //       FormatSstList(response.may_match_sst_file_numbers());
+    //   const std::string output_path_not_found_sst_list =
+    //       FormatSstList(response.path_not_found_sst_file_numbers());
+    //   std::lock_guard<std::mutex> log_lock(*log_mutex_);
+    //   std::cerr << "[SST_LIST][stream] request_id=" << item.stream_request_id
+    //             << " candidates=" << item.stream_sst_file_numbers.size()
+    //             << " input=" << input_sst_list
+    //             << " output_may_match=" << output_may_match_sst_list
+    //             << " output_path_not_found="
+    //             << output_path_not_found_sst_list << std::endl;
+    // }
 
     EnqueueResponse(std::move(response));
   }
@@ -2040,6 +2092,7 @@ class StreamCallData {
   bool CheckKeyInSST(const ROCKSDB_NAMESPACE::Slice& user_key, uint64_t file_number) {
     static std::atomic<size_t> call_count{0};
     const size_t call_id = call_count.fetch_add(1) + 1;
+    ResetLastOpenFailDetail();
     auto log_check_reason = [&](CheckReason reason) {
       const bool sst_reason_log_enabled = IsSstReasonLogEnabled();
       const bool open_fail_log_enabled = IsOpenFailLogEnabled();
@@ -2055,6 +2108,10 @@ class StreamCallData {
       std::lock_guard<std::mutex> log_lock(*log_mutex_);
       if (open_fail_log_enabled && reason == CheckReason::OPEN_FAIL) {
         const OpenFailDetail& d = GetLastOpenFailDetail();
+        if (IsPathNotFoundOnlyLogEnabled() &&
+            (!d.valid || d.stage != "path_not_found")) {
+          return;
+        }
         std::cerr << "[OPEN_FAIL][stream_check] call_id=" << call_id
                   << " file_number=" << file_number
                   << " reason=" << CheckReasonToString(reason);
