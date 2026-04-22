@@ -1220,6 +1220,7 @@ class PerCQWorkerQueue {
     uint64_t stream_request_id;
     std::string stream_user_key;
     std::vector<uint64_t> stream_sst_file_numbers;
+    bool stream_noop_only;
     size_t req_id;
     size_t active_count;
     uint64_t accept_wait_us;
@@ -1233,6 +1234,7 @@ class PerCQWorkerQueue {
           stream_call_data(nullptr),
           request(req),
           stream_request_id(0),
+          stream_noop_only(false),
           req_id(id),
           active_count(active),
           accept_wait_us(accept_wait),
@@ -1240,13 +1242,14 @@ class PerCQWorkerQueue {
 
     WorkItem(StreamCallData* stream_cd, uint64_t request_id,
              std::string user_key, std::vector<uint64_t> sst_numbers,
-             std::chrono::steady_clock::time_point enqueue_time)
+             bool noop_only, std::chrono::steady_clock::time_point enqueue_time)
         : kind(Kind::kStreamCheck),
           call_data(nullptr),
           stream_call_data(stream_cd),
           stream_request_id(request_id),
           stream_user_key(std::move(user_key)),
           stream_sst_file_numbers(std::move(sst_numbers)),
+          stream_noop_only(noop_only),
           req_id(0),
           active_count(0),
           accept_wait_us(0),
@@ -2163,6 +2166,14 @@ class StreamCallData {
     StreamResponse response;
     response.set_request_id(item.stream_request_id);
 
+    if (item.stream_noop_only) {
+      for (uint64_t file_number : item.stream_sst_file_numbers) {
+        response.add_may_match_sst_file_numbers(file_number);
+      }
+      EnqueueResponse(std::move(response));
+      return;
+    }
+
     const ROCKSDB_NAMESPACE::Slice user_key(item.stream_user_key);
     uint64_t filter_eval_attempts = 0;
     std::vector<std::pair<uint64_t, CheckReason>> skipped_details;
@@ -2273,11 +2284,13 @@ class StreamCallData {
 
   void HandleRead(bool ok) {
     uint64_t request_id = 0;
+    bool noop_only = false;
     std::string user_key;
     std::vector<uint64_t> sst_numbers;
 
     if (ok) {
       request_id = read_request_.request_id();
+      noop_only = read_request_.noop_only();
       user_key = std::move(*read_request_.mutable_user_key());
       sst_numbers.reserve(read_request_.sst_file_numbers_size());
       for (uint64_t file_number : read_request_.sst_file_numbers()) {
@@ -2309,7 +2322,8 @@ class StreamCallData {
     }
     worker_queue_->Enqueue(
         PerCQWorkerQueue::WorkItem(this, request_id, std::move(user_key),
-                                   std::move(sst_numbers), enqueue_ts));
+                                   std::move(sst_numbers), noop_only,
+                                   enqueue_ts));
   }
 
   void EnqueueResponse(StreamResponse response) {
