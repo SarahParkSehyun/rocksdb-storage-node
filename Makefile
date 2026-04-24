@@ -1322,7 +1322,7 @@ tools/bloomcheck.grpc.pb.cc tools/bloomcheck.grpc.pb.h: tools/bloomcheck.proto
 	  --plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN) tools/bloomcheck.proto
 
 bloomd: tools/bloomcheck.pb.cc tools/bloomcheck.grpc.pb.cc $(OBJ_DIR)/tools/bloomd.o
-	@if [ ! -f "$(STATIC_LIBRARY)" ] && [ ! -f "${LIBNAME}.a" ] && [ ! -f "${LIBNAME}_debug.a" ] && [ ! -f "$(SHARED_LIBRARY)" ]; then \
+	@if [ ! -f "${LIBNAME}.a" ] && [ ! -f "$(STATIC_LIBRARY)" ] && [ ! -f "${LIBNAME}_debug.a" ] && [ ! -f "$(SHARED_LIBRARY)" ]; then \
 	  echo "Error: RocksDB library not found. Please build it first:"; \
 	  echo "  make static_lib"; \
 	  echo "  or"; \
@@ -1333,7 +1333,7 @@ bloomd: tools/bloomcheck.pb.cc tools/bloomcheck.grpc.pb.cc $(OBJ_DIR)/tools/bloo
 	  -I. -Itools \
 	  $(OBJ_DIR)/tools/bloomd.o \
 	  tools/bloomcheck.pb.cc tools/bloomcheck.grpc.pb.cc \
-	  $(shell if [ -f "$(STATIC_LIBRARY)" ]; then echo "$(STATIC_LIBRARY)"; elif [ -f "${LIBNAME}.a" ]; then echo "${LIBNAME}.a"; elif [ -f "${LIBNAME}_debug.a" ]; then echo "${LIBNAME}_debug.a"; elif [ -f "$(SHARED_LIBRARY)" ]; then echo "-L. -lrocksdb"; else echo ""; fi) $(EXEC_LDFLAGS) \
+	  $(shell if [ -f "${LIBNAME}.a" ]; then echo "${LIBNAME}.a"; elif [ -f "$(STATIC_LIBRARY)" ]; then echo "$(STATIC_LIBRARY)"; elif [ -f "${LIBNAME}_debug.a" ]; then echo "${LIBNAME}_debug.a"; elif [ -f "$(SHARED_LIBRARY)" ]; then echo "-L. -lrocksdb"; else echo ""; fi) $(EXEC_LDFLAGS) \
 	  -Wl,--no-as-needed -lgrpc++ -lgrpc++_reflection -lprotobuf -lgpr -labsl_synchronization -labsl_strings -pthread -o $@ $(LDFLAGS) -Wl,--as-needed
 
 bloomcheck_client: tools/bloomcheck.pb.cc tools/bloomcheck.grpc.pb.cc $(OBJ_DIR)/tools/bloomcheck_client.o

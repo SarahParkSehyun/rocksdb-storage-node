@@ -138,16 +138,7 @@ bool IsFilterEvalDiffLogEnabled() {
 }
 
 bool ShouldLogFilterEvalDiffNow() {
-  static std::atomic<uint64_t> last_log_us{0};
-  const uint64_t now_us = SteadyNowMicros();
-  uint64_t last_us = last_log_us.load(std::memory_order_relaxed);
-  while (now_us >= last_us && now_us - last_us >= 1000000) {
-    if (last_log_us.compare_exchange_weak(last_us, now_us,
-                                          std::memory_order_relaxed)) {
-      return true;
-    }
-  }
-  return false;
+  return true;
 }
 
 struct OpenFailDetail {
