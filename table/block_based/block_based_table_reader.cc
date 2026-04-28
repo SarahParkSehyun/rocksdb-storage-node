@@ -79,6 +79,10 @@
 namespace ROCKSDB_NAMESPACE {
 namespace {
 
+std::atomic<bool> g_count_filter_block_preads_for_request{false};
+std::atomic<uint64_t> g_filter_block_preads_for_request{0};
+thread_local uint32_t g_filter_block_pread_request_scope_depth = 0;
+
 CacheAllocationPtr CopyBufferToHeap(MemoryAllocator* allocator, Slice& buf) {
   CacheAllocationPtr heap_buf;
   heap_buf = AllocateBlock(buf.size(), allocator);
@@ -86,6 +90,47 @@ CacheAllocationPtr CopyBufferToHeap(MemoryAllocator* allocator, Slice& buf) {
   return heap_buf;
 }
 }  // namespace
+
+void SetCountFilterBlockPreadsForRequest(bool enabled) {
+  g_count_filter_block_preads_for_request.store(enabled,
+                                                std::memory_order_relaxed);
+  if (!enabled) {
+    g_filter_block_preads_for_request.store(0, std::memory_order_relaxed);
+  }
+}
+
+uint64_t GetAndResetFilterBlockPreadsForRequest() {
+  return g_filter_block_preads_for_request.exchange(0,
+                                                    std::memory_order_relaxed);
+}
+
+void BeginFilterPreadCountForRequest() {
+  ++g_filter_block_pread_request_scope_depth;
+}
+
+void EndFilterPreadCountForRequest() {
+  if (g_filter_block_pread_request_scope_depth > 0) {
+    --g_filter_block_pread_request_scope_depth;
+  }
+}
+
+void RecordFilterBlockPreadForRequest(BlockType block_type) {
+  if (!g_count_filter_block_preads_for_request.load(
+          std::memory_order_relaxed) ||
+      g_filter_block_pread_request_scope_depth == 0) {
+    return;
+  }
+
+  switch (block_type) {
+    case BlockType::kFilter:
+    case BlockType::kFilterPartitionIndex:
+      g_filter_block_preads_for_request.fetch_add(1,
+                                                  std::memory_order_relaxed);
+      break;
+    default:
+      break;
+  }
+}
 
 // Explicitly instantiate templates for each "blocklike" type we use (and
 // before implicit specialization).

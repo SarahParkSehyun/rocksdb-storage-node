@@ -303,6 +303,14 @@ void BlockFetcher::ReadBlock(bool retry) {
     }
   }
 
+  // Count only actual request-path storage reads of filter-related blocks.
+  // Cache hits, persistent-cache hits, and prefetch-buffer hits return before
+  // ReadBlock(). Retries/re-reads count as additional reads if they actually
+  // reach storage again while a request scope is active.
+  if (io_status_.ok()) {
+    RecordFilterBlockPreadForRequest(block_type_);
+  }
+
   // TODO: introduce dedicated perf counter for range tombstones
   switch (block_type_) {
     case BlockType::kFilter:

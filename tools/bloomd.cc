@@ -137,9 +137,16 @@ bool IsFilterEvalDiffLogEnabled() {
   return enabled;
 }
 
-bool ShouldLogFilterEvalDiffNow() {
-  return true;
+bool IsFilterBlockPreadCountForRequestEnabled() {
+  static const bool enabled = []() {
+    const char* env =
+        std::getenv("BLOOMD_COUNT_FILTER_BLOCK_PREADS_FOR_REQUEST");
+    return env && std::string(env) == "1";
+  }();
+  return enabled;
 }
+
+bool ShouldLogFilterEvalDiffNow() { return true; }
 
 struct OpenFailDetail {
   bool valid = false;
@@ -169,6 +176,24 @@ void SetLastOpenFailDetail(const char* stage, const std::string* path,
 const OpenFailDetail& GetLastOpenFailDetail() {
   return g_last_open_fail_detail;
 }
+
+class RequestFilterPreadCountScope {
+ public:
+  explicit RequestFilterPreadCountScope(bool enabled) : enabled_(enabled) {
+    if (enabled_) {
+      ROCKSDB_NAMESPACE::BeginFilterPreadCountForRequest();
+    }
+  }
+
+  ~RequestFilterPreadCountScope() {
+    if (enabled_) {
+      ROCKSDB_NAMESPACE::EndFilterPreadCountForRequest();
+    }
+  }
+
+ private:
+  bool enabled_;
+};
 
 bool IsLastOpenFailPathNotFound() {
   if (!IsOpenFailCollectionEnabled()) {
@@ -816,7 +841,7 @@ class TableReaderCache {
 
     // Match the baseline path by opening SSTs with direct I/O.
     ROCKSDB_NAMESPACE::EnvOptions env_options;
-    env_options.use_direct_reads = true;
+    // env_options.use_direct_reads = true;
     ROCKSDB_NAMESPACE::ReadOptions read_options;
     read_options.read_tier =
         ROCKSDB_NAMESPACE::kReadAllTier;  // Allow file reads
@@ -1635,7 +1660,6 @@ class CheckCallData : public CallDataBase {
   void ProcessKeyRequest(const KeyRequest& req, KeyResponse* resp) {
     // ProcessKeyRequest 시작 시간 측정
     auto process_start = std::chrono::steady_clock::now();
-
     static std::atomic<size_t> key_request_count{0};
     size_t key_req_id = key_request_count.fetch_add(1) + 1;
 
@@ -1681,6 +1705,15 @@ class CheckCallData : public CallDataBase {
         resp->add_path_not_found_sst_file_numbers(file_number);
       } else if (may_match) {
         resp->add_may_match_sst_file_numbers(file_number);
+      }
+
+      if (IsFilterEvalDiffLogEnabled() && ShouldLogFilterEvalDiffNow()) {
+        std::lock_guard<std::mutex> log_lock(*log_mutex_);
+        std::cerr << "[FILTER_EVAL_DETAIL][check] key_req_id=" << key_req_id
+                  << " candidate_file_number=" << file_number
+                  << " filter_checked="
+                  << (filter_eval_attempted ? "yes" : "no")
+                  << " may_match=" << (may_match ? "yes" : "no") << std::endl;
       }
     }
     if (server_stats_enabled_) stats_->AddCheckLoopUs(total_check_us);
@@ -1987,6 +2020,8 @@ class CheckCallData : public CallDataBase {
       if (filter_eval_attempted) {
         *filter_eval_attempted = true;
       }
+      RequestFilterPreadCountScope filter_pread_count_scope(
+          IsFilterBlockPreadCountForRequestEnabled());
       may_match =
           rep->filter->KeyMayMatch(user_key_without_ts, const_ikey_ptr,
                                    &get_context, &lookup_context, read_options);
@@ -2153,7 +2188,6 @@ class StreamCallData {
   void ProcessInWorkerThread(PerCQWorkerQueue::WorkItem item) {
     StreamResponse response;
     response.set_request_id(item.stream_request_id);
-
     const ROCKSDB_NAMESPACE::Slice user_key(item.stream_user_key);
     uint64_t filter_eval_attempts = 0;
     std::vector<std::pair<uint64_t, CheckReason>> skipped_details;
@@ -2174,6 +2208,16 @@ class StreamCallData {
           continue;
         }
         response.add_may_match_sst_file_numbers(file_number);
+      }
+
+      if (IsFilterEvalDiffLogEnabled() && ShouldLogFilterEvalDiffNow()) {
+        std::lock_guard<std::mutex> log_lock(*log_mutex_);
+        std::cerr << "[FILTER_EVAL_DETAIL][stream] request_id="
+                  << item.stream_request_id
+                  << " candidate_file_number=" << file_number
+                  << " filter_checked="
+                  << (filter_eval_attempted ? "yes" : "no")
+                  << " may_match=" << (may_match ? "yes" : "no") << std::endl;
       }
     }
     auto check_loop_end = std::chrono::steady_clock::now();
@@ -2548,6 +2592,8 @@ class StreamCallData {
       if (filter_eval_attempted) {
         *filter_eval_attempted = true;
       }
+      RequestFilterPreadCountScope filter_pread_count_scope(
+          IsFilterBlockPreadCountForRequestEnabled());
       may_match =
           rep->filter->KeyMayMatch(user_key_without_ts, const_ikey_ptr,
                                    &get_context, &lookup_context, read_options);
@@ -2733,10 +2779,12 @@ class BloomCheckServiceImpl {
           const char* v = std::getenv("BLOOMCHECK_SERVER_STATS");
           return v && std::strcmp(v, "1") == 0;
         }()),
-        filter_eval_count_enabled_(IsFilterEvalCountEnabled()) {
+        filter_eval_count_enabled_(IsFilterEvalCountEnabled()),
+        filter_block_pread_count_enabled_(
+            IsFilterBlockPreadCountForRequestEnabled()) {
     // Configure RocksDB options for filter-only access
     rocksdb_options_.env = ROCKSDB_NAMESPACE::Env::Default();
-    rocksdb_options_.use_direct_reads = true;
+    // rocksdb_options_.use_direct_reads = true;
 
     // Disable RocksDB verbose logging (ERROR level only)
     rocksdb_options_.info_log_level =
@@ -2748,9 +2796,21 @@ class BloomCheckServiceImpl {
         ROCKSDB_NAMESPACE::NewBloomFilterPolicy(10, false));
     bbto.whole_key_filtering = true;
     bbto.partition_filters = true;
+    bbto.cache_index_and_filter_blocks = true;
+    bbto.pin_top_level_index_and_filter = true;
+    bbto.metadata_cache_options.top_level_index_pinning =
+        ROCKSDB_NAMESPACE::PinningTier::kNone;
+    bbto.metadata_cache_options.partition_pinning =
+        ROCKSDB_NAMESPACE::PinningTier::kNone;
+    bbto.metadata_cache_options.unpartitioned_pinning =
+        ROCKSDB_NAMESPACE::PinningTier::kNone;
+    bbto.block_cache =
+        ROCKSDB_NAMESPACE::HyperClockCacheOptions(1, 0, -1).MakeSharedCache();
     rocksdb_options_.table_factory.reset(
         ROCKSDB_NAMESPACE::NewBlockBasedTableFactory(bbto));
 
+    ROCKSDB_NAMESPACE::SetCountFilterBlockPreadsForRequest(
+        filter_block_pread_count_enabled_);
     StartStatsThread();
   }
 
@@ -2784,7 +2844,9 @@ class BloomCheckServiceImpl {
   std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs_;
   const bool server_stats_enabled_;
   const bool filter_eval_count_enabled_;
+  const bool filter_block_pread_count_enabled_;
   std::atomic<size_t> num_cqs_{0};
+  std::atomic<uint64_t> total_filter_block_preads_for_request_{0};
 
   // Stats printing thread (runs only when server_stats_enabled_)
   std::thread stats_thread_;
@@ -2795,7 +2857,10 @@ class BloomCheckServiceImpl {
       std::chrono::steady_clock::time_point::min()};
 
   void StartStatsThread() {
-    if (!server_stats_enabled_ && !filter_eval_count_enabled_) return;
+    if (!server_stats_enabled_ && !filter_eval_count_enabled_ &&
+        !filter_block_pread_count_enabled_) {
+      return;
+    }
     stats_thread_ = std::thread([this]() {
       uint64_t last_recv_req = 0, last_worker_deq = 0, last_depth_sum = 0,
                last_depth_count = 0;
@@ -3013,6 +3078,16 @@ class BloomCheckServiceImpl {
                 : 0;
         uint64_t filter_eval_count_per_s =
             filter_eval_count - last_filter_eval_count;
+        uint64_t interval_filter_pread = 0;
+        uint64_t total_filter_pread = 0;
+        if (filter_block_pread_count_enabled_) {
+          interval_filter_pread =
+              ROCKSDB_NAMESPACE::GetAndResetFilterBlockPreadsForRequest();
+          total_filter_pread =
+              total_filter_block_preads_for_request_.fetch_add(
+                  interval_filter_pread, std::memory_order_relaxed) +
+              interval_filter_pread;
+        }
         uint64_t cq_next_per_s = cq_next - last_cq_next;
         uint64_t cq_read_per_s = cq_read - last_cq_read;
         uint64_t cq_write_per_s = cq_write - last_cq_write;
@@ -3098,10 +3173,18 @@ class BloomCheckServiceImpl {
         {
           std::lock_guard<std::mutex> log_lock(log_mutex_);
           if (!server_stats_enabled_) {
-            std::cerr << "[FILTER_EVAL] filter_eval_count_per_s="
-                      << filter_eval_count_per_s
-                      << " filter_eval_count_total=" << filter_eval_count
-                      << std::endl;
+            if (filter_eval_count_enabled_) {
+              std::cerr << "[FILTER_EVAL] filter_eval_count_per_s="
+                        << filter_eval_count_per_s
+                        << " filter_eval_count_total=" << filter_eval_count
+                        << std::endl;
+            }
+            if (filter_block_pread_count_enabled_) {
+              std::cout << "[FilterCount] interval_filter_pread="
+                        << interval_filter_pread
+                        << " total_filter_pread=" << total_filter_pread
+                        << std::endl;
+            }
             continue;
           }
           std::cerr
@@ -3153,6 +3236,12 @@ class BloomCheckServiceImpl {
                       << " filter_eval_count_total=" << filter_eval_count;
           }
           std::cerr << std::endl;
+          if (filter_block_pread_count_enabled_) {
+            std::cout << "[FilterCount] interval_filter_pread="
+                      << interval_filter_pread
+                      << " total_filter_pread=" << total_filter_pread
+                      << std::endl;
+          }
           std::cerr << "[CQ_FLOW] cq_pop=" << cq_pop_ss.str()
                     << " enq_to_worker=" << enq_ss.str()
                     << " done_by_worker=" << done_ss.str() << std::endl;
@@ -3166,6 +3255,18 @@ class BloomCheckServiceImpl {
     if (stats_thread_.joinable()) {
       stats_thread_.join();
     }
+    if (filter_block_pread_count_enabled_) {
+      const uint64_t residual =
+          ROCKSDB_NAMESPACE::GetAndResetFilterBlockPreadsForRequest();
+      const uint64_t final_total =
+          total_filter_block_preads_for_request_.fetch_add(
+              residual, std::memory_order_relaxed) +
+          residual;
+      std::lock_guard<std::mutex> log_lock(log_mutex_);
+      std::cout << "[FilterCount] final_filter_pread=" << final_total
+                << std::endl;
+    }
+    ROCKSDB_NAMESPACE::SetCountFilterBlockPreadsForRequest(false);
   }
 };
 

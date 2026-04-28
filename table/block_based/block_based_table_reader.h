@@ -55,6 +55,17 @@ struct EnvOptions;
 struct ReadOptions;
 class GetContext;
 
+// Bloomd request-path analysis hooks. Count only actual storage reads of
+// filter-related blocks (filter payload and filter partition index) that occur
+// while a request scope is active. Cache hits, prefetch-buffer hits, and
+// startup/open-time reads are excluded unless they happen inside an active
+// request scope.
+void SetCountFilterBlockPreadsForRequest(bool enabled);
+uint64_t GetAndResetFilterBlockPreadsForRequest();
+void BeginFilterPreadCountForRequest();
+void EndFilterPreadCountForRequest();
+void RecordFilterBlockPreadForRequest(BlockType block_type);
+
 using KVPairBlock = std::vector<std::pair<std::string, std::string>>;
 
 // Reader class for BlockBasedTable format.
