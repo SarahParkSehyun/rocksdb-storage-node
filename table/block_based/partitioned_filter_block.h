@@ -163,6 +163,11 @@ class PartitionedFilterBlockReader
                    GetContext* get_context,
                    BlockCacheLookupContext* lookup_context,
                    const ReadOptions& read_options) override;
+  bool KeyMayMatchAndGetFilterPartitionBlock(
+      const Slice& key, const Slice* const const_ikey_ptr,
+      GetContext* get_context, BlockCacheLookupContext* lookup_context,
+      const ReadOptions& read_options, uint64_t* filter_partition_offset,
+      std::string* filter_partition_contents) override;
   void KeysMayMatch(MultiGetRange* range,
                     BlockCacheLookupContext* lookup_context,
                     const ReadOptions& read_options) override;

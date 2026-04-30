@@ -388,6 +388,62 @@ bool PartitionedFilterBlockReader::KeyMayMatch(
                   read_options, &FullFilterBlockReader::KeyMayMatch);
 }
 
+bool PartitionedFilterBlockReader::KeyMayMatchAndGetFilterPartitionBlock(
+    const Slice& key, const Slice* const const_ikey_ptr,
+    GetContext* get_context, BlockCacheLookupContext* lookup_context,
+    const ReadOptions& read_options, uint64_t* filter_partition_offset,
+    std::string* filter_partition_contents) {
+  assert(const_ikey_ptr != nullptr);
+  if (filter_partition_offset) {
+    *filter_partition_offset = kNotValid;
+  }
+  if (filter_partition_contents) {
+    filter_partition_contents->clear();
+  }
+  if (!whole_key_filtering()) {
+    return true;
+  }
+
+  CachableEntry<Block_kFilterPartitionIndex> filter_block;
+  Status s = GetOrReadFilterBlock(get_context, lookup_context, &filter_block,
+                                  read_options);
+  if (UNLIKELY(!s.ok())) {
+    IGNORE_STATUS_IF_ERROR(s);
+    return true;
+  }
+
+  if (UNLIKELY(filter_block.GetValue()->size() == 0)) {
+    return true;
+  }
+
+  auto filter_handle = GetFilterPartitionHandle(filter_block, *const_ikey_ptr);
+  if (UNLIKELY(filter_handle.size() == 0)) {
+    return false;
+  }
+
+  CachableEntry<ParsedFullFilterBlock> filter_partition_block;
+  s = GetFilterPartitionBlock(nullptr /* prefetch_buffer */, filter_handle,
+                              get_context, lookup_context, read_options,
+                              &filter_partition_block);
+  if (UNLIKELY(!s.ok())) {
+    IGNORE_STATUS_IF_ERROR(s);
+    return true;
+  }
+
+  const Slice& contents = filter_partition_block.GetValue()->ContentSlice();
+  if (filter_partition_offset) {
+    *filter_partition_offset = filter_handle.offset();
+  }
+  if (filter_partition_contents) {
+    filter_partition_contents->assign(contents.data(), contents.size());
+  }
+
+  FullFilterBlockReader filter_partition(table(),
+                                         std::move(filter_partition_block));
+  return filter_partition.KeyMayMatch(key, const_ikey_ptr, get_context,
+                                      lookup_context, read_options);
+}
+
 void PartitionedFilterBlockReader::KeysMayMatch(
     MultiGetRange* range, BlockCacheLookupContext* lookup_context,
     const ReadOptions& read_options) {

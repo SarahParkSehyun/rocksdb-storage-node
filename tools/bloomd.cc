@@ -1,34 +1,31 @@
 // Copyright (c) 2024-present, RocksDB Contributors
 // This source code is licensed under both the GPLv2 and Apache 2.0 License
 
-#include "tools/bloomcheck.grpc.pb.h"
-#include "tools/bloomcheck.pb.h"
-
+#include <grpc/support/log.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
-#include <grpc/support/log.h>
+#include <pthread.h>
+#include <sched.h>
 
-#include <array>
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <chrono>
-#include <condition_variable>
 #include <deque>
 #include <future>
 #include <iomanip>
 #include <iostream>
-#include <list>
 #include <limits>
+#include <list>
 #include <memory>
 #include <mutex>
-#include <pthread.h>
 #include <queue>
-#include <sched.h>
-#include <sstream>
 #include <shared_mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -43,8 +40,10 @@
 #include "rocksdb/table.h"
 #include "table/block_based/block_based_table_reader.h"
 #include "table/get_context.h"
-#include "table/table_reader.h"
 #include "table/table_builder.h"
+#include "table/table_reader.h"
+#include "tools/bloomcheck.grpc.pb.h"
+#include "tools/bloomcheck.pb.h"
 #include "util/cast_util.h"
 
 namespace bloomcheck {
@@ -56,7 +55,8 @@ bool PinCurrentThreadToCpu(int cpu_id) {
   cpu_set_t cpuset;
   CPU_ZERO(&cpuset);
   CPU_SET(cpu_id, &cpuset);
-  return pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0;
+  return pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) ==
+         0;
 }
 
 uint64_t SteadyNowMicros() {
@@ -111,9 +111,7 @@ bool IsOpenFailLogEnabled() {
   return enabled;
 }
 
-bool IsOpenFailCollectionEnabled() {
-  return IsOpenFailLogEnabled();
-}
+bool IsOpenFailCollectionEnabled() { return IsOpenFailLogEnabled(); }
 
 bool IsPathNotFoundOnlyLogEnabled() {
   static const bool enabled = []() {
@@ -133,9 +131,7 @@ struct OpenFailDetail {
 
 thread_local OpenFailDetail g_last_open_fail_detail;
 
-void ResetLastOpenFailDetail() {
-  g_last_open_fail_detail = OpenFailDetail{};
-}
+void ResetLastOpenFailDetail() { g_last_open_fail_detail = OpenFailDetail{}; }
 
 void SetLastOpenFailDetail(const char* stage, const std::string* path,
                            const ROCKSDB_NAMESPACE::Status* st,
@@ -180,16 +176,16 @@ std::string FormatSstList(const Iterable& values) {
 
 // Reason codes for why CheckKeyInSST returned true/false
 enum class CheckReason {
-  OPEN_FAIL,              // GetOrOpen returned nullptr
-  READER_NULL,            // entry->reader is null
-  BB_TABLE_NULL,          // bb_table is null (shouldn't happen)
-  REP_NULL,               // rep is null
-  FILTER_NULL,            // rep->filter is null
+  OPEN_FAIL,                  // GetOrOpen returned nullptr
+  READER_NULL,                // entry->reader is null
+  BB_TABLE_NULL,              // bb_table is null (shouldn't happen)
+  REP_NULL,                   // rep is null
+  FILTER_NULL,                // rep->filter is null
   WHOLE_KEY_FILTERING_FALSE,  // rep->whole_key_filtering is false
-  UCOMP_NULL,             // ucmp is null (shouldn't happen)
-  KEYMAYMATCH_EXCEPTION,  // Exception during KeyMayMatch
-  KEYMAYMATCH_TRUE,       // KeyMayMatch returned true
-  KEYMAYMATCH_FALSE       // KeyMayMatch returned false
+  UCOMP_NULL,                 // ucmp is null (shouldn't happen)
+  KEYMAYMATCH_EXCEPTION,      // Exception during KeyMayMatch
+  KEYMAYMATCH_TRUE,           // KeyMayMatch returned true
+  KEYMAYMATCH_FALSE           // KeyMayMatch returned false
 };
 
 const char* CheckReasonToString(CheckReason reason) {
@@ -236,13 +232,14 @@ struct Stats {
   std::atomic<size_t> reason_keymaymatch_true{0};
   std::atomic<size_t> reason_keymaymatch_false{0};
   std::atomic<size_t> keymaymatch_calls{0};
-  
+
   // Cache statistics
   std::atomic<size_t> cache_hits{0};
   std::atomic<size_t> cache_misses{0};
   std::atomic<size_t> evictions{0};
 
-  // Server stats (BLOOMCHECK_SERVER_STATS=1 only; callers must check before calling)
+  // Server stats (BLOOMCHECK_SERVER_STATS=1 only; callers must check before
+  // calling)
   std::atomic<uint64_t> recv_req_count{0};
   std::atomic<uint64_t> worker_deq_count{0};
   std::atomic<uint64_t> worker_queue_depth_sum{0};
@@ -287,7 +284,9 @@ struct Stats {
 
   static void UpdateMax(std::atomic<uint64_t>& m, uint64_t val) {
     uint64_t cur = m.load(std::memory_order_relaxed);
-    while (val > cur && !m.compare_exchange_weak(cur, val, std::memory_order_relaxed)) {}
+    while (val > cur &&
+           !m.compare_exchange_weak(cur, val, std::memory_order_relaxed)) {
+    }
   }
 
   void AddRecvReq() { recv_req_count.fetch_add(1, std::memory_order_relaxed); }
@@ -306,13 +305,21 @@ struct Stats {
     writeq_count.fetch_add(1, std::memory_order_relaxed);
     UpdateMax(writeq_max, len);
   }
-  void AddWriteDone() { write_done_count.fetch_add(1, std::memory_order_relaxed); }
-  void AddFinishOrClose() { finish_or_close_count.fetch_add(1, std::memory_order_relaxed); }
-  void AddReadReqEvent() { read_req_event_count.fetch_add(1, std::memory_order_relaxed); }
+  void AddWriteDone() {
+    write_done_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  void AddFinishOrClose() {
+    finish_or_close_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  void AddReadReqEvent() {
+    read_req_event_count.fetch_add(1, std::memory_order_relaxed);
+  }
   void AddWriteRespEvent() {
     write_resp_event_count.fetch_add(1, std::memory_order_relaxed);
   }
-  void AddPendingWorkItems(uint64_t depth) { UpdateMax(pending_work_items_max, depth); }
+  void AddPendingWorkItems(uint64_t depth) {
+    UpdateMax(pending_work_items_max, depth);
+  }
   void AddEntryRwLockWaitUs(uint64_t us) {
     total_entry_rw_lock_wait_us.fetch_add(us, std::memory_order_relaxed);
     entry_rw_lock_wait_samples.fetch_add(1, std::memory_order_relaxed);
@@ -324,8 +331,12 @@ struct Stats {
   void AddLastAccessUpdate() {
     last_access_update_count.fetch_add(1, std::memory_order_relaxed);
   }
-  void AddCacheHit() { cache_hit_count.fetch_add(1, std::memory_order_relaxed); }
-  void AddCacheMiss() { cache_miss_count.fetch_add(1, std::memory_order_relaxed); }
+  void AddCacheHit() {
+    cache_hit_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  void AddCacheMiss() {
+    cache_miss_count.fetch_add(1, std::memory_order_relaxed);
+  }
   void AddCacheLookupHit() {
     cache_lookup_hit_count.fetch_add(1, std::memory_order_relaxed);
   }
@@ -351,9 +362,15 @@ struct Stats {
     dequeue_lock_sample_count.fetch_add(1, std::memory_order_relaxed);
   }
   void AddCqNext() { cq_next_count.fetch_add(1, std::memory_order_relaxed); }
-  void AddCqEventRead() { cq_read_events.fetch_add(1, std::memory_order_relaxed); }
-  void AddCqEventWrite() { cq_write_events.fetch_add(1, std::memory_order_relaxed); }
-  void AddCqEventFinish() { cq_finish_events.fetch_add(1, std::memory_order_relaxed); }
+  void AddCqEventRead() {
+    cq_read_events.fetch_add(1, std::memory_order_relaxed);
+  }
+  void AddCqEventWrite() {
+    cq_write_events.fetch_add(1, std::memory_order_relaxed);
+  }
+  void AddCqEventFinish() {
+    cq_finish_events.fetch_add(1, std::memory_order_relaxed);
+  }
   void AddCqPop(size_t cq_idx) {
     if (cq_idx < kMaxTrackedCqs) {
       cq_pop_by_idx[cq_idx].fetch_add(1, std::memory_order_relaxed);
@@ -408,21 +425,24 @@ struct Stats {
     //     break;
     // }
   }
-  
-  void PrintStats(std::mutex& log_mutex, size_t total_opens, size_t active_rpcs) {
+
+  void PrintStats(std::mutex& log_mutex, size_t total_opens,
+                  size_t active_rpcs) {
     std::lock_guard<std::mutex> lock(log_mutex);
-    
+
     size_t hits = cache_hits.load();
     size_t misses = cache_misses.load();
     size_t total_accesses = hits + misses;
-    double cache_hit_rate = total_accesses > 0 ? (double)hits / total_accesses : 0.0;
+    double cache_hit_rate =
+        total_accesses > 0 ? (double)hits / total_accesses : 0.0;
     size_t evictions_count = evictions.load();
-    
-    // std::cerr << "[STATS] cache_hit_rate: " << cache_hit_rate 
+
+    // std::cerr << "[STATS] cache_hit_rate: " << cache_hit_rate
     //           << " (" << hits << "/" << total_accesses << ")" << std::endl;
     // std::cerr << "[STATS] evictions: " << evictions_count << std::endl;
-    // std::cerr << "[STATS] NewTableReader(open): " << total_opens << std::endl;
-    // std::cerr << "[STATS] active_rpcs: " << active_rpcs << std::endl;
+    // std::cerr << "[STATS] NewTableReader(open): " << total_opens <<
+    // std::endl; std::cerr << "[STATS] active_rpcs: " << active_rpcs <<
+    // std::endl;
   }
 };
 
@@ -431,7 +451,7 @@ struct Stats {
 static std::string MakeSstPath(uint64_t file_number) {
   const char* storage_path_env = std::getenv("BLOOMCHECK_STORAGE_PATH");
   std::string base_path;
-  
+
   if (storage_path_env && strlen(storage_path_env) > 0) {
     base_path = storage_path_env;
     if (base_path.back() != '/') {
@@ -440,19 +460,19 @@ static std::string MakeSstPath(uint64_t file_number) {
   } else {
     base_path = "/mnt/kvafa/db_bench_1TB_re_gold/";
   }
-  
+
   // First try: plain format (e.g., "16916.sst")
   return base_path + std::to_string(file_number) + ".sst";
 }
 
 // Try to open SST file with fallback to zero-padded format
-static std::string TryOpenSstPath(uint64_t file_number, 
+static std::string TryOpenSstPath(uint64_t file_number,
                                   ROCKSDB_NAMESPACE::FileSystem* fs,
                                   const ROCKSDB_NAMESPACE::FileOptions& fopts,
                                   uint64_t* file_size) {
   std::string base_path;
   const char* storage_path_env = std::getenv("BLOOMCHECK_STORAGE_PATH");
-  
+
   if (storage_path_env && strlen(storage_path_env) > 0) {
     base_path = storage_path_env;
     if (base_path.back() != '/') {
@@ -461,37 +481,43 @@ static std::string TryOpenSstPath(uint64_t file_number,
   } else {
     base_path = "/mnt/kvafa/db_bench_1TB_re_gold/";
   }
-  
+
   // Try 1: plain format (e.g., "16916.sst")
   std::string path1 = base_path + std::to_string(file_number) + ".sst";
-  ROCKSDB_NAMESPACE::IOStatus s1 = fs->GetFileSize(path1, fopts.io_options, file_size, nullptr);
+  ROCKSDB_NAMESPACE::IOStatus s1 =
+      fs->GetFileSize(path1, fopts.io_options, file_size, nullptr);
   if (s1.ok()) {
     return path1;
   }
-  
+
   // Try 2: 6-digit zero-padded format (e.g., "016916.sst")
   char padded[32];
-  snprintf(padded, sizeof(padded), "%06llu", static_cast<unsigned long long>(file_number));
+  snprintf(padded, sizeof(padded), "%06llu",
+           static_cast<unsigned long long>(file_number));
   std::string path2 = base_path + std::string(padded) + ".sst";
-  ROCKSDB_NAMESPACE::IOStatus s2 = fs->GetFileSize(path2, fopts.io_options, file_size, nullptr);
+  ROCKSDB_NAMESPACE::IOStatus s2 =
+      fs->GetFileSize(path2, fopts.io_options, file_size, nullptr);
   if (s2.ok()) {
     return path2;
   }
-  
+
   // Try 3: 7-digit zero-padded format (e.g., "0016916.sst")
-  snprintf(padded, sizeof(padded), "%07llu", static_cast<unsigned long long>(file_number));
+  snprintf(padded, sizeof(padded), "%07llu",
+           static_cast<unsigned long long>(file_number));
   std::string path3 = base_path + std::string(padded) + ".sst";
-  ROCKSDB_NAMESPACE::IOStatus s3 = fs->GetFileSize(path3, fopts.io_options, file_size, nullptr);
+  ROCKSDB_NAMESPACE::IOStatus s3 =
+      fs->GetFileSize(path3, fopts.io_options, file_size, nullptr);
   if (s3.ok()) {
     return path3;
   }
-  
+
   // All attempts failed, return first path (caller will handle error)
   return path1;
 }
 
 // LRU cache for TableReader (keyed by file_number)
-// Uses sharding to reduce lock contention: file_number is hashed to select a shard
+// Uses sharding to reduce lock contention: file_number is hashed to select a
+// shard
 class TableReaderCache {
  public:
   struct CacheEntry {
@@ -500,7 +526,7 @@ class TableReaderCache {
     ROCKSDB_NAMESPACE::ImmutableOptions ioptions;
     std::atomic<uint64_t> last_access_us{0};
     mutable std::shared_mutex rw_mutex;
-    
+
     explicit CacheEntry(const ROCKSDB_NAMESPACE::Options& opt)
         : internal_comparator(opt.comparator),
           ioptions(opt),
@@ -514,7 +540,7 @@ class TableReaderCache {
   struct InflightOpen {
     std::promise<std::shared_ptr<CacheEntry>> promise;
     std::shared_future<std::shared_ptr<CacheEntry>> future;
-    
+
     InflightOpen() : promise(), future(promise.get_future().share()) {}
   };
 
@@ -526,7 +552,7 @@ class TableReaderCache {
     std::list<uint64_t> lru_list;  // Front = MRU, Back = LRU
     std::unordered_map<uint64_t, std::list<uint64_t>::iterator> lru_map;
     size_t max_size;
-    
+
     Shard(size_t max_size_per_shard) : max_size(max_size_per_shard) {}
   };
 
@@ -546,13 +572,13 @@ class TableReaderCache {
       shards_[i] = std::make_unique<Shard>(max_size_per_shard);
     }
   }
-  
+
   // Hash function to select shard from file_number
   static size_t GetShardIndex(uint64_t file_number) {
     // Simple hash: mix bits for better distribution
     return std::hash<uint64_t>{}(file_number) & (N_SHARDS - 1);
   }
-  
+
   Shard& GetShard(uint64_t file_number) {
     return *shards_[GetShardIndex(file_number)];
   }
@@ -573,22 +599,24 @@ class TableReaderCache {
 
   bool entry_lock_enabled() const { return entry_lock_enabled_; }
   uint32_t lru_update_every() const { return lru_update_every_; }
-  uint32_t last_access_update_every() const { return last_access_update_every_; }
+  uint32_t last_access_update_every() const {
+    return last_access_update_every_;
+  }
   bool ShouldUpdateLastAccessOnCheck() const {
     return ShouldUpdateLastAccessOnCheckImpl();
   }
 
   // Get or create TableReader for SST file (by file_number)
   // Returns nullptr on error (safe to treat as may_match=true)
-  std::shared_ptr<CacheEntry> GetOrOpen(uint64_t file_number,
-                                        const ROCKSDB_NAMESPACE::Options& options,
-                                        Stats* stats, std::mutex* log_mutex, std::atomic<size_t>* open_count) {
+  std::shared_ptr<CacheEntry> GetOrOpen(
+      uint64_t file_number, const ROCKSDB_NAMESPACE::Options& options,
+      Stats* stats, std::mutex* log_mutex, std::atomic<size_t>* open_count) {
     Shard& shard = GetShard(file_number);
     ResetLastOpenFailDetail();
     auto get_or_open_start = std::chrono::steady_clock::now();
-    bool sample_get_or_open = stats && server_stats_enabled_ && ShouldSampleGetOrOpen();
-    auto log_open_fallback = [&](const char* stage,
-                                 const std::string* path,
+    bool sample_get_or_open =
+        stats && server_stats_enabled_ && ShouldSampleGetOrOpen();
+    auto log_open_fallback = [&](const char* stage, const std::string* path,
                                  const ROCKSDB_NAMESPACE::Status* st,
                                  const ROCKSDB_NAMESPACE::IOStatus* ios) {
       const bool sst_reason_log_enabled = IsSstReasonLogEnabled();
@@ -612,8 +640,7 @@ class TableReaderCache {
       std::lock_guard<std::mutex> lg(*log_mutex);
       std::cerr << (open_fail_log_enabled ? "[OPEN_FAIL][get_or_open] stage="
                                           : "[SST_REASON][get_or_open] stage=")
-                << stage
-                << " file_number=" << file_number;
+                << stage << " file_number=" << file_number;
       if (path) {
         std::cerr << " path=" << *path;
       }
@@ -625,11 +652,13 @@ class TableReaderCache {
       }
       std::cerr << std::endl;
     };
-    auto record_get_or_open_duration = [get_or_open_start, sample_get_or_open, stats]() {
+    auto record_get_or_open_duration = [get_or_open_start, sample_get_or_open,
+                                        stats]() {
       if (sample_get_or_open && stats) {
         uint64_t us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - get_or_open_start).count());
+                std::chrono::steady_clock::now() - get_or_open_start)
+                .count());
         stats->AddGetOrOpenUs(us);
       }
     };
@@ -638,7 +667,7 @@ class TableReaderCache {
     std::shared_ptr<CacheEntry> cached_entry;
     {
       std::shared_lock<std::shared_mutex> lock(shard.mutex);
-      
+
       // Check cache first (by file_number)
       auto it = shard.cache.find(file_number);
       if (it != shard.cache.end()) {
@@ -647,7 +676,7 @@ class TableReaderCache {
         // if (stats) stats->cache_hits++;
       }
     }
-    
+
     // Update LRU outside shared_lock (requires unique_lock)
     if (cached_entry) {
       if (!ShouldUpdateLruOnHit()) {
@@ -655,9 +684,11 @@ class TableReaderCache {
         record_get_or_open_duration();
         return cached_entry;
       }
-      bool sample_lru_lock_wait = server_stats_enabled_ && stats && ShouldSampleLockWait();
-      auto lock_wait_start = sample_lru_lock_wait ? std::chrono::steady_clock::now()
-                                                  : std::chrono::steady_clock::time_point{};
+      bool sample_lru_lock_wait =
+          server_stats_enabled_ && stats && ShouldSampleLockWait();
+      auto lock_wait_start = sample_lru_lock_wait
+                                 ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
       std::unique_lock<std::shared_mutex> lock(shard.mutex);
       if (sample_lru_lock_wait) {
         uint64_t wait_us = static_cast<uint64_t>(
@@ -677,16 +708,18 @@ class TableReaderCache {
 
     // Cache miss - need to open file
     // if (stats) stats->cache_misses++;
-    
+
     // Phase A (continued): Check inflight and register if needed
     std::shared_ptr<InflightOpen> inflight;
     bool is_waiting = false;
     {
-      bool sample_lru_lock_wait = server_stats_enabled_ && stats && ShouldSampleLockWait();
-      auto lock_wait_start = sample_lru_lock_wait ? std::chrono::steady_clock::now()
-                                                  : std::chrono::steady_clock::time_point{};
+      bool sample_lru_lock_wait =
+          server_stats_enabled_ && stats && ShouldSampleLockWait();
+      auto lock_wait_start = sample_lru_lock_wait
+                                 ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
       std::unique_lock<std::shared_mutex> lock(shard.mutex);
-      
+
       // Double-check cache (might have been inserted by another thread)
       auto it = shard.cache.find(file_number);
       if (it != shard.cache.end()) {
@@ -713,7 +746,7 @@ class TableReaderCache {
         // We are the first thread to open this file - register inflight
         inflight = std::make_shared<InflightOpen>();
         shard.inflight[file_number] = inflight;
-        
+
         // If cache is full, evict LRU entry before opening
         if (shard.cache.size() >= shard.max_size) {
           EvictLRUOne(shard, stats);
@@ -721,7 +754,7 @@ class TableReaderCache {
       }
       // Lock released here - proceed to Phase B
     }
-    
+
     // If another thread is opening, wait for result
     if (is_waiting && inflight) {
       try {
@@ -743,27 +776,34 @@ class TableReaderCache {
 
     // Open using BlockBasedTable directly
     ROCKSDB_NAMESPACE::EnvOptions env_options;
+    env_options.use_direct_reads = true;
     ROCKSDB_NAMESPACE::ReadOptions read_options;
-    read_options.read_tier = ROCKSDB_NAMESPACE::kReadAllTier;  // Allow file reads
+    read_options.read_tier =
+        ROCKSDB_NAMESPACE::kReadAllTier;  // Allow file reads
 
     std::unique_ptr<ROCKSDB_NAMESPACE::FSRandomAccessFile> file;
     const auto& fs = options.env->GetFileSystem();
     ROCKSDB_NAMESPACE::FileOptions fopts(env_options);
-    
+
     // Try to find actual path with fallback (plain -> 6-digit -> 7-digit)
-    // TryOpenSstPath already calls GetFileSize, so file_size is set if successful
+    // TryOpenSstPath already calls GetFileSize, so file_size is set if
+    // successful
     uint64_t file_size = 0;
-    std::string actual_path = TryOpenSstPath(file_number, fs.get(), fopts, &file_size);
-    
+    std::string actual_path =
+        TryOpenSstPath(file_number, fs.get(), fopts, &file_size);
+
     // Debug output for first 20 cache misses
     size_t open_id = (open_count ? (*open_count)++ : 0);
     if (open_id <= 20) {
       // std::lock_guard<std::mutex> log_lock(*log_mutex);
-      // std::cerr << "[DBG] file_number=" << file_number << ", actual_path(len=" << actual_path.size() << "): \"" << actual_path << "\"\n";
+      // std::cerr << "[DBG] file_number=" << file_number << ",
+      // actual_path(len=" << actual_path.size() << "): \"" << actual_path <<
+      // "\"\n";
     }
-    
+
     // Check if TryOpenSstPath found a valid file (file_size > 0 means success)
-    // Note: TryOpenSstPath already called GetFileSize, so we check file_size here
+    // Note: TryOpenSstPath already called GetFileSize, so we check file_size
+    // here
     if (actual_path.empty() || file_size == 0) {
       // TryOpenSstPath failed to find any matching file
       if (stats && IsOpenFailCollectionEnabled()) {
@@ -772,10 +812,12 @@ class TableReaderCache {
       // 샘플 로그 (초기 50회 + 매 1000회) - 락 밖에서
       // if (open_id <= 50 || open_id % 1000 == 0) {
       //   std::lock_guard<std::mutex> log_lock(*log_mutex);
-      //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
-      //             << " FAIL: TryOpenSstPath failed to find file" << std::endl;
+      //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id
+      //             << " FAIL: TryOpenSstPath failed to find file" <<
+      //             std::endl;
       //   std::cerr << "[SAMPLE]   file_number: " << file_number << std::endl;
-      //   std::cerr << "[SAMPLE]   actual_path: " << (actual_path.empty() ? "(empty)" : actual_path) << std::endl;
+      //   std::cerr << "[SAMPLE]   actual_path: " << (actual_path.empty() ?
+      //   "(empty)" : actual_path) << std::endl;
       // }
       // Clean up inflight entry on failure
       {
@@ -790,7 +832,8 @@ class TableReaderCache {
       return nullptr;
     }
 
-    ROCKSDB_NAMESPACE::IOStatus s = fs->NewRandomAccessFile(actual_path, fopts, &file, nullptr);
+    ROCKSDB_NAMESPACE::IOStatus s =
+        fs->NewRandomAccessFile(actual_path, fopts, &file, nullptr);
     if (!s.ok()) {
       if (stats && IsOpenFailCollectionEnabled()) {
         stats->open_fail_newfile.fetch_add(1, std::memory_order_relaxed);
@@ -798,7 +841,7 @@ class TableReaderCache {
       // 샘플 로그 - 락 밖에서
       // if (open_id <= 50 || open_id % 1000 == 0) {
       //   std::lock_guard<std::mutex> log_lock(*log_mutex);
-      //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
+      //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id
       //             << " FAIL: NewRandomAccessFile failed" << std::endl;
       //   std::cerr << "[SAMPLE]   file_number: " << file_number << std::endl;
       //   std::cerr << "[SAMPLE]   actual_path: " << actual_path << std::endl;
@@ -812,18 +855,21 @@ class TableReaderCache {
         inflight->promise.set_value(nullptr);
       }
       if (stats) stats->AddCacheMiss();
-      SetLastOpenFailDetail("new_random_access_file_fail", &actual_path, nullptr, &s);
-      log_open_fallback("new_random_access_file_fail", &actual_path, nullptr, &s);
+      SetLastOpenFailDetail("new_random_access_file_fail", &actual_path,
+                            nullptr, &s);
+      log_open_fallback("new_random_access_file_fail", &actual_path, nullptr,
+                        &s);
       record_get_or_open_duration();
       return nullptr;
     }
 
     std::unique_ptr<ROCKSDB_NAMESPACE::RandomAccessFileReader> file_reader(
-        new ROCKSDB_NAMESPACE::RandomAccessFileReader(std::move(file), actual_path));
+        new ROCKSDB_NAMESPACE::RandomAccessFileReader(std::move(file),
+                                                      actual_path));
 
     // Use entry->ioptions and entry->internal_comparator to ensure lifetime
     const auto& ioptions = entry->ioptions;
-    
+
     ROCKSDB_NAMESPACE::TableReaderOptions t_opt(
         ioptions, options.prefix_extractor,
         ROCKSDB_NAMESPACE::UnownedPtr<ROCKSDB_NAMESPACE::CompressionManager>(
@@ -840,10 +886,11 @@ class TableReaderCache {
     t_opt.largest_seqno = ROCKSDB_NAMESPACE::kMaxSequenceNumber;
 
     std::unique_ptr<ROCKSDB_NAMESPACE::TableReader> table_reader;
-    ROCKSDB_NAMESPACE::Status table_status = options.table_factory->NewTableReader(
-        read_options, t_opt, std::move(file_reader), file_size, &table_reader,
-        false /* prefetch_index_and_filter_in_cache */);
-    
+    ROCKSDB_NAMESPACE::Status table_status =
+        options.table_factory->NewTableReader(
+            read_options, t_opt, std::move(file_reader), file_size,
+            &table_reader, false /* prefetch_index_and_filter_in_cache */);
+
     if (!table_status.ok() || !table_reader) {
       if (stats && IsOpenFailCollectionEnabled()) {
         stats->open_fail_newreader.fetch_add(1, std::memory_order_relaxed);
@@ -851,12 +898,13 @@ class TableReaderCache {
       // 샘플 로그 - 락 밖에서
       // if (open_id <= 50 || open_id % 1000 == 0) {
       //   std::lock_guard<std::mutex> log_lock(*log_mutex);
-      //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
+      //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id
       //             << " FAIL: NewTableReader failed" << std::endl;
       //   std::cerr << "[SAMPLE]   file_number: " << file_number << std::endl;
       //   std::cerr << "[SAMPLE]   actual_path: " << actual_path << std::endl;
       //   std::cerr << "[SAMPLE]   file_size: " << file_size << std::endl;
-      //   std::cerr << "[SAMPLE]   status: " << table_status.ToString() << std::endl;
+      //   std::cerr << "[SAMPLE]   status: " << table_status.ToString() <<
+      //   std::endl;
       // }
       // Clean up inflight entry on failure
       {
@@ -865,8 +913,10 @@ class TableReaderCache {
         inflight->promise.set_value(nullptr);
       }
       if (stats) stats->AddCacheMiss();
-      SetLastOpenFailDetail("new_table_reader_fail", &actual_path, &table_status, nullptr);
-      log_open_fallback("new_table_reader_fail", &actual_path, &table_status, nullptr);
+      SetLastOpenFailDetail("new_table_reader_fail", &actual_path,
+                            &table_status, nullptr);
+      log_open_fallback("new_table_reader_fail", &actual_path, &table_status,
+                        nullptr);
       record_get_or_open_duration();
       return nullptr;
     }
@@ -874,32 +924,38 @@ class TableReaderCache {
     // 샘플 로그 (성공한 경우) 및 table properties 로그
     // if (open_id <= 5 || open_id % 1000 == 0) {
     //   std::lock_guard<std::mutex> log_lock(*log_mutex);
-    //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id 
-    //             << " SUCCESS file_number=" << file_number 
+    //   std::cerr << "[SAMPLE] GetOrOpen #" << open_id
+    //             << " SUCCESS file_number=" << file_number
     //             << " path=" << actual_path << std::endl;
-    //   
+    //
     //   // Table properties 로그
     //   auto props = table_reader->GetTableProperties();
     //   if (props) {
-    //     std::cerr << "[SAMPLE]   table_properties.filter_policy_name: " << props->filter_policy_name << std::endl;
+    //     std::cerr << "[SAMPLE]   table_properties.filter_policy_name: " <<
+    //     props->filter_policy_name << std::endl;
     //   } else {
     //     std::cerr << "[SAMPLE]   table_properties: null" << std::endl;
     //   }
-    //   
+    //
     //   // BlockBasedTable::Rep 정보 로그
     //   ROCKSDB_NAMESPACE::BlockBasedTable* bb_table =
     //       static_cast<ROCKSDB_NAMESPACE::BlockBasedTable*>(table_reader.get());
     //   if (bb_table) {
-    //     const ROCKSDB_NAMESPACE::BlockBasedTable::Rep* rep = bb_table->get_rep();
-    //     if (rep) {
-    //       std::cerr << "[SAMPLE]   rep->filter_policy: " << (rep->table_options.filter_policy ? rep->table_options.filter_policy.get() : nullptr) << std::endl;
-    //       if (rep->table_options.filter_policy) {
-    //         std::cerr << "[SAMPLE]   rep->filter_policy->Name(): " << rep->table_options.filter_policy->Name() << std::endl;
+    //     const ROCKSDB_NAMESPACE::BlockBasedTable::Rep* rep =
+    //     bb_table->get_rep(); if (rep) {
+    //       std::cerr << "[SAMPLE]   rep->filter_policy: " <<
+    //       (rep->table_options.filter_policy ?
+    //       rep->table_options.filter_policy.get() : nullptr) << std::endl; if
+    //       (rep->table_options.filter_policy) {
+    //         std::cerr << "[SAMPLE]   rep->filter_policy->Name(): " <<
+    //         rep->table_options.filter_policy->Name() << std::endl;
     //       }
-    //       std::cerr << "[SAMPLE]   rep->filter: " << (rep->filter ? rep->filter.get() : nullptr) << std::endl;
-    //       std::cerr << "[SAMPLE]   rep->whole_key_filtering: " << (rep->whole_key_filtering ? "true" : "false") << std::endl;
-    //       std::cerr << "[SAMPLE]   rep->index_type: " << static_cast<int>(rep->index_type) << std::endl;
-    //       
+    //       std::cerr << "[SAMPLE]   rep->filter: " << (rep->filter ?
+    //       rep->filter.get() : nullptr) << std::endl; std::cerr << "[SAMPLE]
+    //       rep->whole_key_filtering: " << (rep->whole_key_filtering ? "true" :
+    //       "false") << std::endl; std::cerr << "[SAMPLE]   rep->index_type: "
+    //       << static_cast<int>(rep->index_type) << std::endl;
+    //
     //       // 실제로 열린 파일의 첫 번째 키 확인 (초기 5회만)
     //       if (open_id <= 5) {
     //         ROCKSDB_NAMESPACE::ReadOptions ro;
@@ -909,10 +965,13 @@ class TableReaderCache {
     //         iter->SeekToFirst();
     //         if (iter->Valid()) {
     //           ROCKSDB_NAMESPACE::Slice first_key = iter->key();
-    //           std::cerr << "[SAMPLE]   First key in file (hex): " << first_key.ToString(true) << std::endl;
+    //           std::cerr << "[SAMPLE]   First key in file (hex): " <<
+    //           first_key.ToString(true) << std::endl;
     //           ROCKSDB_NAMESPACE::ParsedInternalKey parsed;
-    //           if (ROCKSDB_NAMESPACE::ParseInternalKey(first_key, &parsed, false).ok()) {
-    //             std::cerr << "[SAMPLE]   First user_key (hex): " << parsed.user_key.ToString(true) << std::endl;
+    //           if (ROCKSDB_NAMESPACE::ParseInternalKey(first_key, &parsed,
+    //           false).ok()) {
+    //             std::cerr << "[SAMPLE]   First user_key (hex): " <<
+    //             parsed.user_key.ToString(true) << std::endl;
     //           }
     //         }
     //       }
@@ -924,12 +983,14 @@ class TableReaderCache {
 
     entry->reader = std::move(table_reader);
     std::shared_ptr<CacheEntry> entry_ptr = std::move(entry);
-    
+
     // Phase C: Insert into cache under lock (short duration)
     {
-      bool sample_lru_lock_wait = server_stats_enabled_ && stats && ShouldSampleLockWait();
-      auto lock_wait_start = sample_lru_lock_wait ? std::chrono::steady_clock::now()
-                                                  : std::chrono::steady_clock::time_point{};
+      bool sample_lru_lock_wait =
+          server_stats_enabled_ && stats && ShouldSampleLockWait();
+      auto lock_wait_start = sample_lru_lock_wait
+                                 ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
       std::unique_lock<std::shared_mutex> lock(shard.mutex);
       if (sample_lru_lock_wait) {
         uint64_t wait_us = static_cast<uint64_t>(
@@ -938,8 +999,9 @@ class TableReaderCache {
                 .count());
         stats->AddShardLruLockWaitUs(wait_us);
       }
-      
-      // Double-check cache (might have been inserted by another thread during Phase B)
+
+      // Double-check cache (might have been inserted by another thread during
+      // Phase B)
       auto it = shard.cache.find(file_number);
       if (it != shard.cache.end()) {
         // Another thread already inserted - use existing entry
@@ -951,8 +1013,9 @@ class TableReaderCache {
         return it->second;
       }
 
-      // Enforce cap at insert time: other threads may have inserted while we opened,
-      // so we can exceed max_size_per_shard if we only evicted in Phase A.
+      // Enforce cap at insert time: other threads may have inserted while we
+      // opened, so we can exceed max_size_per_shard if we only evicted in Phase
+      // A.
       while (shard.cache.size() >= shard.max_size) {
         EvictLRUOne(shard, stats);
       }
@@ -965,7 +1028,7 @@ class TableReaderCache {
       shard.inflight.erase(file_number);
       inflight->promise.set_value(entry_ptr);
     }
-    
+
     return entry_ptr;
   }
 
@@ -993,7 +1056,8 @@ class TableReaderCache {
     if (end == env || parsed == 0) {
       return 64;
     }
-    if (parsed > static_cast<unsigned long>(std::numeric_limits<uint32_t>::max())) {
+    if (parsed >
+        static_cast<unsigned long>(std::numeric_limits<uint32_t>::max())) {
       return std::numeric_limits<uint32_t>::max();
     }
     return static_cast<uint32_t>(parsed);
@@ -1009,7 +1073,8 @@ class TableReaderCache {
     if (end == env || parsed == 0) {
       return 256;
     }
-    if (parsed > static_cast<unsigned long>(std::numeric_limits<uint32_t>::max())) {
+    if (parsed >
+        static_cast<unsigned long>(std::numeric_limits<uint32_t>::max())) {
       return std::numeric_limits<uint32_t>::max();
     }
     return static_cast<uint32_t>(parsed);
@@ -1039,7 +1104,8 @@ class TableReaderCache {
     auto lru_it = shard.lru_map.find(file_number);
     if (lru_it != shard.lru_map.end()) {
       // Already in LRU list - move to front
-      shard.lru_list.splice(shard.lru_list.begin(), shard.lru_list, lru_it->second);
+      shard.lru_list.splice(shard.lru_list.begin(), shard.lru_list,
+                            lru_it->second);
       // Iterator is still valid, no need to update lru_map
     } else {
       // Not in LRU list - add to front
@@ -1047,19 +1113,19 @@ class TableReaderCache {
       shard.lru_map[file_number] = shard.lru_list.begin();
     }
   }
-  
+
   // Evict one LRU entry (O(1) operation)
   // Requires: caller must hold unique_lock on shard.mutex
   // Note: Removing from cache doesn't immediately delete CacheEntry because
   // shared_ptr ensures existing references remain valid until released
   void EvictLRUOne(Shard& shard, Stats* stats) {
     if (shard.lru_list.empty()) return;
-    
+
     // Back of list is LRU
     uint64_t lru_file_number = shard.lru_list.back();
     shard.lru_list.pop_back();
     shard.lru_map.erase(lru_file_number);
-    
+
     // Remove from cache
     // Note: shared_ptr ensures existing references remain valid until released
     auto cache_it = shard.cache.find(lru_file_number);
@@ -1109,16 +1175,18 @@ class PerCQWorkerQueue {
     size_t active_count;
     uint64_t accept_wait_us;
     std::chrono::steady_clock::time_point enqueue_ts;
-    
-    WorkItem(CheckCallData* cd, const BatchRequest& req,
-             size_t id, size_t active, uint64_t accept_wait,
+
+    WorkItem(CheckCallData* cd, const BatchRequest& req, size_t id,
+             size_t active, uint64_t accept_wait,
              std::chrono::steady_clock::time_point enqueue_time)
         : kind(Kind::kUnaryCheck),
           call_data(cd),
           stream_call_data(nullptr),
           request(req),
           stream_request_id(0),
-          req_id(id), active_count(active), accept_wait_us(accept_wait),
+          req_id(id),
+          active_count(active),
+          accept_wait_us(accept_wait),
           enqueue_ts(enqueue_time) {}
 
     WorkItem(StreamCallData* stream_cd, uint64_t request_id,
@@ -1135,53 +1203,60 @@ class PerCQWorkerQueue {
           accept_wait_us(0),
           enqueue_ts(enqueue_time) {}
   };
-  
-  PerCQWorkerQueue(size_t cq_idx, size_t num_workers, Stats* stats, bool server_stats_enabled)
-      : cq_idx_(cq_idx), num_workers_(num_workers), stats_(stats), server_stats_enabled_(server_stats_enabled),
+
+  PerCQWorkerQueue(size_t cq_idx, size_t num_workers, Stats* stats,
+                   bool server_stats_enabled)
+      : cq_idx_(cq_idx),
+        num_workers_(num_workers),
+        stats_(stats),
+        server_stats_enabled_(server_stats_enabled),
         shutdown_(false) {
     for (size_t i = 0; i < num_workers_; i++) {
       workers_.emplace_back([this]() { WorkerLoop(); });
     }
   }
-  
-  ~PerCQWorkerQueue() {
-    Shutdown();
-  }
-  
+
+  ~PerCQWorkerQueue() { Shutdown(); }
+
   void Enqueue(WorkItem item) {
     if (stats_) stats_->AddEnqToWorker(cq_idx_);
     bool sample = server_stats_enabled_ && stats_ && ShouldSampleEnqueueLock();
-    auto t0 = sample ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto t0 = sample ? std::chrono::steady_clock::now()
+                     : std::chrono::steady_clock::time_point{};
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
-      auto t1 = sample ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+      auto t1 = sample ? std::chrono::steady_clock::now()
+                       : std::chrono::steady_clock::time_point{};
       work_queue_.push(std::move(item));
-      auto t2 = sample ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+      auto t2 = sample ? std::chrono::steady_clock::now()
+                       : std::chrono::steady_clock::time_point{};
       if (sample && stats_) {
         uint64_t wait_us = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                .count());
         uint64_t hold_us = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count());
+            std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1)
+                .count());
         stats_->AddEnqueueLockUs(wait_us, hold_us);
       }
     }
     queue_cv_.notify_one();
   }
-  
+
   void Shutdown() {
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
       shutdown_ = true;
     }
     queue_cv_.notify_all();
-    
+
     for (auto& worker : workers_) {
       if (worker.joinable()) {
         worker.join();
       }
     }
   }
-  
+
  private:
   void WorkerLoop();
 
@@ -1234,26 +1309,39 @@ class CheckCallData : public CallDataBase {
     uint64_t rpc_e2e_us = 0;
   };
 
-  CheckCallData(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* cq,
-                TableReaderCache* cache, ROCKSDB_NAMESPACE::Options* rocksdb_options,
-                Stats* stats, std::mutex* log_mutex, std::atomic<size_t>* open_count,
-                std::atomic<size_t>* active_rpc_count, std::atomic<size_t>* total_rpc_count,
+  CheckCallData(BloomCheck::AsyncService* service,
+                grpc::ServerCompletionQueue* cq, TableReaderCache* cache,
+                ROCKSDB_NAMESPACE::Options* rocksdb_options, Stats* stats,
+                std::mutex* log_mutex, std::atomic<size_t>* open_count,
+                std::atomic<size_t>* active_rpc_count,
+                std::atomic<size_t>* total_rpc_count,
                 std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock,
                 std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs,
                 PerCQWorkerQueue* worker_queue, bool server_stats_enabled)
-      : service_(service), cq_(cq), cache_(cache), rocksdb_options_(rocksdb_options),
-        stats_(stats), log_mutex_(log_mutex), open_count_(open_count),
-        active_rpc_count_(active_rpc_count), total_rpc_count_(total_rpc_count),
-        clock_(clock), fs_(fs), worker_queue_(worker_queue),
+      : service_(service),
+        cq_(cq),
+        cache_(cache),
+        rocksdb_options_(rocksdb_options),
+        stats_(stats),
+        log_mutex_(log_mutex),
+        open_count_(open_count),
+        active_rpc_count_(active_rpc_count),
+        total_rpc_count_(total_rpc_count),
+        clock_(clock),
+        fs_(fs),
+        worker_queue_(worker_queue),
         server_stats_enabled_(server_stats_enabled),
-        responder_(&ctx_), status_(CREATE) {
+        responder_(&ctx_),
+        status_(CREATE) {
     Proceed(true);
   }
 
   void Proceed(bool ok) override {
     if (server_stats_enabled_ && stats_) {
-      if (status_ == PROCESS) stats_->AddCqEventRead();
-      else if (status_ == FINISH) stats_->AddCqEventFinish();
+      if (status_ == PROCESS)
+        stats_->AddCqEventRead();
+      else if (status_ == FINISH)
+        stats_->AddCqEventFinish();
     }
     if (!ok) {
       if (status_ == FINISH) {
@@ -1265,15 +1353,16 @@ class CheckCallData : public CallDataBase {
       // ACCEPT: 새로운 RPC 요청 수락
       status_ = PROCESS;
       service_->RequestCheck(&ctx_, &request_, &responder_, cq_, cq_, this);
-      
+
       // Active RPC 카운터 증가
       active_count_ = active_rpc_count_->fetch_add(1) + 1;
       total_rpc_count_->fetch_add(1);
       req_id_ = request_count_.fetch_add(1) + 1;
-      
+
       if (req_id_ <= 10 || req_id_ % 100 == 0) {
-        // std::cerr << "[INFO] Check request #" << req_id_ 
-        //           << " received: " << request_.reqs_size() << " key request(s)" << std::flush << std::endl;
+        // std::cerr << "[INFO] Check request #" << req_id_
+        //           << " received: " << request_.reqs_size() << " key
+        //           request(s)" << std::flush << std::endl;
       }
     } else if (status_ == PROCESS) {
       // 실제 요청이 CQ에 도착한 시점부터 서버 경로 타이밍 측정 시작
@@ -1281,20 +1370,23 @@ class CheckCallData : public CallDataBase {
 
       // READ 완료, PROCESS 시작
       // 새로운 CallData를 생성하여 다음 요청을 받을 준비
-      new CheckCallData(service_, cq_, cache_, rocksdb_options_, stats_, log_mutex_,
-                       open_count_, active_rpc_count_, total_rpc_count_, clock_, fs_,
-                       worker_queue_, server_stats_enabled_);
-      
-      // CQ poller thread: Enqueue work to per-CQ worker queue and return immediately
-      // DO NOT perform bloom filter checks here - that happens in worker thread
+      new CheckCallData(service_, cq_, cache_, rocksdb_options_, stats_,
+                        log_mutex_, open_count_, active_rpc_count_,
+                        total_rpc_count_, clock_, fs_, worker_queue_,
+                        server_stats_enabled_);
+
+      // CQ poller thread: Enqueue work to per-CQ worker queue and return
+      // immediately DO NOT perform bloom filter checks here - that happens in
+      // worker thread
       if (server_stats_enabled_) stats_->AddRecvReq();
       auto enqueue_ts = std::chrono::steady_clock::now();
       uint64_t accept_wait_us = static_cast<uint64_t>(
-          std::chrono::duration_cast<std::chrono::microseconds>(
-              enqueue_ts - accept_start_).count());
+          std::chrono::duration_cast<std::chrono::microseconds>(enqueue_ts -
+                                                                accept_start_)
+              .count());
       worker_queue_->Enqueue(PerCQWorkerQueue::WorkItem(
           this, request_, req_id_, active_count_, accept_wait_us, enqueue_ts));
-      
+
       // Return immediately - worker thread will call Finish() directly
       // No need for WORK_DONE state or Alarm
     } else {
@@ -1306,10 +1398,12 @@ class CheckCallData : public CallDataBase {
         std::lock_guard<std::mutex> snapshot_lock(log_snapshot_mutex_);
         snapshot_copy = log_snapshot_;
         if (snapshot_copy.should_log &&
-            finish_call_done_ts_ > std::chrono::steady_clock::time_point::min()) {
+            finish_call_done_ts_ >
+                std::chrono::steady_clock::time_point::min()) {
           snapshot_copy.finish_to_cq_pop_us = static_cast<uint64_t>(
               std::chrono::duration_cast<std::chrono::microseconds>(
-                  finish_handle_start - finish_call_done_ts_).count());
+                  finish_handle_start - finish_call_done_ts_)
+                  .count());
         }
       }
 
@@ -1317,10 +1411,12 @@ class CheckCallData : public CallDataBase {
       if (snapshot_copy.should_log) {
         snapshot_copy.rpc_e2e_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(
-                finish_handle_start - accept_start_).count());
+                finish_handle_start - accept_start_)
+                .count());
         snapshot_copy.finish_cq_handle_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(
-                finish_handle_end - finish_handle_start).count());
+                finish_handle_end - finish_handle_start)
+                .count());
         std::lock_guard<std::mutex> log_lock(*log_mutex_);
         std::cerr << "[CHECK] req_id=" << snapshot_copy.req_id
                   << " keys=" << snapshot_copy.keys
@@ -1329,8 +1425,10 @@ class CheckCallData : public CallDataBase {
                   << " may_match=" << snapshot_copy.may_match
                   << " handler_us=" << snapshot_copy.handler_us
                   << " work_avg_us=" << snapshot_copy.work_avg_us
-                  << " sst_get_or_open_avg_us=" << snapshot_copy.sst_get_or_open_avg_us
-                  << " sst_keymaymatch_avg_us=" << snapshot_copy.sst_keymaymatch_avg_us
+                  << " sst_get_or_open_avg_us="
+                  << snapshot_copy.sst_get_or_open_avg_us
+                  << " sst_keymaymatch_avg_us="
+                  << snapshot_copy.sst_keymaymatch_avg_us
                   << " sst_call_id=" << snapshot_copy.sst_call_id
                   << " sst_file_number=" << snapshot_copy.sst_file_number
                   << " sst_stage=" << snapshot_copy.sst_stage
@@ -1340,15 +1438,16 @@ class CheckCallData : public CallDataBase {
                   << " accept_wait_us=" << snapshot_copy.accept_wait_us
                   << " queue_wait_us=" << snapshot_copy.queue_wait_us
                   << " finish_call_us=" << snapshot_copy.finish_call_us
-                  << " finish_to_cq_pop_us=" << snapshot_copy.finish_to_cq_pop_us
-                  << " finish_cq_handle_us=" << snapshot_copy.finish_cq_handle_us
-                  << " rpc_e2e_us=" << snapshot_copy.rpc_e2e_us
-                  << std::endl;
+                  << " finish_to_cq_pop_us="
+                  << snapshot_copy.finish_to_cq_pop_us
+                  << " finish_cq_handle_us="
+                  << snapshot_copy.finish_cq_handle_us
+                  << " rpc_e2e_us=" << snapshot_copy.rpc_e2e_us << std::endl;
       }
       delete this;
     }
   }
-  
+
   // Called from worker thread - performs actual bloom filter processing
   // Worker thread directly calls Finish() - no Alarm needed
   void ProcessInWorkerThread(PerCQWorkerQueue::WorkItem item) {
@@ -1360,8 +1459,9 @@ class CheckCallData : public CallDataBase {
     }
     auto handler_start = std::chrono::steady_clock::now();
     uint64_t queue_wait_us = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            handler_start - item.enqueue_ts).count());
+        std::chrono::duration_cast<std::chrono::microseconds>(handler_start -
+                                                              item.enqueue_ts)
+            .count());
     // This runs in worker thread, NOT in CQ poller thread
     response_.clear_resps();
     response_.mutable_resps()->Reserve(item.request.reqs_size());
@@ -1380,27 +1480,31 @@ class CheckCallData : public CallDataBase {
       *response_.add_resps() = key_resp;
     }
     auto work_end = std::chrono::steady_clock::now();
-    
+
     // Handler 종료 시간 측정
     auto handler_before_finish = std::chrono::steady_clock::now();
     auto work_us = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            work_end - work_start).count());
+        std::chrono::duration_cast<std::chrono::microseconds>(work_end -
+                                                              work_start)
+            .count());
     auto handler_us = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
-            handler_before_finish - handler_start).count());
-    
+            handler_before_finish - handler_start)
+            .count());
+
     // if (item.req_id <= 10 || item.req_id % 100 == 0) {
     //   std::lock_guard<std::mutex> log_lock(*log_mutex_);
-    //   std::cerr << "[INFO] Check request #" << item.req_id << " completed" << std::flush << std::endl;
-    //   std::cerr << "[INFO] Check request #" << item.req_id 
-    //             << " response size: " << response_.resps_size() << std::flush << std::endl;
-    //   std::cerr << "[PERF] Check request #" << item.req_id 
-    //             << " server_handler_us=" << handler_us 
+    //   std::cerr << "[INFO] Check request #" << item.req_id << " completed" <<
+    //   std::flush << std::endl; std::cerr << "[INFO] Check request #" <<
+    //   item.req_id
+    //             << " response size: " << response_.resps_size() << std::flush
+    //             << std::endl;
+    //   std::cerr << "[PERF] Check request #" << item.req_id
+    //             << " server_handler_us=" << handler_us
     //             << " active_rpcs=" << item.active_count
     //             << " (handler processing time)" << std::flush << std::endl;
     // }
-    
+
     // Worker thread directly calls Finish() - gRPC responder is thread-safe
     // No need for Alarm or CQ notification
     auto finish_call_start = std::chrono::steady_clock::now();
@@ -1408,44 +1512,53 @@ class CheckCallData : public CallDataBase {
     responder_.Finish(response_, grpc::Status::OK, this);
     auto finish_call_end = std::chrono::steady_clock::now();
     uint64_t finish_call_us = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            finish_call_end - finish_call_start).count());
+        std::chrono::duration_cast<std::chrono::microseconds>(finish_call_end -
+                                                              finish_call_start)
+            .count());
     {
       std::lock_guard<std::mutex> snapshot_lock(log_snapshot_mutex_);
       finish_call_done_ts_ = finish_call_end;
     }
-    
+
     // Active RPC 카운터 감소
     active_rpc_count_->fetch_sub(1);
 
     // Statistics collection and logging disabled for performance
     // check_timing_req_count_.fetch_add(1, std::memory_order_relaxed);
     // check_timing_work_us_sum_.fetch_add(work_us, std::memory_order_relaxed);
-    // check_timing_handler_us_sum_.fetch_add(handler_us, std::memory_order_relaxed);
-    // bool check_log_enabled = []() {
+    // check_timing_handler_us_sum_.fetch_add(handler_us,
+    // std::memory_order_relaxed); bool check_log_enabled = []() {
     //   const char* env = std::getenv("BLOOMD_CHECK_TIMING_LOG");
     //   return env && std::string(env) == "1";
     // }();
-    // bool should_log = check_log_enabled && (item.req_id <= 10 || item.req_id % 1000 == 0);
-    // if (should_log) {
+    // bool should_log = check_log_enabled && (item.req_id <= 10 || item.req_id
+    // % 1000 == 0); if (should_log) {
     //   const uint64_t req_cnt =
     //       check_timing_req_count_.load(std::memory_order_relaxed);
     //   const uint64_t sst_cnt =
     //       check_timing_sst_count_.load(std::memory_order_relaxed);
     //   const uint64_t work_avg_us =
     //       req_cnt == 0 ? 0
-    //                    : check_timing_work_us_sum_.load(std::memory_order_relaxed) / req_cnt;
+    //                    :
+    //                    check_timing_work_us_sum_.load(std::memory_order_relaxed)
+    //                    / req_cnt;
     //   const uint64_t handler_avg_us =
     //       req_cnt == 0 ? 0
-    //                    : check_timing_handler_us_sum_.load(std::memory_order_relaxed) / req_cnt;
+    //                    :
+    //                    check_timing_handler_us_sum_.load(std::memory_order_relaxed)
+    //                    / req_cnt;
     //   const uint64_t sst_get_or_open_avg_us =
     //       sst_cnt == 0
     //           ? 0
-    //           : check_timing_sst_get_or_open_us_sum_.load(std::memory_order_relaxed) / sst_cnt;
+    //           :
+    //           check_timing_sst_get_or_open_us_sum_.load(std::memory_order_relaxed)
+    //           / sst_cnt;
     //   const uint64_t sst_keymaymatch_avg_us =
     //       sst_cnt == 0
     //           ? 0
-    //           : check_timing_sst_keymaymatch_us_sum_.load(std::memory_order_relaxed) / sst_cnt;
+    //           :
+    //           check_timing_sst_keymaymatch_us_sum_.load(std::memory_order_relaxed)
+    //           / sst_cnt;
 
     //   std::lock_guard<std::mutex> snapshot_lock(log_snapshot_mutex_);
     //   log_snapshot_.should_log = true;
@@ -1468,8 +1581,9 @@ class CheckCallData : public CallDataBase {
     //   log_snapshot_.queue_wait_us = queue_wait_us;
     //   log_snapshot_.finish_call_us = finish_call_us;
     // }
-    
-    // Note: CallData will be deleted when FINISH event is processed by CQ poller
+
+    // Note: CallData will be deleted when FINISH event is processed by CQ
+    // poller
   }
 
  private:
@@ -1481,34 +1595,38 @@ class CheckCallData : public CallDataBase {
   void ProcessKeyRequest(const KeyRequest& req, KeyResponse* resp) {
     // ProcessKeyRequest 시작 시간 측정
     auto process_start = std::chrono::steady_clock::now();
-    
+
     static std::atomic<size_t> key_request_count{0};
     size_t key_req_id = key_request_count.fetch_add(1) + 1;
-    
+
     const ROCKSDB_NAMESPACE::Slice user_key(req.user_key());
-    
+
     // total_candidates: 요청된 전체 candidate 파일 수
     uint64_t total_candidates = req.sst_file_numbers_size();
     resp->set_total_candidates(total_candidates);
-    
+
     // if (key_req_id <= 10 || key_req_id % 100 == 0) {
-    //   std::cerr << "[INFO] ProcessKeyRequest #" << key_req_id 
-    //             << ": key_len=" << user_key.size() 
-    //             << ", sst_count=" << total_candidates << std::flush << std::endl;
+    //   std::cerr << "[INFO] ProcessKeyRequest #" << key_req_id
+    //             << ": key_len=" << user_key.size()
+    //             << ", sst_count=" << total_candidates << std::flush <<
+    //             std::endl;
     // }
 
     // checked_count: 실제로 검사한 파일 수 (성공적으로 처리한 파일 수)
     uint64_t checked_count = 0;
     uint64_t total_check_us = 0;  // 모든 CheckKeyInSST 시간 합계
-    
+
     for (uint64_t file_number : req.sst_file_numbers()) {
       auto sst_check_start = std::chrono::steady_clock::now();
-      bool may_match = CheckKeyInSST(user_key, file_number);
+      FilterPartitionBlock filter_partition_block;
+      bool may_match =
+          CheckKeyInSST(user_key, file_number, &filter_partition_block);
       auto sst_check_end = std::chrono::steady_clock::now();
       auto sst_check_us = std::chrono::duration_cast<std::chrono::microseconds>(
-          sst_check_end - sst_check_start).count();
+                              sst_check_end - sst_check_start)
+                              .count();
       total_check_us += sst_check_us;
-      
+
       checked_count++;  // CheckKeyInSST 호출 시도 (성공/실패 무관)
 
       if (may_match && IsLastOpenFailPathNotFound()) {
@@ -1516,19 +1634,24 @@ class CheckCallData : public CallDataBase {
       } else if (may_match) {
         resp->add_may_match_sst_file_numbers(file_number);
       }
+      if (!filter_partition_block.filter_partition_contents().empty()) {
+        *resp->add_filter_partition_blocks() =
+            std::move(filter_partition_block);
+      }
     }
     if (server_stats_enabled_) stats_->AddCheckLoopUs(total_check_us);
 
     // checked_count 설정
     resp->set_checked_count(checked_count);
-    
+
     // complete: 모든 candidate 파일을 검사했는지 여부
     bool complete = (checked_count == total_candidates);
     resp->set_complete(complete);
 
     // if (IsSstListLogEnabled()) {
-    //   const std::string input_sst_list = FormatSstList(req.sst_file_numbers());
-    //   const std::string output_may_match_sst_list =
+    //   const std::string input_sst_list =
+    //   FormatSstList(req.sst_file_numbers()); const std::string
+    //   output_may_match_sst_list =
     //       FormatSstList(resp->may_match_sst_file_numbers());
     //   const std::string output_path_not_found_sst_list =
     //       FormatSstList(resp->path_not_found_sst_file_numbers());
@@ -1540,29 +1663,33 @@ class CheckCallData : public CallDataBase {
     //             << " output_path_not_found="
     //             << output_path_not_found_sst_list << std::endl;
     // }
-    
+
     // ProcessKeyRequest 종료 시간 측정
     auto process_end = std::chrono::steady_clock::now();
     auto process_us = std::chrono::duration_cast<std::chrono::microseconds>(
-        process_end - process_start).count();
-    
+                          process_end - process_start)
+                          .count();
+
     // if (key_req_id <= 10 || key_req_id % 100 == 0) {
     //   std::lock_guard<std::mutex> log_lock(*log_mutex_);
     //   uint64_t overhead_us = process_us - total_check_us;
-    //   std::cerr << "[PERF] ProcessKeyRequest #" << key_req_id 
-    //             << " process_us=" << process_us 
+    //   std::cerr << "[PERF] ProcessKeyRequest #" << key_req_id
+    //             << " process_us=" << process_us
     //             << " total_check_us=" << total_check_us
     //             << " overhead_us=" << overhead_us
     //             << " sst_count=" << total_candidates
-    //             << " avg_check_us=" << (total_candidates > 0 ? total_check_us / total_candidates : 0)
+    //             << " avg_check_us=" << (total_candidates > 0 ? total_check_us
+    //             / total_candidates : 0)
     //             << " (per-key processing time)" << std::flush << std::endl;
     // }
   }
 
-  bool CheckKeyInSST(const ROCKSDB_NAMESPACE::Slice& user_key, uint64_t file_number) {
+  bool CheckKeyInSST(const ROCKSDB_NAMESPACE::Slice& user_key,
+                     uint64_t file_number,
+                     FilterPartitionBlock* filter_partition_block) {
     // CheckKeyInSST 시작 시간 측정
     auto check_start = std::chrono::steady_clock::now();
-    
+
     static std::atomic<size_t> call_count{0};
     size_t call_id = call_count.fetch_add(1) + 1;
     ResetLastOpenFailDetail();
@@ -1576,7 +1703,8 @@ class CheckCallData : public CallDataBase {
       if (open_fail_log_enabled && reason != CheckReason::OPEN_FAIL) {
         return;
       }
-      if (!open_fail_log_enabled && !(call_id <= 200 || (call_id % 10000) == 0)) {
+      if (!open_fail_log_enabled &&
+          !(call_id <= 200 || (call_id % 10000) == 0)) {
         return;
       }
       std::lock_guard<std::mutex> log_lock(*log_mutex_);
@@ -1608,12 +1736,14 @@ class CheckCallData : public CallDataBase {
                 << " file_number=" << file_number
                 << " reason=" << CheckReasonToString(reason) << std::endl;
     };
-    
+
     // Statistics collection disabled for performance
-    // auto maybe_log_timing = [&](const char* stage, uint64_t get_entry_us_val) {
+    // auto maybe_log_timing = [&](const char* stage, uint64_t get_entry_us_val)
+    // {
     //   auto now = std::chrono::steady_clock::now();
     //   uint64_t total_us = static_cast<uint64_t>(
-    //       std::chrono::duration_cast<std::chrono::microseconds>(now - check_start).count());
+    //       std::chrono::duration_cast<std::chrono::microseconds>(now -
+    //       check_start).count());
     //   auto& sst_trace = ThreadLocalSstTrace();
     //   sst_trace.valid = true;
     //   sst_trace.call_id = call_id;
@@ -1623,14 +1753,15 @@ class CheckCallData : public CallDataBase {
     //   sst_trace.keymaymatch_us = keymaymatch_us;
     //   sst_trace.total_check_us = total_us;
     // };
-    
+
     // Get or open TableReader - returns shared_ptr to guarantee lifetime
     auto get_entry_start = std::chrono::steady_clock::now();
     std::shared_ptr<TableReaderCache::CacheEntry> entry = cache_->GetOrOpen(
         file_number, *rocksdb_options_, stats_, log_mutex_, open_count_);
     auto get_entry_end = std::chrono::steady_clock::now();
     auto get_entry_us = std::chrono::duration_cast<std::chrono::microseconds>(
-        get_entry_end - get_entry_start).count();
+                            get_entry_end - get_entry_start)
+                            .count();
     if (!entry) {
       // stats_->RecordReason(CheckReason::OPEN_FAIL);
       // maybe_log_timing("open_fail", static_cast<uint64_t>(get_entry_us));
@@ -1645,9 +1776,11 @@ class CheckCallData : public CallDataBase {
     }
     std::shared_lock<std::shared_mutex> lock(entry->rw_mutex, std::defer_lock);
     if (cache_->entry_lock_enabled()) {
-      bool sample_entry_lock_wait = server_stats_enabled_ && ShouldSampleLockWait();
-      auto lock_wait_start = sample_entry_lock_wait ? std::chrono::steady_clock::now()
-                                                    : std::chrono::steady_clock::time_point{};
+      bool sample_entry_lock_wait =
+          server_stats_enabled_ && ShouldSampleLockWait();
+      auto lock_wait_start = sample_entry_lock_wait
+                                 ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
       lock.lock();
       if (sample_entry_lock_wait) {
         uint64_t wait_us = static_cast<uint64_t>(
@@ -1684,14 +1817,14 @@ class CheckCallData : public CallDataBase {
       log_check_reason(CheckReason::REP_NULL);
       return true;
     }
-    
+
     if (!rep->ioptions.fs || !rep->ioptions.fs.get()) {
       // stats_->RecordReason(CheckReason::FILTER_NULL);
       // maybe_log_timing("fs_null", static_cast<uint64_t>(get_entry_us));
       log_check_reason(CheckReason::FILTER_NULL);
       return true;
     }
-    
+
     if (!rep->filter) {
       // stats_->RecordReason(CheckReason::FILTER_NULL);
       // maybe_log_timing("filter_null", static_cast<uint64_t>(get_entry_us));
@@ -1702,7 +1835,8 @@ class CheckCallData : public CallDataBase {
     // Check whole_key_filtering
     if (!rep->whole_key_filtering) {
       // stats_->RecordReason(CheckReason::WHOLE_KEY_FILTERING_FALSE);
-      // maybe_log_timing("whole_key_filtering_false", static_cast<uint64_t>(get_entry_us));
+      // maybe_log_timing("whole_key_filtering_false",
+      // static_cast<uint64_t>(get_entry_us));
       log_check_reason(CheckReason::WHOLE_KEY_FILTERING_FALSE);
       return true;
     }
@@ -1735,10 +1869,9 @@ class CheckCallData : public CallDataBase {
     ROCKSDB_NAMESPACE::GetContext get_context(
         ucmp, nullptr /* merge_operator */, nullptr /* logger */,
         nullptr /* statistics */, ROCKSDB_NAMESPACE::GetContext::kNotFound,
-        user_key_without_ts, &dummy_value, nullptr /* columns */, &dummy_value_found,
-        &dummy_merge_context, false /* do_merge */,
-        &dummy_max_covering_tombstone_seq,
-        clock_.get());
+        user_key_without_ts, &dummy_value, nullptr /* columns */,
+        &dummy_value_found, &dummy_merge_context, false /* do_merge */,
+        &dummy_max_covering_tombstone_seq, clock_.get());
 
     // Create BlockCacheLookupContext
     ROCKSDB_NAMESPACE::BlockCacheLookupContext lookup_context(
@@ -1751,19 +1884,31 @@ class CheckCallData : public CallDataBase {
         ROCKSDB_NAMESPACE::kValueTypeForSeek);
     ROCKSDB_NAMESPACE::Slice ikey_slice = ikey_for_seek.Encode();
     const ROCKSDB_NAMESPACE::Slice* const_ikey_ptr = &ikey_slice;
-    
+
     // Check filter
     bool may_match = false;
     try {
       auto keymaymatch_start = std::chrono::steady_clock::now();
-      may_match = rep->filter->KeyMayMatch(
-          user_key_without_ts, const_ikey_ptr, &get_context,
-          &lookup_context, read_options);
+      uint64_t filter_partition_offset = ROCKSDB_NAMESPACE::kNotValid;
+      std::string filter_partition_contents;
+      may_match = rep->filter->KeyMayMatchAndGetFilterPartitionBlock(
+          user_key_without_ts, const_ikey_ptr, &get_context, &lookup_context,
+          read_options, &filter_partition_offset, &filter_partition_contents);
+      if (filter_partition_block &&
+          filter_partition_offset != ROCKSDB_NAMESPACE::kNotValid &&
+          !filter_partition_contents.empty()) {
+        filter_partition_block->set_sst_file_number(file_number);
+        filter_partition_block->set_filter_partition_offset(
+            filter_partition_offset);
+        filter_partition_block->set_filter_partition_contents(
+            std::move(filter_partition_contents));
+      }
       auto keymaymatch_end = std::chrono::steady_clock::now();
       keymaymatch_us = static_cast<uint64_t>(
           std::chrono::duration_cast<std::chrono::microseconds>(
-              keymaymatch_end - keymaymatch_start).count());
-      
+              keymaymatch_end - keymaymatch_start)
+              .count());
+
       // if (may_match) {
       //   stats_->RecordReason(CheckReason::KEYMAYMATCH_TRUE);
       // } else {
@@ -1771,15 +1916,17 @@ class CheckCallData : public CallDataBase {
       // }
     } catch (...) {
       // stats_->RecordReason(CheckReason::KEYMAYMATCH_EXCEPTION);
-      // maybe_log_timing("keymaymatch_exception", static_cast<uint64_t>(get_entry_us));
+      // maybe_log_timing("keymaymatch_exception",
+      // static_cast<uint64_t>(get_entry_us));
       log_check_reason(CheckReason::KEYMAYMATCH_EXCEPTION);
       return true;  // Safe default on exception
     }
-    
+
     // CheckKeyInSST 종료 시간 측정
     auto check_end = std::chrono::steady_clock::now();
     auto check_us = std::chrono::duration_cast<std::chrono::microseconds>(
-        check_end - check_start).count();
+                        check_end - check_start)
+                        .count();
     // Statistics collection disabled for performance
     // check_timing_sst_count_.fetch_add(1, std::memory_order_relaxed);
     // check_timing_sst_get_or_open_us_sum_.fetch_add(
@@ -1787,28 +1934,28 @@ class CheckCallData : public CallDataBase {
     // check_timing_sst_keymaymatch_us_sum_.fetch_add(
     //     keymaymatch_us, std::memory_order_relaxed);
     // maybe_log_timing("ok", static_cast<uint64_t>(get_entry_us));
-    
+
     // if (call_id <= 10 || call_id % 1000 == 0) {
     //   std::lock_guard<std::mutex> log_lock(*log_mutex_);
-    //   std::cerr << "[PERF] CheckKeyInSST #" << call_id 
-    //             << " check_us=" << check_us 
-    //             << " get_entry_us=" << get_entry_us 
+    //   std::cerr << "[PERF] CheckKeyInSST #" << call_id
+    //             << " check_us=" << check_us
+    //             << " get_entry_us=" << get_entry_us
     //             << " (per-SST check time)" << std::flush << std::endl;
     // }
-    
+
     return may_match;
   }
 
   enum CallStatus { CREATE, PROCESS, FINISH };
   CallStatus status_;
-  
+
   BloomCheck::AsyncService* service_;
   grpc::ServerCompletionQueue* cq_;
   grpc::ServerContext ctx_;
   BatchRequest request_;
   BatchResponse response_;
   grpc::ServerAsyncResponseWriter<BatchResponse> responder_;
-  
+
   TableReaderCache* cache_;
   ROCKSDB_NAMESPACE::Options* rocksdb_options_;
   Stats* stats_;
@@ -1828,7 +1975,7 @@ class CheckCallData : public CallDataBase {
   size_t active_count_;
   std::mutex log_snapshot_mutex_;
   CheckLogSnapshot log_snapshot_;
-  
+
   static std::atomic<size_t> request_count_;
   static std::atomic<uint64_t> check_timing_req_count_;
   static std::atomic<uint64_t> check_timing_work_us_sum_;
@@ -1855,10 +2002,12 @@ class StreamCallData {
     kFinish,
   };
 
-  StreamCallData(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* cq,
-                 TableReaderCache* cache, ROCKSDB_NAMESPACE::Options* rocksdb_options,
-                 Stats* stats, std::mutex* log_mutex, std::atomic<size_t>* open_count,
-                 std::atomic<size_t>* active_rpc_count, std::atomic<size_t>* total_rpc_count,
+  StreamCallData(BloomCheck::AsyncService* service,
+                 grpc::ServerCompletionQueue* cq, TableReaderCache* cache,
+                 ROCKSDB_NAMESPACE::Options* rocksdb_options, Stats* stats,
+                 std::mutex* log_mutex, std::atomic<size_t>* open_count,
+                 std::atomic<size_t>* active_rpc_count,
+                 std::atomic<size_t>* total_rpc_count,
                  std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock,
                  std::shared_ptr<ROCKSDB_NAMESPACE::FileSystem> fs,
                  PerCQWorkerQueue* worker_queue, bool server_stats_enabled)
@@ -1885,9 +2034,12 @@ class StreamCallData {
 
   void OnOpComplete(OpType op, bool ok) {
     if (server_stats_enabled_ && stats_) {
-      if (op == OpType::kRequest || op == OpType::kRead) stats_->AddCqEventRead();
-      else if (op == OpType::kWrite) stats_->AddCqEventWrite();
-      else if (op == OpType::kFinish) stats_->AddCqEventFinish();
+      if (op == OpType::kRequest || op == OpType::kRead)
+        stats_->AddCqEventRead();
+      else if (op == OpType::kWrite)
+        stats_->AddCqEventWrite();
+      else if (op == OpType::kFinish)
+        stats_->AddCqEventFinish();
     }
     if (op == OpType::kRequest) {
       HandleRequest(ok);
@@ -1911,25 +2063,32 @@ class StreamCallData {
     const ROCKSDB_NAMESPACE::Slice user_key(item.stream_user_key);
     auto check_loop_start = std::chrono::steady_clock::now();
     for (uint64_t file_number : item.stream_sst_file_numbers) {
-      if (CheckKeyInSST(user_key, file_number)) {
+      FilterPartitionBlock filter_partition_block;
+      if (CheckKeyInSST(user_key, file_number, &filter_partition_block)) {
         if (IsLastOpenFailPathNotFound()) {
           response.add_path_not_found_sst_file_numbers(file_number);
           continue;
         }
         response.add_may_match_sst_file_numbers(file_number);
       }
+      if (!filter_partition_block.filter_partition_contents().empty()) {
+        *response.add_filter_partition_blocks() =
+            std::move(filter_partition_block);
+      }
     }
     auto check_loop_end = std::chrono::steady_clock::now();
     if (server_stats_enabled_) {
       uint64_t check_loop_us = static_cast<uint64_t>(
           std::chrono::duration_cast<std::chrono::microseconds>(
-              check_loop_end - check_loop_start).count());
+              check_loop_end - check_loop_start)
+              .count());
       stats_->AddCheckLoopUs(check_loop_us);
     }
 
     // if (IsSstListLogEnabled()) {
-    //   const std::string input_sst_list = FormatSstList(item.stream_sst_file_numbers);
-    //   const std::string output_may_match_sst_list =
+    //   const std::string input_sst_list =
+    //   FormatSstList(item.stream_sst_file_numbers); const std::string
+    //   output_may_match_sst_list =
     //       FormatSstList(response.may_match_sst_file_numbers());
     //   const std::string output_path_not_found_sst_list =
     //       FormatSstList(response.path_not_found_sst_file_numbers());
@@ -1948,7 +2107,8 @@ class StreamCallData {
  private:
   class StreamOpTag : public CallDataBase {
    public:
-    StreamOpTag(StreamCallData* owner, OpType type) : owner_(owner), type_(type) {}
+    StreamOpTag(StreamCallData* owner, OpType type)
+        : owner_(owner), type_(type) {}
     void Proceed(bool ok) override { owner_->OnOpComplete(type_, ok); }
 
    private:
@@ -1962,9 +2122,10 @@ class StreamCallData {
       return;
     }
 
-    new StreamCallData(service_, cq_, cache_, rocksdb_options_, stats_, log_mutex_,
-                       open_count_, active_rpc_count_, total_rpc_count_, clock_, fs_,
-                       worker_queue_, server_stats_enabled_);
+    new StreamCallData(service_, cq_, cache_, rocksdb_options_, stats_,
+                       log_mutex_, open_count_, active_rpc_count_,
+                       total_rpc_count_, clock_, fs_, worker_queue_,
+                       server_stats_enabled_);
 
     active_rpc_count_->fetch_add(1);
     total_rpc_count_->fetch_add(1);
@@ -2017,8 +2178,9 @@ class StreamCallData {
       stats_->AddRecvReq();
       stats_->AddReadReqEvent();
     }
-    worker_queue_->Enqueue(PerCQWorkerQueue::WorkItem(
-        this, request_id, std::move(user_key), std::move(sst_numbers), enqueue_ts));
+    worker_queue_->Enqueue(
+        PerCQWorkerQueue::WorkItem(this, request_id, std::move(user_key),
+                                   std::move(sst_numbers), enqueue_ts));
   }
 
   void EnqueueResponse(StreamResponse response) {
@@ -2089,7 +2251,9 @@ class StreamCallData {
     delete this;
   }
 
-  bool CheckKeyInSST(const ROCKSDB_NAMESPACE::Slice& user_key, uint64_t file_number) {
+  bool CheckKeyInSST(const ROCKSDB_NAMESPACE::Slice& user_key,
+                     uint64_t file_number,
+                     FilterPartitionBlock* filter_partition_block) {
     static std::atomic<size_t> call_count{0};
     const size_t call_id = call_count.fetch_add(1) + 1;
     ResetLastOpenFailDetail();
@@ -2102,7 +2266,8 @@ class StreamCallData {
       if (open_fail_log_enabled && reason != CheckReason::OPEN_FAIL) {
         return;
       }
-      if (!open_fail_log_enabled && !(call_id <= 200 || (call_id % 10000) == 0)) {
+      if (!open_fail_log_enabled &&
+          !(call_id <= 200 || (call_id % 10000) == 0)) {
         return;
       }
       std::lock_guard<std::mutex> log_lock(*log_mutex_);
@@ -2149,9 +2314,11 @@ class StreamCallData {
     }
     std::shared_lock<std::shared_mutex> lock(entry->rw_mutex, std::defer_lock);
     if (cache_->entry_lock_enabled()) {
-      bool sample_entry_lock_wait = server_stats_enabled_ && ShouldSampleLockWait();
-      auto lock_wait_start = sample_entry_lock_wait ? std::chrono::steady_clock::now()
-                                                    : std::chrono::steady_clock::time_point{};
+      bool sample_entry_lock_wait =
+          server_stats_enabled_ && ShouldSampleLockWait();
+      auto lock_wait_start = sample_entry_lock_wait
+                                 ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
       lock.lock();
       if (sample_entry_lock_wait) {
         uint64_t wait_us = static_cast<uint64_t>(
@@ -2228,8 +2395,20 @@ class StreamCallData {
 
     bool may_match = false;
     try {
-      may_match = rep->filter->KeyMayMatch(user_key_without_ts, const_ikey_ptr,
-                                           &get_context, &lookup_context, read_options);
+      uint64_t filter_partition_offset = ROCKSDB_NAMESPACE::kNotValid;
+      std::string filter_partition_contents;
+      may_match = rep->filter->KeyMayMatchAndGetFilterPartitionBlock(
+          user_key_without_ts, const_ikey_ptr, &get_context, &lookup_context,
+          read_options, &filter_partition_offset, &filter_partition_contents);
+      if (filter_partition_block &&
+          filter_partition_offset != ROCKSDB_NAMESPACE::kNotValid &&
+          !filter_partition_contents.empty()) {
+        filter_partition_block->set_sst_file_number(file_number);
+        filter_partition_block->set_filter_partition_offset(
+            filter_partition_offset);
+        filter_partition_block->set_filter_partition_contents(
+            std::move(filter_partition_contents));
+      }
       // if (may_match) {
       //   stats_->RecordReason(CheckReason::KEYMAYMATCH_TRUE);
       // } else {
@@ -2280,11 +2459,15 @@ class StreamCallData {
 // PerCQWorkerQueue::WorkerLoop implementation (after CheckCallData definition)
 void PerCQWorkerQueue::WorkerLoop() {
   while (true) {
-    bool sample_deq = server_stats_enabled_ && stats_ && ShouldSampleDequeueLock();
-    auto t0 = sample_deq ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    bool sample_deq =
+        server_stats_enabled_ && stats_ && ShouldSampleDequeueLock();
+    auto t0 = sample_deq ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point{};
     std::unique_lock<std::mutex> lock(queue_mutex_);
-    queue_cv_.wait(lock, [this]() { return !work_queue_.empty() || shutdown_; });
-    auto t2 = sample_deq ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    queue_cv_.wait(lock,
+                   [this]() { return !work_queue_.empty() || shutdown_; });
+    auto t2 = sample_deq ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point{};
 
     if (shutdown_ && work_queue_.empty()) {
       break;
@@ -2294,14 +2477,17 @@ void PerCQWorkerQueue::WorkerLoop() {
       uint64_t depth = work_queue_.size();
       WorkItem item = std::move(work_queue_.front());
       work_queue_.pop();
-      auto t3 = sample_deq ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+      auto t3 = sample_deq ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
       lock.unlock();
 
       if (sample_deq && stats_) {
         uint64_t wait_us = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(t2 - t0).count());
+            std::chrono::duration_cast<std::chrono::microseconds>(t2 - t0)
+                .count());
         uint64_t hold_us = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count());
+            std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2)
+                .count());
         stats_->AddDequeueLockUs(wait_us, hold_us);
       }
       if (server_stats_enabled_ && stats_) {
@@ -2320,7 +2506,8 @@ void PerCQWorkerQueue::WorkerLoop() {
 // Per-RPC state machine for Noop RPC
 class NoopCallData : public CallDataBase {
  public:
-  NoopCallData(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* cq)
+  NoopCallData(BloomCheck::AsyncService* service,
+               grpc::ServerCompletionQueue* cq)
       : service_(service), cq_(cq), responder_(&ctx_), status_(CREATE) {
     Proceed(true);
   }
@@ -2340,29 +2527,29 @@ class NoopCallData : public CallDataBase {
       // READ 완료, PROCESS 시작
       // 새로운 CallData를 생성하여 다음 요청을 받을 준비
       new NoopCallData(service_, cq_);
-      
+
       // 실제 요청 처리
       struct timespec ts;
       clock_gettime(CLOCK_MONOTONIC, &ts);
-      uint64_t now_ns = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + 
+      uint64_t now_ns = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL +
                         static_cast<uint64_t>(ts.tv_nsec);
-      
+
       response_.set_server_ts_ns(now_ns);
-      
+
       // Optional: very sparse logging (1/100000 sample rate)
       static std::atomic<size_t> noop_count{0};
       size_t count = noop_count.fetch_add(1) + 1;
-      
+
       static bool noop_log_enabled = []() {
         const char* env = std::getenv("BLOOMD_NOOP_LOG");
         return env && std::string(env) == "1";
       }();
-      
+
       // if (noop_log_enabled && count % 100000 == 0) {
-      //   std::cerr << "[NOOP] Noop request #" << count 
+      //   std::cerr << "[NOOP] Noop request #" << count
       //             << " server_ts_ns=" << now_ns << std::flush << std::endl;
       // }
-      
+
       // FINISH: 응답 전송
       status_ = FINISH;
       responder_.Finish(response_, grpc::Status::OK, this);
@@ -2376,7 +2563,7 @@ class NoopCallData : public CallDataBase {
  private:
   enum CallStatus { CREATE, PROCESS, FINISH };
   CallStatus status_;
-  
+
   BloomCheck::AsyncService* service_;
   grpc::ServerCompletionQueue* cq_;
   grpc::ServerContext ctx_;
@@ -2389,7 +2576,8 @@ class NoopCallData : public CallDataBase {
 class BloomCheckServiceImpl {
  public:
   explicit BloomCheckServiceImpl(size_t cache_size)
-      : cache_(cache_size), rocksdb_options_(),
+      : cache_(cache_size),
+        rocksdb_options_(),
         clock_(ROCKSDB_NAMESPACE::SystemClock::Default()),
         fs_(ROCKSDB_NAMESPACE::Env::Default()->GetFileSystem()),
         server_stats_enabled_([]() {
@@ -2398,27 +2586,34 @@ class BloomCheckServiceImpl {
         }()) {
     // Configure RocksDB options for filter-only access
     rocksdb_options_.env = ROCKSDB_NAMESPACE::Env::Default();
-    
+    rocksdb_options_.use_direct_reads = true;
+
     // Disable RocksDB verbose logging (ERROR level only)
-    rocksdb_options_.info_log_level = ROCKSDB_NAMESPACE::InfoLogLevel::ERROR_LEVEL;
-    
+    rocksdb_options_.info_log_level =
+        ROCKSDB_NAMESPACE::InfoLogLevel::ERROR_LEVEL;
+
     // Set BlockBasedTableOptions with filter_policy
     ROCKSDB_NAMESPACE::BlockBasedTableOptions bbto;
-    bbto.filter_policy.reset(ROCKSDB_NAMESPACE::NewBloomFilterPolicy(10, false));
+    bbto.filter_policy.reset(
+        ROCKSDB_NAMESPACE::NewBloomFilterPolicy(10, false));
     bbto.whole_key_filtering = true;
+    bbto.index_type =
+        ROCKSDB_NAMESPACE::BlockBasedTableOptions::kTwoLevelIndexSearch;
     bbto.partition_filters = true;
+    bbto.pin_top_level_index_and_filter = false;
+    bbto.cache_index_and_filter_blocks = true;
+    bbto.block_cache =
+        ROCKSDB_NAMESPACE::HyperClockCacheOptions(1, 0, -1).MakeSharedCache();
     rocksdb_options_.table_factory.reset(
         ROCKSDB_NAMESPACE::NewBlockBasedTableFactory(bbto));
-    
+
     StartStatsThread();
   }
-  
-  ~BloomCheckServiceImpl() {
-    StopStatsThread();
-  }
-  
+
+  ~BloomCheckServiceImpl() { StopStatsThread(); }
+
   BloomCheck::AsyncService* service() { return &service_; }
-  
+
   TableReaderCache* cache() { return &cache_; }
   ROCKSDB_NAMESPACE::Options* rocksdb_options() { return &rocksdb_options_; }
   Stats* stats() { return &stats_; }
@@ -2433,7 +2628,7 @@ class BloomCheckServiceImpl {
 
  private:
   BloomCheck::AsyncService service_;
-  
+
   TableReaderCache cache_;
   ROCKSDB_NAMESPACE::Options rocksdb_options_;
   Stats stats_;
@@ -2449,24 +2644,27 @@ class BloomCheckServiceImpl {
   // Stats printing thread (runs only when server_stats_enabled_)
   std::thread stats_thread_;
   std::atomic<bool> stop_stats_thread_{false};
-  
+
   // Rate-limited logging for filter null cases
   std::atomic<std::chrono::steady_clock::time_point> last_filter_null_log_time_{
       std::chrono::steady_clock::time_point::min()};
-  
+
   void StartStatsThread() {
     if (!server_stats_enabled_) return;
     stats_thread_ = std::thread([this]() {
-      uint64_t last_recv_req = 0, last_worker_deq = 0, last_depth_sum = 0, last_depth_count = 0;
+      uint64_t last_recv_req = 0, last_worker_deq = 0, last_depth_sum = 0,
+               last_depth_count = 0;
       uint64_t last_check_loop_us = 0, last_check_loop_count = 0;
       uint64_t last_writeq_sum = 0, last_writeq_count = 0;
       uint64_t last_write_done = 0, last_finish_or_close = 0;
       uint64_t last_read_req_event = 0, last_write_resp_event = 0;
       uint64_t last_entry_lock_wait_us = 0, last_entry_lock_wait_samples = 0;
-      uint64_t last_shard_lru_lock_wait_us = 0, last_shard_lru_lock_wait_samples = 0;
+      uint64_t last_shard_lru_lock_wait_us = 0,
+               last_shard_lru_lock_wait_samples = 0;
       uint64_t last_last_access_updates = 0;
       uint64_t last_cache_hit = 0, last_cache_miss = 0;
-      uint64_t last_cache_lookup_hit = 0, last_inflight_wait = 0, last_new_table_reader = 0;
+      uint64_t last_cache_lookup_hit = 0, last_inflight_wait = 0,
+               last_new_table_reader = 0;
       uint64_t last_eviction = 0;
       uint64_t last_get_or_open_us = 0, last_get_or_open_samples = 0;
       uint64_t last_open_fail_getfilesize = 0;
@@ -2476,9 +2674,11 @@ class BloomCheckServiceImpl {
       uint64_t last_enqueue_lock_hold_us = 0;
       uint64_t last_dequeue_lock_wait_us = 0, last_dequeue_lock_samples = 0;
       uint64_t last_dequeue_lock_hold_us = 0;
-      uint64_t last_cq_next = 0, last_cq_read = 0, last_cq_write = 0, last_cq_finish = 0;
+      uint64_t last_cq_next = 0, last_cq_read = 0, last_cq_write = 0,
+               last_cq_finish = 0;
       uint64_t last_write_resp_event_10s = 0, last_write_done_10s = 0;
-      uint64_t last_computed_write_resp_event_per_10s = 0, last_computed_write_done_per_10s = 0;
+      uint64_t last_computed_write_resp_event_per_10s = 0,
+               last_computed_write_done_per_10s = 0;
       uint64_t sec = 0;
       while (!stop_stats_thread_.load()) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -2487,21 +2687,31 @@ class BloomCheckServiceImpl {
 
         uint64_t recv = stats_.recv_req_count.load(std::memory_order_relaxed);
         uint64_t deq = stats_.worker_deq_count.load(std::memory_order_relaxed);
-        uint64_t depth_sum = stats_.worker_queue_depth_sum.load(std::memory_order_relaxed);
-        uint64_t depth_count = stats_.worker_queue_depth_count.load(std::memory_order_relaxed);
-        uint64_t depth_max = stats_.worker_queue_depth_max.exchange(0, std::memory_order_relaxed);
-        uint64_t check_us = stats_.total_check_loop_us.load(std::memory_order_relaxed);
-        uint64_t check_n = stats_.check_loop_sample_count.load(std::memory_order_relaxed);
+        uint64_t depth_sum =
+            stats_.worker_queue_depth_sum.load(std::memory_order_relaxed);
+        uint64_t depth_count =
+            stats_.worker_queue_depth_count.load(std::memory_order_relaxed);
+        uint64_t depth_max = stats_.worker_queue_depth_max.exchange(
+            0, std::memory_order_relaxed);
+        uint64_t check_us =
+            stats_.total_check_loop_us.load(std::memory_order_relaxed);
+        uint64_t check_n =
+            stats_.check_loop_sample_count.load(std::memory_order_relaxed);
         uint64_t wq_sum = stats_.writeq_sum.load(std::memory_order_relaxed);
         uint64_t wq_count = stats_.writeq_count.load(std::memory_order_relaxed);
-        uint64_t wq_max = stats_.writeq_max.exchange(0, std::memory_order_relaxed);
-        uint64_t write_done = stats_.write_done_count.load(std::memory_order_relaxed);
-        uint64_t finish_close = stats_.finish_or_close_count.load(std::memory_order_relaxed);
-        uint64_t read_req_event = stats_.read_req_event_count.load(std::memory_order_relaxed);
+        uint64_t wq_max =
+            stats_.writeq_max.exchange(0, std::memory_order_relaxed);
+        uint64_t write_done =
+            stats_.write_done_count.load(std::memory_order_relaxed);
+        uint64_t finish_close =
+            stats_.finish_or_close_count.load(std::memory_order_relaxed);
+        uint64_t read_req_event =
+            stats_.read_req_event_count.load(std::memory_order_relaxed);
         uint64_t write_resp_event =
             stats_.write_resp_event_count.load(std::memory_order_relaxed);
         uint64_t pending_work_items_max =
-            stats_.pending_work_items_max.exchange(0, std::memory_order_relaxed);
+            stats_.pending_work_items_max.exchange(0,
+                                                   std::memory_order_relaxed);
         uint64_t entry_lock_wait_us =
             stats_.total_entry_rw_lock_wait_us.load(std::memory_order_relaxed);
         uint64_t entry_lock_wait_samples =
@@ -2512,15 +2722,18 @@ class BloomCheckServiceImpl {
             stats_.shard_lru_lock_wait_samples.load(std::memory_order_relaxed);
         uint64_t last_access_updates =
             stats_.last_access_update_count.load(std::memory_order_relaxed);
-        uint64_t cache_hit = stats_.cache_hit_count.load(std::memory_order_relaxed);
-        uint64_t cache_miss = stats_.cache_miss_count.load(std::memory_order_relaxed);
+        uint64_t cache_hit =
+            stats_.cache_hit_count.load(std::memory_order_relaxed);
+        uint64_t cache_miss =
+            stats_.cache_miss_count.load(std::memory_order_relaxed);
         uint64_t cache_lookup_hit =
             stats_.cache_lookup_hit_count.load(std::memory_order_relaxed);
         uint64_t inflight_wait =
             stats_.inflight_wait_count.load(std::memory_order_relaxed);
         uint64_t new_table_reader =
             stats_.new_table_reader_count.load(std::memory_order_relaxed);
-        uint64_t eviction = stats_.eviction_count.load(std::memory_order_relaxed);
+        uint64_t eviction =
+            stats_.eviction_count.load(std::memory_order_relaxed);
         uint64_t get_or_open_us =
             stats_.total_get_or_open_us.load(std::memory_order_relaxed);
         uint64_t get_or_open_samples =
@@ -2544,17 +2757,30 @@ class BloomCheckServiceImpl {
         uint64_t dequeue_lock_hold_us =
             stats_.total_dequeue_lock_hold_us.load(std::memory_order_relaxed);
         uint64_t cq_next = stats_.cq_next_count.load(std::memory_order_relaxed);
-        uint64_t cq_read = stats_.cq_read_events.load(std::memory_order_relaxed);
-        uint64_t cq_write = stats_.cq_write_events.load(std::memory_order_relaxed);
-        uint64_t cq_finish = stats_.cq_finish_events.load(std::memory_order_relaxed);
+        uint64_t cq_read =
+            stats_.cq_read_events.load(std::memory_order_relaxed);
+        uint64_t cq_write =
+            stats_.cq_write_events.load(std::memory_order_relaxed);
+        uint64_t cq_finish =
+            stats_.cq_finish_events.load(std::memory_order_relaxed);
 
         uint64_t recv_req_per_s = recv - last_recv_req;
         uint64_t worker_deq_per_s = deq - last_worker_deq;
-        uint64_t depth_count_delta = (depth_count >= last_depth_count) ? (depth_count - last_depth_count) : 0;
-        uint64_t worker_queue_depth_avg = depth_count_delta ? (depth_sum - last_depth_sum) / depth_count_delta : 0;
-        uint64_t check_loop_avg_us = (check_n > last_check_loop_count) ? (check_us - last_check_loop_us) / (check_n - last_check_loop_count) : 0;
-        uint64_t wq_count_delta = (wq_count >= last_writeq_count) ? (wq_count - last_writeq_count) : 0;
-        uint64_t writeq_avg = wq_count_delta ? (wq_sum - last_writeq_sum) / wq_count_delta : 0;
+        uint64_t depth_count_delta = (depth_count >= last_depth_count)
+                                         ? (depth_count - last_depth_count)
+                                         : 0;
+        uint64_t worker_queue_depth_avg =
+            depth_count_delta ? (depth_sum - last_depth_sum) / depth_count_delta
+                              : 0;
+        uint64_t check_loop_avg_us = (check_n > last_check_loop_count)
+                                         ? (check_us - last_check_loop_us) /
+                                               (check_n - last_check_loop_count)
+                                         : 0;
+        uint64_t wq_count_delta = (wq_count >= last_writeq_count)
+                                      ? (wq_count - last_writeq_count)
+                                      : 0;
+        uint64_t writeq_avg =
+            wq_count_delta ? (wq_sum - last_writeq_sum) / wq_count_delta : 0;
         uint64_t write_done_per_s = write_done - last_write_done;
         uint64_t finish_or_close_per_s = finish_close - last_finish_or_close;
         uint64_t read_req_per_s = read_req_event - last_read_req_event;
@@ -2565,22 +2791,27 @@ class BloomCheckServiceImpl {
                 : 0;
         uint64_t entry_rw_lock_wait_avg_us =
             entry_lock_wait_sample_delta
-                ? (entry_lock_wait_us - last_entry_lock_wait_us) / entry_lock_wait_sample_delta
+                ? (entry_lock_wait_us - last_entry_lock_wait_us) /
+                      entry_lock_wait_sample_delta
                 : 0;
         uint64_t shard_lru_lock_wait_sample_delta =
             (shard_lru_lock_wait_samples >= last_shard_lru_lock_wait_samples)
-                ? (shard_lru_lock_wait_samples - last_shard_lru_lock_wait_samples)
+                ? (shard_lru_lock_wait_samples -
+                   last_shard_lru_lock_wait_samples)
                 : 0;
         uint64_t shard_lru_lock_wait_avg_us =
             shard_lru_lock_wait_sample_delta
                 ? (shard_lru_lock_wait_us - last_shard_lru_lock_wait_us) /
                       shard_lru_lock_wait_sample_delta
                 : 0;
-        uint64_t last_access_updates_per_s = last_access_updates - last_last_access_updates;
+        uint64_t last_access_updates_per_s =
+            last_access_updates - last_last_access_updates;
         uint64_t cache_miss_per_s = cache_miss - last_cache_miss;
-        uint64_t cache_lookup_hit_per_s = cache_lookup_hit - last_cache_lookup_hit;
+        uint64_t cache_lookup_hit_per_s =
+            cache_lookup_hit - last_cache_lookup_hit;
         uint64_t inflight_wait_per_s = inflight_wait - last_inflight_wait;
-        uint64_t new_table_reader_per_s = new_table_reader - last_new_table_reader;
+        uint64_t new_table_reader_per_s =
+            new_table_reader - last_new_table_reader;
         uint64_t evictions_per_s = eviction - last_eviction;
         uint64_t cache_size_current = cache_.GetTotalCacheSize();
         uint64_t get_or_open_sample_delta =
@@ -2588,30 +2819,33 @@ class BloomCheckServiceImpl {
                 ? (get_or_open_samples - last_get_or_open_samples)
                 : 0;
         uint64_t get_or_open_avg_us =
-            get_or_open_sample_delta
-                ? (get_or_open_us - last_get_or_open_us) / get_or_open_sample_delta
-                : 0;
+            get_or_open_sample_delta ? (get_or_open_us - last_get_or_open_us) /
+                                           get_or_open_sample_delta
+                                     : 0;
         uint64_t open_fail_getfilesize_per_s =
             open_fail_getfilesize - last_open_fail_getfilesize;
-        uint64_t open_fail_newfile_per_s = open_fail_newfile - last_open_fail_newfile;
+        uint64_t open_fail_newfile_per_s =
+            open_fail_newfile - last_open_fail_newfile;
         uint64_t open_fail_newreader_per_s =
             open_fail_newreader - last_open_fail_newreader;
         uint64_t open_fail_total_per_s = open_fail_getfilesize_per_s +
                                          open_fail_newfile_per_s +
                                          open_fail_newreader_per_s;
-        uint64_t open_fail_total = open_fail_getfilesize + open_fail_newfile +
-                                   open_fail_newreader;
+        uint64_t open_fail_total =
+            open_fail_getfilesize + open_fail_newfile + open_fail_newreader;
         uint64_t enqueue_lock_sample_delta =
             (enqueue_lock_samples >= last_enqueue_lock_samples)
                 ? (enqueue_lock_samples - last_enqueue_lock_samples)
                 : 0;
         uint64_t enqueue_lock_wait_avg_us =
             enqueue_lock_sample_delta
-                ? (enqueue_lock_wait_us - last_enqueue_lock_wait_us) / enqueue_lock_sample_delta
+                ? (enqueue_lock_wait_us - last_enqueue_lock_wait_us) /
+                      enqueue_lock_sample_delta
                 : 0;
         uint64_t enqueue_lock_hold_avg_us =
             enqueue_lock_sample_delta
-                ? (enqueue_lock_hold_us - last_enqueue_lock_hold_us) / enqueue_lock_sample_delta
+                ? (enqueue_lock_hold_us - last_enqueue_lock_hold_us) /
+                      enqueue_lock_sample_delta
                 : 0;
         uint64_t dequeue_lock_sample_delta =
             (dequeue_lock_samples >= last_dequeue_lock_samples)
@@ -2619,11 +2853,13 @@ class BloomCheckServiceImpl {
                 : 0;
         uint64_t dequeue_lock_wait_avg_us =
             dequeue_lock_sample_delta
-                ? (dequeue_lock_wait_us - last_dequeue_lock_wait_us) / dequeue_lock_sample_delta
+                ? (dequeue_lock_wait_us - last_dequeue_lock_wait_us) /
+                      dequeue_lock_sample_delta
                 : 0;
         uint64_t dequeue_lock_hold_avg_us =
             dequeue_lock_sample_delta
-                ? (dequeue_lock_hold_us - last_dequeue_lock_hold_us) / dequeue_lock_sample_delta
+                ? (dequeue_lock_hold_us - last_dequeue_lock_hold_us) /
+                      dequeue_lock_sample_delta
                 : 0;
         uint64_t cq_next_per_s = cq_next - last_cq_next;
         uint64_t cq_read_per_s = cq_read - last_cq_read;
@@ -2634,19 +2870,28 @@ class BloomCheckServiceImpl {
           last_write_resp_event_10s = write_resp_event;
           last_write_done_10s = write_done;
         } else if (sec > 10 && (sec - 1) % 10 == 0) {
-          last_computed_write_resp_event_per_10s = write_resp_event - last_write_resp_event_10s;
+          last_computed_write_resp_event_per_10s =
+              write_resp_event - last_write_resp_event_10s;
           last_computed_write_done_per_10s = write_done - last_write_done_10s;
           last_write_resp_event_10s = write_resp_event;
           last_write_done_10s = write_done;
         }
-        uint64_t write_resp_event_per_10s = last_computed_write_resp_event_per_10s;
+        uint64_t write_resp_event_per_10s =
+            last_computed_write_resp_event_per_10s;
         uint64_t write_done_per_10s = last_computed_write_done_per_10s;
 
-        last_recv_req = recv; last_worker_deq = deq; last_depth_sum = depth_sum; last_depth_count = depth_count;
-        last_check_loop_us = check_us; last_check_loop_count = check_n;
-        last_writeq_sum = wq_sum; last_writeq_count = wq_count;
-        last_write_done = write_done; last_finish_or_close = finish_close;
-        last_read_req_event = read_req_event; last_write_resp_event = write_resp_event;
+        last_recv_req = recv;
+        last_worker_deq = deq;
+        last_depth_sum = depth_sum;
+        last_depth_count = depth_count;
+        last_check_loop_us = check_us;
+        last_check_loop_count = check_n;
+        last_writeq_sum = wq_sum;
+        last_writeq_count = wq_count;
+        last_write_done = write_done;
+        last_finish_or_close = finish_close;
+        last_read_req_event = read_req_event;
+        last_write_resp_event = write_resp_event;
         last_entry_lock_wait_us = entry_lock_wait_us;
         last_entry_lock_wait_samples = entry_lock_wait_samples;
         last_shard_lru_lock_wait_us = shard_lru_lock_wait_us;
@@ -2688,8 +2933,10 @@ class BloomCheckServiceImpl {
             done_ss << ",";
           }
           cq_pop_ss << stats_.cq_pop_by_idx[i].load(std::memory_order_relaxed);
-          enq_ss << stats_.enq_to_worker_by_idx[i].load(std::memory_order_relaxed);
-          done_ss << stats_.done_by_worker_by_idx[i].load(std::memory_order_relaxed);
+          enq_ss << stats_.enq_to_worker_by_idx[i].load(
+              std::memory_order_relaxed);
+          done_ss << stats_.done_by_worker_by_idx[i].load(
+              std::memory_order_relaxed);
         }
         cq_pop_ss << "]";
         enq_ss << "]";
@@ -2697,60 +2944,58 @@ class BloomCheckServiceImpl {
 
         {
           std::lock_guard<std::mutex> log_lock(log_mutex_);
-          std::cerr << "[STATS] recv_req_per_s=" << recv_req_per_s
-                    << " worker_deq_per_s=" << worker_deq_per_s
-                    << " worker_queue_depth_avg=" << worker_queue_depth_avg
-                    << " worker_queue_depth_max=" << depth_max
-                    << " check_loop_avg_us=" << check_loop_avg_us
-                    << " writeq_avg=" << writeq_avg
-                    << " writeq_max=" << wq_max
-                    << " max_pending_work_items=" << pending_work_items_max
-                    << " read_req_per_s=" << read_req_per_s
-                    << " write_resp_per_s=" << write_resp_per_s
-                    << " write_resp_event_total=" << write_resp_event
-                    << " write_resp_event_per_10s=" << write_resp_event_per_10s
-                    << " write_done_total=" << write_done
-                    << " write_done_per_10s=" << write_done_per_10s
-                    << " last_access_updates_per_s=" << last_access_updates_per_s
-                    << " cache_size_current=" << cache_size_current
-                    << " cache_size_max=" << cache_.max_size()
-                    << " evictions_per_s=" << evictions_per_s
-                    << " cache_lookup_hit_per_s=" << cache_lookup_hit_per_s
-                    << " inflight_wait_per_s=" << inflight_wait_per_s
-                    << " new_table_reader_per_s=" << new_table_reader_per_s
-                    << " cache_miss_per_s=" << cache_miss_per_s
-                    << " get_or_open_avg_us=" << get_or_open_avg_us
-                    << " open_fail_per_s=" << open_fail_total_per_s
-                    << " open_fail_total=" << open_fail_total
-                    << " open_fail_path_not_found_total="
-                    << open_fail_getfilesize
-                    << " open_fail_new_file_total=" << open_fail_newfile
-                    << " open_fail_new_reader_total=" << open_fail_newreader
-                    << " entry_rw_lock_wait_avg_us=" << entry_rw_lock_wait_avg_us
-                    << " shard_lru_lock_wait_avg_us=" << shard_lru_lock_wait_avg_us
-                    << " entry_lock_enabled=" << (cache_.entry_lock_enabled() ? 1 : 0)
-                    << " last_access_update_every=" << cache_.last_access_update_every()
-                    << " lru_update_every=" << cache_.lru_update_every()
-                    << " write_done_per_s=" << write_done_per_s
-                    << " finish_or_close_per_s=" << finish_or_close_per_s
-                    << " enqueue_lock_wait_avg_us=" << enqueue_lock_wait_avg_us
-                    << " enqueue_lock_hold_avg_us=" << enqueue_lock_hold_avg_us
-                    << " dequeue_lock_wait_avg_us=" << dequeue_lock_wait_avg_us
-                    << " dequeue_lock_hold_avg_us=" << dequeue_lock_hold_avg_us
-                    << " cq_next_per_s=" << cq_next_per_s
-                    << " cq_read_per_s=" << cq_read_per_s
-                    << " cq_write_per_s=" << cq_write_per_s
-                    << " cq_finish_per_s=" << cq_finish_per_s
-                    << std::endl;
+          std::cerr
+              << "[STATS] recv_req_per_s=" << recv_req_per_s
+              << " worker_deq_per_s=" << worker_deq_per_s
+              << " worker_queue_depth_avg=" << worker_queue_depth_avg
+              << " worker_queue_depth_max=" << depth_max
+              << " check_loop_avg_us=" << check_loop_avg_us
+              << " writeq_avg=" << writeq_avg << " writeq_max=" << wq_max
+              << " max_pending_work_items=" << pending_work_items_max
+              << " read_req_per_s=" << read_req_per_s
+              << " write_resp_per_s=" << write_resp_per_s
+              << " write_resp_event_total=" << write_resp_event
+              << " write_resp_event_per_10s=" << write_resp_event_per_10s
+              << " write_done_total=" << write_done
+              << " write_done_per_10s=" << write_done_per_10s
+              << " last_access_updates_per_s=" << last_access_updates_per_s
+              << " cache_size_current=" << cache_size_current
+              << " cache_size_max=" << cache_.max_size()
+              << " evictions_per_s=" << evictions_per_s
+              << " cache_lookup_hit_per_s=" << cache_lookup_hit_per_s
+              << " inflight_wait_per_s=" << inflight_wait_per_s
+              << " new_table_reader_per_s=" << new_table_reader_per_s
+              << " cache_miss_per_s=" << cache_miss_per_s
+              << " get_or_open_avg_us=" << get_or_open_avg_us
+              << " open_fail_per_s=" << open_fail_total_per_s
+              << " open_fail_total=" << open_fail_total
+              << " open_fail_path_not_found_total=" << open_fail_getfilesize
+              << " open_fail_new_file_total=" << open_fail_newfile
+              << " open_fail_new_reader_total=" << open_fail_newreader
+              << " entry_rw_lock_wait_avg_us=" << entry_rw_lock_wait_avg_us
+              << " shard_lru_lock_wait_avg_us=" << shard_lru_lock_wait_avg_us
+              << " entry_lock_enabled=" << (cache_.entry_lock_enabled() ? 1 : 0)
+              << " last_access_update_every="
+              << cache_.last_access_update_every()
+              << " lru_update_every=" << cache_.lru_update_every()
+              << " write_done_per_s=" << write_done_per_s
+              << " finish_or_close_per_s=" << finish_or_close_per_s
+              << " enqueue_lock_wait_avg_us=" << enqueue_lock_wait_avg_us
+              << " enqueue_lock_hold_avg_us=" << enqueue_lock_hold_avg_us
+              << " dequeue_lock_wait_avg_us=" << dequeue_lock_wait_avg_us
+              << " dequeue_lock_hold_avg_us=" << dequeue_lock_hold_avg_us
+              << " cq_next_per_s=" << cq_next_per_s
+              << " cq_read_per_s=" << cq_read_per_s
+              << " cq_write_per_s=" << cq_write_per_s
+              << " cq_finish_per_s=" << cq_finish_per_s << std::endl;
           std::cerr << "[CQ_FLOW] cq_pop=" << cq_pop_ss.str()
                     << " enq_to_worker=" << enq_ss.str()
-                    << " done_by_worker=" << done_ss.str()
-                    << std::endl;
+                    << " done_by_worker=" << done_ss.str() << std::endl;
         }
       }
     });
   }
-  
+
   void StopStatsThread() {
     stop_stats_thread_ = true;
     if (stats_thread_.joinable()) {
@@ -2760,25 +3005,27 @@ class BloomCheckServiceImpl {
 };
 
 // HandleRpcs: CQ 폴러 스레드에서 실행되는 함수
-// IMPORTANT: This thread MUST NOT perform any application logic (bloom filter checks).
-// It only handles CQ events and state transitions.
-void HandleRpcs(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* cq,
-                BloomCheckServiceImpl* impl, PerCQWorkerQueue* worker_queue,
-                size_t cq_idx) {
+// IMPORTANT: This thread MUST NOT perform any application logic (bloom filter
+// checks). It only handles CQ events and state transitions.
+void HandleRpcs(BloomCheck::AsyncService* service,
+                grpc::ServerCompletionQueue* cq, BloomCheckServiceImpl* impl,
+                PerCQWorkerQueue* worker_queue, size_t cq_idx) {
   // 초기 CallData 생성 (ACCEPT 단계)
-  new CheckCallData(service, cq, impl->cache(), impl->rocksdb_options(), impl->stats(),
-                   impl->log_mutex(), impl->open_count(), impl->active_rpc_count(),
-                   impl->total_rpc_count(), impl->clock(), impl->fs(), worker_queue,
-                   impl->server_stats_enabled());
+  new CheckCallData(service, cq, impl->cache(), impl->rocksdb_options(),
+                    impl->stats(), impl->log_mutex(), impl->open_count(),
+                    impl->active_rpc_count(), impl->total_rpc_count(),
+                    impl->clock(), impl->fs(), worker_queue,
+                    impl->server_stats_enabled());
   new NoopCallData(service, cq);
-  new StreamCallData(service, cq, impl->cache(), impl->rocksdb_options(), impl->stats(),
-                     impl->log_mutex(), impl->open_count(), impl->active_rpc_count(),
-                     impl->total_rpc_count(), impl->clock(), impl->fs(), worker_queue,
+  new StreamCallData(service, cq, impl->cache(), impl->rocksdb_options(),
+                     impl->stats(), impl->log_mutex(), impl->open_count(),
+                     impl->active_rpc_count(), impl->total_rpc_count(),
+                     impl->clock(), impl->fs(), worker_queue,
                      impl->server_stats_enabled());
-  
+
   void* tag;
   bool ok;
-  
+
   // CQ에서 이벤트 폴링
   // This loop runs in CQ poller thread - must be fast and non-blocking
   while (true) {
@@ -2795,7 +3042,7 @@ void HandleRpcs(BloomCheck::AsyncService* service, grpc::ServerCompletionQueue* 
 void RunServer(const std::string& server_address, size_t cache_size) {
   // Disable gRPC verbose logging (ERROR level only)
   gpr_set_log_verbosity(GPR_LOG_SEVERITY_ERROR);
-  
+
   bloomcheck::BloomCheckServiceImpl service(cache_size);
 
   grpc::EnableDefaultHealthCheckService(true);
@@ -2803,11 +3050,11 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   grpc::ServerBuilder builder;
   builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
   builder.RegisterService(service.service());
-  
+
   // ============================================
   // gRPC AsyncServer 설정
   // ============================================
-  
+
   // CompletionQueue 생성 (여러 CQ 사용 가능)
   const int NUM_CQS = 4;  // CQ 개수 (필요에 따라 조정)
   service.SetNumCqs(static_cast<size_t>(NUM_CQS));
@@ -2815,37 +3062,39 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   for (int i = 0; i < NUM_CQS; i++) {
     cqs.emplace_back(builder.AddCompletionQueue());
   }
-  
+
   // 1. 스레드 풀 크기 증가
   grpc::ResourceQuota quota;
   quota.SetMaxThreads(128);
   builder.SetResourceQuota(quota);
-  
+
   // 2. HTTP/2 stream concurrency 증가 (connection당)
   builder.AddChannelArgument(GRPC_ARG_MAX_CONCURRENT_STREAMS, 1000);
   builder.AddChannelArgument("grpc.tcp_nodelay", 1);
   builder.AddChannelArgument("grpc.http2.initial_stream_window_size", 1 << 20);
-  builder.AddChannelArgument("grpc.http2.initial_connection_window_size", 16 << 20);
-  
+  builder.AddChannelArgument("grpc.http2.initial_connection_window_size",
+                             16 << 20);
+
   // 3. 메시지 크기 제한
   builder.SetMaxReceiveMessageSize(4 * 1024 * 1024);  // 4MB
-  builder.SetMaxSendMessageSize(4 * 1024 * 1024);    // 4MB
-  
+  builder.SetMaxSendMessageSize(4 * 1024 * 1024);     // 4MB
+
   // 4. Connection 관리
   builder.AddChannelArgument(GRPC_ARG_MAX_CONNECTION_IDLE_MS, 300000);  // 5분
-  builder.AddChannelArgument(GRPC_ARG_MAX_CONNECTION_AGE_MS, 3600000);   // 1시간
-  
+  builder.AddChannelArgument(GRPC_ARG_MAX_CONNECTION_AGE_MS, 3600000);  // 1시간
+
   // ============================================
   // AsyncServer 모델
   // - 각 RPC는 per-RPC state machine으로 처리
   // - ServerCompletionQueue에서 이벤트 폴링
   // - 여러 CQ 폴러 스레드로 병렬 처리
   // ============================================
-  
+
   std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
-  // std::cout << "BloomCheck AsyncServer listening on " << server_address << std::endl;
-  // std::cout << "Using " << NUM_CQS << " CompletionQueues" << std::endl;
-  
+  // std::cout << "BloomCheck AsyncServer listening on " << server_address <<
+  // std::endl; std::cout << "Using " << NUM_CQS << " CompletionQueues" <<
+  // std::endl;
+
   // Per-CQ worker queue 생성 (각 CQ마다 별도의 worker queue)
   // Lock contention을 줄이기 위해 CQ별로 분리
   const size_t NUM_WORKER_THREADS_PER_CQ = 8;  // CQ당 worker thread 개수
@@ -2855,10 +3104,10 @@ void RunServer(const std::string& server_address, size_t cache_size) {
         static_cast<size_t>(i), NUM_WORKER_THREADS_PER_CQ, service.stats(),
         service.server_stats_enabled()));
   }
-  // std::cout << "Using " << NUM_WORKER_THREADS_PER_CQ 
-  //           << " worker threads per CQ (total: " 
+  // std::cout << "Using " << NUM_WORKER_THREADS_PER_CQ
+  //           << " worker threads per CQ (total: "
   //           << (NUM_CQS * NUM_WORKER_THREADS_PER_CQ) << ")" << std::endl;
-  
+
   // CQ 폴러 스레드 생성 (각 CQ당 1개 스레드)
   // CQ poller threads: 빠른 이벤트 처리만 수행 (bloom filter 체크 안 함)
   const size_t NUM_POLLERS_PER_CQ = 1;
@@ -2867,37 +3116,36 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   std::vector<std::thread> cq_threads;
   for (int i = 0; i < NUM_CQS; i++) {
     for (size_t p = 0; p < NUM_POLLERS_PER_CQ; ++p) {
-      cq_threads.emplace_back(std::thread(
-          [&, i]() {
-            const int pin_idx = poller_pin_index.fetch_add(1, std::memory_order_relaxed);
-            const int cpu_id = POLLER_PIN_START_CPU + pin_idx;
-            (void)bloomcheck::PinCurrentThreadToCpu(cpu_id);
-            bloomcheck::HandleRpcs(service.service(), cqs[i].get(), &service,
-                                   worker_queues[i].get(),
-                                   static_cast<size_t>(i));
-          }));
+      cq_threads.emplace_back(std::thread([&, i]() {
+        const int pin_idx =
+            poller_pin_index.fetch_add(1, std::memory_order_relaxed);
+        const int cpu_id = POLLER_PIN_START_CPU + pin_idx;
+        (void)bloomcheck::PinCurrentThreadToCpu(cpu_id);
+        bloomcheck::HandleRpcs(service.service(), cqs[i].get(), &service,
+                               worker_queues[i].get(), static_cast<size_t>(i));
+      }));
     }
   }
-  
+
   // 서버 종료 대기
   server->Wait();
-  
+
   // 서버 종료 시 CQ 종료
   server->Shutdown();
   for (auto& cq : cqs) {
     cq->Shutdown();
   }
-  
+
   // Worker queues 종료 (큐에 남은 작업 처리)
   for (auto& wq : worker_queues) {
     wq->Shutdown();
   }
-  
+
   // CQ 폴러 스레드 종료 대기
   for (auto& t : cq_threads) {
     t.join();
   }
-  
+
   // 남은 이벤트 처리
   for (auto& cq : cqs) {
     void* tag;
@@ -2907,7 +3155,6 @@ void RunServer(const std::string& server_address, size_t cache_size) {
     }
   }
 }
-
 
 int main(int argc, char** argv) {
   setenv("GRPC_POLL_STRATEGY", "epoll1", 1);

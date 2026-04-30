@@ -152,6 +152,21 @@ class FilterBlockReader {
                            BlockCacheLookupContext* lookup_context,
                            const ReadOptions& read_options) = 0;
 
+  virtual bool KeyMayMatchAndGetFilterPartitionBlock(
+      const Slice& key, const Slice* const const_ikey_ptr,
+      GetContext* get_context, BlockCacheLookupContext* lookup_context,
+      const ReadOptions& read_options, uint64_t* filter_partition_offset,
+      std::string* filter_partition_contents) {
+    if (filter_partition_offset) {
+      *filter_partition_offset = kNotValid;
+    }
+    if (filter_partition_contents) {
+      filter_partition_contents->clear();
+    }
+    return KeyMayMatch(key, const_ikey_ptr, get_context, lookup_context,
+                       read_options);
+  }
+
   virtual void KeysMayMatch(MultiGetRange* range,
                             BlockCacheLookupContext* lookup_context,
                             const ReadOptions& read_options) {
