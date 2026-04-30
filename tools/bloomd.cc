@@ -841,7 +841,7 @@ class TableReaderCache {
 
     // Match the baseline path by opening SSTs with direct I/O.
     ROCKSDB_NAMESPACE::EnvOptions env_options;
-    // env_options.use_direct_reads = true;
+    env_options.use_direct_reads = true;
     ROCKSDB_NAMESPACE::ReadOptions read_options;
     read_options.read_tier =
         ROCKSDB_NAMESPACE::kReadAllTier;  // Allow file reads
@@ -2784,7 +2784,7 @@ class BloomCheckServiceImpl {
             IsFilterBlockPreadCountForRequestEnabled()) {
     // Configure RocksDB options for filter-only access
     rocksdb_options_.env = ROCKSDB_NAMESPACE::Env::Default();
-    // rocksdb_options_.use_direct_reads = true;
+    rocksdb_options_.use_direct_reads = true;
 
     // Disable RocksDB verbose logging (ERROR level only)
     rocksdb_options_.info_log_level =
@@ -2795,9 +2795,11 @@ class BloomCheckServiceImpl {
     bbto.filter_policy.reset(
         ROCKSDB_NAMESPACE::NewBloomFilterPolicy(10, false));
     bbto.whole_key_filtering = true;
+    bbto.index_type =
+        ROCKSDB_NAMESPACE::BlockBasedTableOptions::kTwoLevelIndexSearch;
     bbto.partition_filters = true;
     bbto.cache_index_and_filter_blocks = true;
-    bbto.pin_top_level_index_and_filter = true;
+    bbto.pin_top_level_index_and_filter = false;
     bbto.metadata_cache_options.top_level_index_pinning =
         ROCKSDB_NAMESPACE::PinningTier::kNone;
     bbto.metadata_cache_options.partition_pinning =
