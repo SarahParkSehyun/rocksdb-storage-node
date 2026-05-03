@@ -8,6 +8,7 @@
 #include "db/dbformat.h"
 #include "file/filename.h"
 #include "file/random_access_file_reader.h"
+#include "rocksdb/cache.h"
 #include "rocksdb/env.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/table.h"
@@ -18,6 +19,11 @@
 namespace pruneoff {
 
 namespace {
+
+constexpr size_t kBlockCacheSize = 1;
+constexpr int kCacheNumShardBits = -1;
+constexpr int kBloomBitsPerKey = 10;
+constexpr size_t kBlockSize = 4096;
 
 std::string JoinPath(const std::string& dir, const std::string& file) {
   if (dir.empty() || dir.back() == '/') {
@@ -42,9 +48,18 @@ BloomEvaluator::BloomEvaluator(std::string db_path, size_t cache_capacity)
 
   ROCKSDB_NAMESPACE::BlockBasedTableOptions table_options;
   table_options.filter_policy.reset(
-      ROCKSDB_NAMESPACE::NewBloomFilterPolicy(10, false));
+      ROCKSDB_NAMESPACE::NewBloomFilterPolicy(kBloomBitsPerKey, false));
   table_options.whole_key_filtering = true;
+  table_options.index_type =
+      ROCKSDB_NAMESPACE::BlockBasedTableOptions::kTwoLevelIndexSearch;
   table_options.partition_filters = true;
+  table_options.cache_index_and_filter_blocks = true;
+  table_options.pin_top_level_index_and_filter = false;
+  table_options.block_size = kBlockSize;
+  table_options.block_cache =
+      ROCKSDB_NAMESPACE::HyperClockCacheOptions(kBlockCacheSize, 0,
+                                                kCacheNumShardBits)
+          .MakeSharedCache();
   options_.table_factory.reset(
       ROCKSDB_NAMESPACE::NewBlockBasedTableFactory(table_options));
 
