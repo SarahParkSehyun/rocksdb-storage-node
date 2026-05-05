@@ -15,7 +15,7 @@ namespace pruneoff {
 
 class BloomEvaluator {
  public:
-  explicit BloomEvaluator(std::string db_path, size_t cache_capacity = 4096);
+  explicit BloomEvaluator(std::string db_path, size_t cache_capacity = 13000);
 
   BloomEvaluator(const BloomEvaluator&) = delete;
   BloomEvaluator& operator=(const BloomEvaluator&) = delete;

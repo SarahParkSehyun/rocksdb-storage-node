@@ -31,6 +31,7 @@ void ThreadPool::Stop() {
       return;
     }
     stopping_ = true;
+    tasks_ = {};
   }
   cv_.notify_all();
   for (std::thread& worker : workers_) {

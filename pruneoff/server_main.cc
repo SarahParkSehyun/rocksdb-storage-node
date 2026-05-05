@@ -7,6 +7,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -23,10 +24,36 @@ bool ParseArg(const std::string& arg, const std::string& prefix,
   return true;
 }
 
+bool ParseCpuList(const std::string& value, std::vector<int>* cpus) {
+  cpus->clear();
+  size_t start = 0;
+  while (start <= value.size()) {
+    size_t comma = value.find(',', start);
+    if (comma == std::string::npos) {
+      comma = value.size();
+    }
+    if (comma == start) {
+      return false;
+    }
+    const int cpu = std::stoi(value.substr(start, comma - start));
+    if (cpu < 0) {
+      return false;
+    }
+    cpus->push_back(cpu);
+    if (comma == value.size()) {
+      break;
+    }
+    start = comma + 1;
+  }
+  return !cpus->empty();
+}
+
 void Usage(const char* prog) {
   std::cerr << "usage: " << prog
             << " --db_path=/path/to/rocksdb [--bind=0.0.0.0]"
-            << " [--port=7471] [--workers=8] [--poller_cpu=N]\n";
+            << " [--port=7471] [--workers=8]"
+            << " [--recv_depth=256] [--send_depth=256]"
+            << " [--poller_cpu=N] [--poller_cpus=N[,M...]]\n";
 }
 
 }  // namespace
@@ -45,12 +72,24 @@ int main(int argc, char** argv) {
       options.port = static_cast<uint16_t>(std::stoul(value));
     } else if (ParseArg(arg, "--workers=", &value)) {
       options.worker_threads = std::stoul(value);
-    } else if (ParseArg(arg, "--recv_depth=", &value)) {
+    } else if (ParseArg(arg, "--recv_depth=", &value) ||
+               ParseArg(arg, "--recv_pool_depth=", &value)) {
       options.recv_pool_depth = std::stoul(value);
-    } else if (ParseArg(arg, "--send_depth=", &value)) {
+    } else if (ParseArg(arg, "--send_depth=", &value) ||
+               ParseArg(arg, "--send_pool_depth=", &value)) {
       options.send_pool_depth = std::stoul(value);
     } else if (ParseArg(arg, "--poller_cpu=", &value)) {
-      options.poller_cpu = std::stoi(value);
+      const int cpu = std::stoi(value);
+      if (cpu < 0) {
+        std::cerr << "--poller_cpu must be non-negative\n";
+        return 2;
+      }
+      options.poller_cpus = {cpu};
+    } else if (ParseArg(arg, "--poller_cpus=", &value)) {
+      if (!ParseCpuList(value, &options.poller_cpus)) {
+        std::cerr << "--poller_cpus must be a comma-separated CPU list\n";
+        return 2;
+      }
     } else if (arg == "--help" || arg == "-h") {
       Usage(argv[0]);
       return 0;

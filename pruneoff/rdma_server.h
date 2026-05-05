@@ -27,7 +27,7 @@ class RDMAServer {
     size_t worker_threads = 8;
     size_t recv_pool_depth = 256;
     size_t send_pool_depth = 256;
-    int poller_cpu = -1;
+    std::vector<int> poller_cpus;
   };
 
   explicit RDMAServer(Options options);
@@ -63,6 +63,7 @@ class RDMAServer {
     std::vector<size_t> free_send_slots;
     std::thread poller;
     std::atomic<bool> running{false};
+    int poller_cpu = -1;
     RDMAServer* server = nullptr;
   };
 
@@ -87,6 +88,7 @@ class RDMAServer {
                        size_t* slot);
   void ReleaseSendSlot(const std::shared_ptr<Connection>& connection,
                        size_t slot);
+  int NextPollerCpu();
 
   static uintptr_t RecvWrId(size_t slot);
   static uintptr_t SendWrId(size_t slot);
@@ -103,6 +105,7 @@ class RDMAServer {
   std::thread event_thread_;
   std::mutex connections_mutex_;
   std::vector<std::shared_ptr<Connection>> connections_;
+  size_t next_poller_cpu_index_ = 0;
 };
 
 }  // namespace pruneoff

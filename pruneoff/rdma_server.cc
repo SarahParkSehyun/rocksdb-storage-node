@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <pthread.h>
+#include <poll.h>
 #include <sys/socket.h>
 
 #include <cerrno>
@@ -91,6 +92,9 @@ void RDMAServer::Stop() {
     return;
   }
 
+  if (event_thread_.joinable()) {
+    event_thread_.join();
+  }
   if (listener_ != nullptr) {
     rdma_destroy_id(listener_);
     listener_ = nullptr;
@@ -98,9 +102,6 @@ void RDMAServer::Stop() {
   if (event_channel_ != nullptr) {
     rdma_destroy_event_channel(event_channel_);
     event_channel_ = nullptr;
-  }
-  if (event_thread_.joinable()) {
-    event_thread_.join();
   }
 
   std::vector<std::shared_ptr<Connection>> connections;
@@ -148,6 +149,35 @@ bool RDMAServer::SetupListener() {
 
 void RDMAServer::EventLoop() {
   while (running_) {
+    pollfd pfd{};
+    pfd.fd = event_channel_->fd;
+    pfd.events = POLLIN;
+
+    const int poll_result = poll(&pfd, 1, 100);
+    if (!running_) {
+      break;
+    }
+    if (poll_result < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      std::cerr << "poll RDMA CM event channel failed: "
+                << std::strerror(errno) << "\n";
+      break;
+    }
+    if (poll_result == 0) {
+      continue;
+    }
+    if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+      if (running_) {
+        std::cerr << "RDMA CM event channel closed unexpectedly\n";
+      }
+      break;
+    }
+    if ((pfd.revents & POLLIN) == 0) {
+      continue;
+    }
+
     rdma_cm_event* event = nullptr;
     if (rdma_get_cm_event(event_channel_, &event) != 0) {
       if (running_) {
@@ -204,6 +234,7 @@ bool RDMAServer::HandleConnectRequest(rdma_cm_id* id) {
     return false;
   }
 
+  connection->poller_cpu = NextPollerCpu();
   connection->running = true;
   connection->poller = std::thread([this, connection] { PollLoop(connection); });
   {
@@ -304,7 +335,7 @@ void RDMAServer::DestroyConnection(
 }
 
 void RDMAServer::PollLoop(std::shared_ptr<Connection> connection) {
-  PinCurrentThreadToCpu(options_.poller_cpu);
+  PinCurrentThreadToCpu(connection->poller_cpu);
   ibv_wc completions[kPollBatch];
   while (running_ && connection->running) {
     const int n = ibv_poll_cq(connection->cq, kPollBatch, completions);
@@ -455,6 +486,16 @@ void RDMAServer::ReleaseSendSlot(
     connection->free_send_slots.push_back(slot);
   }
   connection->send_cv.notify_one();
+}
+
+int RDMAServer::NextPollerCpu() {
+  if (options_.poller_cpus.empty()) {
+    return -1;
+  }
+  const int cpu =
+      options_.poller_cpus[next_poller_cpu_index_ % options_.poller_cpus.size()];
+  ++next_poller_cpu_index_;
+  return cpu;
 }
 
 uintptr_t RDMAServer::RecvWrId(size_t slot) { return slot; }
