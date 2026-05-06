@@ -1,8 +1,10 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
@@ -33,9 +35,17 @@ class BloomEvaluator {
     std::unique_ptr<ROCKSDB_NAMESPACE::TableReader> reader;
   };
 
+  struct CacheShard {
+    mutable std::shared_mutex mutex;
+    std::unordered_map<uint64_t, std::shared_ptr<CacheEntry>> cache;
+  };
+
   std::shared_ptr<CacheEntry> GetOrOpen(uint64_t file_number);
   ROCKSDB_NAMESPACE::Status OpenTable(uint64_t file_number, CacheEntry* entry);
   std::string ResolveSstPath(uint64_t file_number, uint64_t* file_size) const;
+  CacheShard& GetCacheShard(uint64_t file_number);
+  std::mutex& GetLoaderMutex(uint64_t file_number);
+  size_t PerShardCacheCapacity() const;
 
   const std::string db_path_;
   const size_t cache_capacity_;
@@ -43,8 +53,10 @@ class BloomEvaluator {
   ROCKSDB_NAMESPACE::EnvOptions env_options_;
   std::shared_ptr<ROCKSDB_NAMESPACE::SystemClock> clock_;
 
-  std::mutex cache_mutex_;
-  std::unordered_map<uint64_t, std::shared_ptr<CacheEntry>> cache_;
+  static constexpr size_t kCacheShardCount = 64;
+  static constexpr size_t kLoaderMutexCount = 1024;
+  std::array<CacheShard, kCacheShardCount> cache_shards_;
+  std::array<std::mutex, kLoaderMutexCount> loader_mutexes_;
 };
 
 }  // namespace pruneoff

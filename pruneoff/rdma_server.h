@@ -25,6 +25,7 @@ class RDMAServer {
     uint16_t port = 7471;
     std::string db_path;
     size_t worker_threads = 8;
+    size_t worker_threads_per_connection = 0;
     size_t recv_pool_depth = 256;
     size_t send_pool_depth = 256;
     std::vector<int> poller_cpus;
@@ -61,6 +62,7 @@ class RDMAServer {
     std::mutex send_mutex;
     std::condition_variable send_cv;
     std::vector<size_t> free_send_slots;
+    std::unique_ptr<ThreadPool> workers;
     std::thread poller;
     std::atomic<bool> running{false};
     int poller_cpu = -1;

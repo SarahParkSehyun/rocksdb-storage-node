@@ -92,6 +92,7 @@ bool BloomEvaluator::KeyMayMatch(uint64_t file_number,
 
   ROCKSDB_NAMESPACE::ReadOptions read_options;
   read_options.read_tier = ROCKSDB_NAMESPACE::kReadAllTier;
+  read_options.fill_cache = false;
 
   const size_t timestamp_size = user_comparator->timestamp_size();
   ROCKSDB_NAMESPACE::Slice user_key_without_ts =
@@ -123,9 +124,20 @@ bool BloomEvaluator::KeyMayMatch(uint64_t file_number,
 std::shared_ptr<BloomEvaluator::CacheEntry> BloomEvaluator::GetOrOpen(
     uint64_t file_number) {
   {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    auto it = cache_.find(file_number);
-    if (it != cache_.end()) {
+    CacheShard& shard = GetCacheShard(file_number);
+    std::shared_lock<std::shared_mutex> lock(shard.mutex);
+    auto it = shard.cache.find(file_number);
+    if (it != shard.cache.end()) {
+      return it->second;
+    }
+  }
+
+  std::unique_lock<std::mutex> load_lock(GetLoaderMutex(file_number));
+  {
+    CacheShard& shard = GetCacheShard(file_number);
+    std::shared_lock<std::shared_mutex> lock(shard.mutex);
+    auto it = shard.cache.find(file_number);
+    if (it != shard.cache.end()) {
       return it->second;
     }
   }
@@ -138,13 +150,34 @@ std::shared_ptr<BloomEvaluator::CacheEntry> BloomEvaluator::GetOrOpen(
     return nullptr;
   }
 
-  std::lock_guard<std::mutex> lock(cache_mutex_);
-  if (cache_.size() >= cache_capacity_ && !cache_.empty()) {
-    cache_.erase(cache_.begin());
+  CacheShard& shard = GetCacheShard(file_number);
+  std::unique_lock<std::shared_mutex> lock(shard.mutex);
+  auto existing = shard.cache.find(file_number);
+  if (existing != shard.cache.end()) {
+    return existing->second;
   }
-  auto [it, inserted] = cache_.emplace(file_number, entry);
+  if (shard.cache.size() >= PerShardCacheCapacity() && !shard.cache.empty()) {
+    shard.cache.erase(shard.cache.begin());
+  }
+  auto [it, inserted] = shard.cache.emplace(file_number, entry);
   (void)inserted;
   return it->second;
+}
+
+BloomEvaluator::CacheShard& BloomEvaluator::GetCacheShard(
+    uint64_t file_number) {
+  return cache_shards_[std::hash<uint64_t>{}(file_number) %
+                       cache_shards_.size()];
+}
+
+std::mutex& BloomEvaluator::GetLoaderMutex(uint64_t file_number) {
+  return loader_mutexes_[std::hash<uint64_t>{}(file_number) %
+                         loader_mutexes_.size()];
+}
+
+size_t BloomEvaluator::PerShardCacheCapacity() const {
+  return std::max<size_t>(
+      size_t{1}, (cache_capacity_ + kCacheShardCount - 1) / kCacheShardCount);
 }
 
 ROCKSDB_NAMESPACE::Status BloomEvaluator::OpenTable(uint64_t file_number,

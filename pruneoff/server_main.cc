@@ -52,6 +52,7 @@ void Usage(const char* prog) {
   std::cerr << "usage: " << prog
             << " --db_path=/path/to/rocksdb [--bind=0.0.0.0]"
             << " [--port=7471] [--workers=8]"
+            << " [--workers_per_connection=N]"
             << " [--recv_depth=256] [--send_depth=256]"
             << " [--poller_cpu=N] [--poller_cpus=N[,M...]]\n";
 }
@@ -72,6 +73,8 @@ int main(int argc, char** argv) {
       options.port = static_cast<uint16_t>(std::stoul(value));
     } else if (ParseArg(arg, "--workers=", &value)) {
       options.worker_threads = std::stoul(value);
+    } else if (ParseArg(arg, "--workers_per_connection=", &value)) {
+      options.worker_threads_per_connection = std::stoul(value);
     } else if (ParseArg(arg, "--recv_depth=", &value) ||
                ParseArg(arg, "--recv_pool_depth=", &value)) {
       options.recv_pool_depth = std::stoul(value);
@@ -102,6 +105,11 @@ int main(int argc, char** argv) {
 
   if (options.db_path.empty()) {
     Usage(argv[0]);
+    return 2;
+  }
+  if (options.worker_threads_per_connection == 0 &&
+      options.worker_threads == 0) {
+    std::cerr << "either --workers or --workers_per_connection must be > 0\n";
     return 2;
   }
 

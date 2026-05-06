@@ -28,7 +28,9 @@ void* SlotAddress(void* base, size_t slot, size_t slot_size) {
 RDMAServer::RDMAServer(Options options)
     : options_(std::move(options)),
       evaluator_(options_.db_path),
-      workers_(options_.worker_threads) {}
+      workers_(options_.worker_threads_per_connection == 0
+                   ? options_.worker_threads
+                   : 0) {}
 
 RDMAServer::~RDMAServer() { Stop(); }
 
@@ -234,6 +236,10 @@ bool RDMAServer::HandleConnectRequest(rdma_cm_id* id) {
     return false;
   }
 
+  if (options_.worker_threads_per_connection > 0) {
+    connection->workers =
+        std::make_unique<ThreadPool>(options_.worker_threads_per_connection);
+  }
   connection->poller_cpu = NextPollerCpu();
   connection->running = true;
   connection->poller = std::thread([this, connection] { PollLoop(connection); });
@@ -332,6 +338,9 @@ void RDMAServer::DestroyConnection(
   if (connection->poller.joinable()) {
     connection->poller.join();
   }
+  if (connection->workers) {
+    connection->workers->Stop();
+  }
 }
 
 void RDMAServer::PollLoop(std::shared_ptr<Connection> connection) {
@@ -369,9 +378,14 @@ void RDMAServer::DispatchRecv(const std::shared_ptr<Connection>& connection,
   const auto* request = static_cast<const PruneOffRequest*>(
       SlotAddress(connection->recv_pool, recv_slot, sizeof(PruneOffRequest)));
   item.request = *request;
-  workers_.Enqueue([this, item = std::move(item)]() mutable {
+  auto task = [this, item = std::move(item)]() mutable {
     EvaluateAndSend(std::move(item));
-  });
+  };
+  if (connection->workers) {
+    connection->workers->Enqueue(std::move(task));
+  } else {
+    workers_.Enqueue(std::move(task));
+  }
 }
 
 void RDMAServer::EvaluateAndSend(WorkItem item) {
