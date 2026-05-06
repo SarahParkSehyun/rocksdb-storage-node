@@ -85,6 +85,8 @@ class RDMAServer {
                     size_t recv_slot);
   void EvaluateAndSend(WorkItem item);
   bool PostRecv(const std::shared_ptr<Connection>& connection, size_t slot);
+  bool PostRecvBatch(const std::shared_ptr<Connection>& connection,
+                     const size_t* slots, size_t count);
   bool PostSend(const std::shared_ptr<Connection>& connection, size_t slot);
   bool AcquireSendSlot(const std::shared_ptr<Connection>& connection,
                        size_t* slot);

@@ -6,6 +6,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <iostream>
@@ -323,8 +324,19 @@ bool RDMAServer::InitConnection(
   for (size_t i = 0; i < connection->send_pool_depth; ++i) {
     connection->free_send_slots.push_back(connection->send_pool_depth - 1 - i);
   }
+  std::array<size_t, kPollBatch> recv_slots;
+  size_t recv_count = 0;
   for (size_t i = 0; i < connection->recv_pool_depth; ++i) {
-    if (!PostRecv(connection, i)) {
+    recv_slots[recv_count++] = i;
+    if (recv_count == recv_slots.size()) {
+      if (!PostRecvBatch(connection, recv_slots.data(), recv_count)) {
+        return false;
+      }
+      recv_count = 0;
+    }
+  }
+  if (recv_count > 0) {
+    if (!PostRecvBatch(connection, recv_slots.data(), recv_count)) {
       return false;
     }
   }
@@ -346,12 +358,14 @@ void RDMAServer::DestroyConnection(
 void RDMAServer::PollLoop(std::shared_ptr<Connection> connection) {
   PinCurrentThreadToCpu(connection->poller_cpu);
   ibv_wc completions[kPollBatch];
+  std::array<size_t, kPollBatch> recv_slots;
   while (running_ && connection->running) {
     const int n = ibv_poll_cq(connection->cq, kPollBatch, completions);
     if (n < 0) {
       std::cerr << "ibv_poll_cq failed\n";
       break;
     }
+    size_t recv_count = 0;
     for (int i = 0; i < n; ++i) {
       const ibv_wc& wc = completions[i];
       if (wc.status != IBV_WC_SUCCESS) {
@@ -363,10 +377,13 @@ void RDMAServer::PollLoop(std::shared_ptr<Connection> connection) {
       if (wc.opcode == IBV_WC_RECV) {
         const size_t slot = SlotFromWrId(wr_id);
         DispatchRecv(connection, slot);
-        PostRecv(connection, slot);
+        recv_slots[recv_count++] = slot;
       } else if (wc.opcode == IBV_WC_SEND) {
         ReleaseSendSlot(connection, SlotFromWrId(wr_id));
       }
+    }
+    if (recv_count > 0) {
+      PostRecvBatch(connection, recv_slots.data(), recv_count);
     }
   }
 }
@@ -437,21 +454,39 @@ void RDMAServer::EvaluateAndSend(WorkItem item) {
 
 bool RDMAServer::PostRecv(const std::shared_ptr<Connection>& connection,
                           size_t slot) {
-  ibv_sge sge{};
-  sge.addr = reinterpret_cast<uint64_t>(
-      SlotAddress(connection->recv_pool, slot, sizeof(PruneOffRequest)));
-  sge.length = sizeof(PruneOffRequest);
-  sge.lkey = connection->recv_mr->lkey;
+  return PostRecvBatch(connection, &slot, 1);
+}
 
-  ibv_recv_wr wr{};
-  wr.wr_id = RecvWrId(slot);
-  wr.sg_list = &sge;
-  wr.num_sge = 1;
+bool RDMAServer::PostRecvBatch(const std::shared_ptr<Connection>& connection,
+                               const size_t* slots, size_t count) {
+  while (count > 0) {
+    const size_t chunk =
+        count < static_cast<size_t>(kPollBatch) ? count : kPollBatch;
+    std::array<ibv_sge, kPollBatch> sges{};
+    std::array<ibv_recv_wr, kPollBatch> wrs{};
 
-  ibv_recv_wr* bad_wr = nullptr;
-  if (ibv_post_recv(connection->qp, &wr, &bad_wr) != 0) {
-    std::cerr << "ibv_post_recv failed: " << std::strerror(errno) << "\n";
-    return false;
+    for (size_t i = 0; i < chunk; ++i) {
+      const size_t slot = slots[i];
+      sges[i].addr = reinterpret_cast<uint64_t>(
+          SlotAddress(connection->recv_pool, slot, sizeof(PruneOffRequest)));
+      sges[i].length = sizeof(PruneOffRequest);
+      sges[i].lkey = connection->recv_mr->lkey;
+
+      wrs[i].wr_id = RecvWrId(slot);
+      wrs[i].sg_list = &sges[i];
+      wrs[i].num_sge = 1;
+      wrs[i].next = i + 1 < chunk ? &wrs[i + 1] : nullptr;
+    }
+
+    ibv_recv_wr* bad_wr = nullptr;
+    if (ibv_post_recv(connection->qp, &wrs[0], &bad_wr) != 0) {
+      std::cerr << "ibv_post_recv batch failed: " << std::strerror(errno)
+                << "\n";
+      return false;
+    }
+
+    slots += chunk;
+    count -= chunk;
   }
   return true;
 }
