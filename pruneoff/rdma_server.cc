@@ -6,6 +6,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstring>
@@ -18,6 +19,8 @@ namespace pruneoff {
 namespace {
 
 constexpr int kPollBatch = 32;
+constexpr size_t kSendSignalInterval = 32;
+constexpr size_t kMaxIdlePauseCount = 64;
 constexpr uintptr_t kSendWrMask = uintptr_t{1} << (sizeof(uintptr_t) * 8 - 1);
 
 void* SlotAddress(void* base, size_t slot, size_t slot_size) {
@@ -57,9 +60,13 @@ RDMAServer::Connection::~Connection() {
     ibv_dereg_mr(send_mr);
     send_mr = nullptr;
   }
-  if (cq != nullptr) {
-    ibv_destroy_cq(cq);
-    cq = nullptr;
+  if (send_cq != nullptr) {
+    ibv_destroy_cq(send_cq);
+    send_cq = nullptr;
+  }
+  if (recv_cq != nullptr) {
+    ibv_destroy_cq(recv_cq);
+    recv_cq = nullptr;
   }
   if (pd != nullptr) {
     ibv_dealloc_pd(pd);
@@ -276,16 +283,22 @@ bool RDMAServer::InitConnection(
     return false;
   }
 
-  connection->cq = ibv_create_cq(connection->id->verbs, 8192, nullptr, nullptr,
-                                 0);
-  if (connection->cq == nullptr) {
-    std::cerr << "ibv_create_cq failed\n";
+  connection->send_cq =
+      ibv_create_cq(connection->id->verbs, 8192, nullptr, nullptr, 0);
+  if (connection->send_cq == nullptr) {
+    std::cerr << "ibv_create_cq for send CQ failed\n";
+    return false;
+  }
+  connection->recv_cq =
+      ibv_create_cq(connection->id->verbs, 8192, nullptr, nullptr, 0);
+  if (connection->recv_cq == nullptr) {
+    std::cerr << "ibv_create_cq for recv CQ failed\n";
     return false;
   }
 
   ibv_qp_init_attr qp_attr{};
-  qp_attr.send_cq = connection->cq;
-  qp_attr.recv_cq = connection->cq;
+  qp_attr.send_cq = connection->send_cq;
+  qp_attr.recv_cq = connection->recv_cq;
   qp_attr.qp_type = IBV_QPT_RC;
   qp_attr.cap.max_send_wr = 4096;
   qp_attr.cap.max_recv_wr = 4096;
@@ -359,14 +372,16 @@ void RDMAServer::PollLoop(std::shared_ptr<Connection> connection) {
   PinCurrentThreadToCpu(connection->poller_cpu);
   ibv_wc completions[kPollBatch];
   std::array<size_t, kPollBatch> recv_slots;
+  size_t idle_poll_count = 0;
   while (running_ && connection->running) {
-    const int n = ibv_poll_cq(connection->cq, kPollBatch, completions);
-    if (n < 0) {
-      std::cerr << "ibv_poll_cq failed\n";
+    const int recv_n =
+        ibv_poll_cq(connection->recv_cq, kPollBatch, completions);
+    if (recv_n < 0) {
+      std::cerr << "ibv_poll_cq for recv CQ failed\n";
       break;
     }
     size_t recv_count = 0;
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0; i < recv_n; ++i) {
       const ibv_wc& wc = completions[i];
       if (wc.status != IBV_WC_SUCCESS) {
         std::cerr << "RDMA WC error: " << ibv_wc_status_str(wc.status)
@@ -378,12 +393,39 @@ void RDMAServer::PollLoop(std::shared_ptr<Connection> connection) {
         const size_t slot = SlotFromWrId(wr_id);
         DispatchRecv(connection, slot);
         recv_slots[recv_count++] = slot;
-      } else if (wc.opcode == IBV_WC_SEND) {
-        ReleaseSendSlot(connection, SlotFromWrId(wr_id));
       }
     }
     if (recv_count > 0) {
       PostRecvBatch(connection, recv_slots.data(), recv_count);
+    }
+
+    const int send_n =
+        ibv_poll_cq(connection->send_cq, kPollBatch, completions);
+    if (send_n < 0) {
+      std::cerr << "ibv_poll_cq for send CQ failed\n";
+      break;
+    }
+    for (int i = 0; i < send_n; ++i) {
+      const ibv_wc& wc = completions[i];
+      if (wc.status != IBV_WC_SUCCESS) {
+        std::cerr << "RDMA WC error: " << ibv_wc_status_str(wc.status)
+                  << "\n";
+        continue;
+      }
+      if (wc.opcode == IBV_WC_SEND) {
+        ReleaseCompletedSendSlots(
+            connection, SlotFromWrId(static_cast<uintptr_t>(wc.wr_id)));
+      }
+    }
+
+    if (recv_n == 0 && send_n == 0) {
+      const size_t pause_count =
+          std::min(++idle_poll_count, kMaxIdlePauseCount);
+      for (size_t i = 0; i < pause_count; ++i) {
+        asm volatile("pause" ::: "memory");
+      }
+    } else {
+      idle_poll_count = 0;
     }
   }
 }
@@ -504,12 +546,27 @@ bool RDMAServer::PostSend(const std::shared_ptr<Connection>& connection,
   wr.opcode = IBV_WR_SEND;
   wr.sg_list = &sge;
   wr.num_sge = 1;
-  wr.send_flags = IBV_SEND_SIGNALED;
 
   ibv_send_wr* bad_wr = nullptr;
-  if (ibv_post_send(connection->qp, &wr, &bad_wr) != 0) {
-    std::cerr << "ibv_post_send failed: " << std::strerror(errno) << "\n";
-    return false;
+  {
+    std::lock_guard<std::mutex> lock(connection->send_post_mutex);
+    connection->pending_send_slots.push_back(slot);
+    ++connection->sends_since_signal;
+    if (connection->sends_since_signal >= kSendSignalInterval) {
+      wr.send_flags = IBV_SEND_SIGNALED;
+      connection->sends_since_signal = 0;
+    }
+
+    if (ibv_post_send(connection->qp, &wr, &bad_wr) != 0) {
+      connection->pending_send_slots.pop_back();
+      if (wr.send_flags & IBV_SEND_SIGNALED) {
+        connection->sends_since_signal = kSendSignalInterval - 1;
+      } else if (connection->sends_since_signal > 0) {
+        --connection->sends_since_signal;
+      }
+      std::cerr << "ibv_post_send failed: " << std::strerror(errno) << "\n";
+      return false;
+    }
   }
   return true;
 }
@@ -535,6 +592,36 @@ void RDMAServer::ReleaseSendSlot(
     connection->free_send_slots.push_back(slot);
   }
   connection->send_cv.notify_one();
+}
+
+void RDMAServer::ReleaseCompletedSendSlots(
+    const std::shared_ptr<Connection>& connection, size_t signaled_slot) {
+  std::vector<size_t> completed_slots;
+  {
+    std::lock_guard<std::mutex> lock(connection->send_post_mutex);
+    auto end = connection->pending_send_slots.end();
+    auto it = std::find(connection->pending_send_slots.begin(), end,
+                        signaled_slot);
+    if (it == end) {
+      return;
+    }
+    while (!connection->pending_send_slots.empty()) {
+      const size_t slot = connection->pending_send_slots.front();
+      connection->pending_send_slots.pop_front();
+      completed_slots.push_back(slot);
+      if (slot == signaled_slot) {
+        break;
+      }
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(connection->send_mutex);
+    for (size_t slot : completed_slots) {
+      connection->free_send_slots.push_back(slot);
+    }
+  }
+  connection->send_cv.notify_all();
 }
 
 int RDMAServer::NextPollerCpu() {

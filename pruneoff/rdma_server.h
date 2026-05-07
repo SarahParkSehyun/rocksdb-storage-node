@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -51,7 +52,8 @@ class RDMAServer {
 
     rdma_cm_id* id = nullptr;
     ibv_pd* pd = nullptr;
-    ibv_cq* cq = nullptr;
+    ibv_cq* send_cq = nullptr;
+    ibv_cq* recv_cq = nullptr;
     ibv_qp* qp = nullptr;
     ibv_mr* recv_mr = nullptr;
     ibv_mr* send_mr = nullptr;
@@ -62,6 +64,9 @@ class RDMAServer {
     std::mutex send_mutex;
     std::condition_variable send_cv;
     std::vector<size_t> free_send_slots;
+    std::mutex send_post_mutex;
+    std::deque<size_t> pending_send_slots;
+    size_t sends_since_signal = 0;
     std::unique_ptr<ThreadPool> workers;
     std::thread poller;
     std::atomic<bool> running{false};
@@ -92,6 +97,8 @@ class RDMAServer {
                        size_t* slot);
   void ReleaseSendSlot(const std::shared_ptr<Connection>& connection,
                        size_t slot);
+  void ReleaseCompletedSendSlots(const std::shared_ptr<Connection>& connection,
+                                 size_t signaled_slot);
   int NextPollerCpu();
 
   static uintptr_t RecvWrId(size_t slot);

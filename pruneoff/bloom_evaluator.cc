@@ -92,7 +92,7 @@ bool BloomEvaluator::KeyMayMatch(uint64_t file_number,
 
   ROCKSDB_NAMESPACE::ReadOptions read_options;
   read_options.read_tier = ROCKSDB_NAMESPACE::kReadAllTier;
-  read_options.fill_cache = false;
+  read_options.fill_cache = true;
 
   const size_t timestamp_size = user_comparator->timestamp_size();
   ROCKSDB_NAMESPACE::Slice user_key_without_ts =
