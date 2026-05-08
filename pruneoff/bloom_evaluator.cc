@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <utility>
 
@@ -13,14 +14,18 @@
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/table.h"
 #include "table/block_based/block_based_table_reader.h"
+#include "table/block_based/full_filter_block.h"
+#include "table/block_based/partitioned_filter_block.h"
 #include "table/get_context.h"
+#include "table/format.h"
 #include "table/table_builder.h"
+#include "util/coding.h"
 
 namespace pruneoff {
 
 namespace {
 
-constexpr size_t kBlockCacheSize = 1;
+constexpr size_t kBlockCacheSize = size_t{10000000000};
 constexpr int kCacheNumShardBits = -1;
 constexpr int kBloomBitsPerKey = 10;
 constexpr size_t kBlockSize = 4096;
@@ -54,7 +59,7 @@ BloomEvaluator::BloomEvaluator(std::string db_path, size_t cache_capacity)
       ROCKSDB_NAMESPACE::BlockBasedTableOptions::kTwoLevelIndexSearch;
   table_options.partition_filters = true;
   table_options.cache_index_and_filter_blocks = true;
-  table_options.pin_top_level_index_and_filter = false;
+  table_options.pin_top_level_index_and_filter = true;
   table_options.block_size = kBlockSize;
   table_options.block_cache =
       ROCKSDB_NAMESPACE::HyperClockCacheOptions(kBlockCacheSize, 0,
@@ -68,6 +73,24 @@ BloomEvaluator::BloomEvaluator(std::string db_path, size_t cache_capacity)
 
 bool BloomEvaluator::KeyMayMatch(uint64_t file_number,
                                  const ROCKSDB_NAMESPACE::Slice& key) {
+  uint32_t filter_block_size = 0;
+  bool filter_block_found = false;
+  return KeyMayMatchAndReadFilterBlock(file_number, key, nullptr, 0,
+                                       &filter_block_size,
+                                       &filter_block_found);
+}
+
+bool BloomEvaluator::KeyMayMatchAndReadFilterBlock(
+    uint64_t file_number, const ROCKSDB_NAMESPACE::Slice& key,
+    uint8_t* filter_block_dst, uint32_t filter_block_capacity,
+    uint32_t* filter_block_size, bool* filter_block_found) {
+  if (filter_block_size != nullptr) {
+    *filter_block_size = 0;
+  }
+  if (filter_block_found != nullptr) {
+    *filter_block_found = false;
+  }
+
   std::shared_ptr<CacheEntry> entry = GetOrOpen(file_number);
   if (!entry || !entry->reader) {
     return true;
@@ -116,9 +139,73 @@ bool BloomEvaluator::KeyMayMatch(uint64_t file_number,
   ROCKSDB_NAMESPACE::Slice internal_key_slice = internal_key.Encode();
   const ROCKSDB_NAMESPACE::Slice* internal_key_ptr = &internal_key_slice;
 
-  return rep->filter->KeyMayMatch(user_key_without_ts, internal_key_ptr,
-                                  &get_context, &lookup_context,
-                                  read_options);
+  const bool should_read_filter_block =
+      filter_block_dst != nullptr && filter_block_capacity > 0 &&
+      filter_block_size != nullptr && filter_block_found != nullptr;
+
+  if (!should_read_filter_block) {
+    return rep->filter->KeyMayMatch(user_key_without_ts, internal_key_ptr,
+                                    &get_context, &lookup_context,
+                                    read_options);
+  }
+
+  if (rep->filter_type != ROCKSDB_NAMESPACE::BlockBasedTable::Rep::FilterType::
+                              kPartitionedFilter) {
+    return true;
+  }
+
+  ROCKSDB_NAMESPACE::BlockHandle filter_partition_handle =
+      ROCKSDB_NAMESPACE::BlockHandle::NullBlockHandle();
+  ROCKSDB_NAMESPACE::CachableEntry<ROCKSDB_NAMESPACE::ParsedFullFilterBlock>
+      filter_partition_block;
+  auto* partitioned_filter =
+      static_cast<ROCKSDB_NAMESPACE::PartitionedFilterBlockReader*>(
+          rep->filter.get());
+  ROCKSDB_NAMESPACE::Status filter_status =
+      partitioned_filter->GetFilterPartitionBlockForKey(
+          internal_key_slice, &get_context, &lookup_context, read_options,
+          &filter_partition_handle, &filter_partition_block);
+  if (!filter_status.ok() || filter_partition_handle.IsNull() ||
+      filter_partition_handle.size() == 0 ||
+      filter_partition_block.GetValue() == nullptr) {
+    return true;
+  }
+
+  const ROCKSDB_NAMESPACE::Slice& filter_contents =
+      filter_partition_block.GetValue()->ContentSlice();
+  const size_t trailer_size = rep->footer.GetBlockTrailerSize();
+  if (trailer_size != 0 &&
+      trailer_size != ROCKSDB_NAMESPACE::BlockBasedTable::kBlockTrailerSize) {
+    return true;
+  }
+  const uint64_t bytes_to_send = filter_contents.size() + trailer_size;
+  if (filter_contents.empty() || bytes_to_send > filter_block_capacity) {
+    return true;
+  }
+
+  std::memcpy(filter_block_dst, filter_contents.data(), filter_contents.size());
+  if (trailer_size > 0) {
+    char* trailer = reinterpret_cast<char*>(filter_block_dst) +
+                    filter_contents.size();
+    const char compression_type =
+        static_cast<char>(ROCKSDB_NAMESPACE::kNoCompression);
+    trailer[0] = compression_type;
+    uint32_t checksum = ROCKSDB_NAMESPACE::ComputeBuiltinChecksumWithLastByte(
+        rep->footer.checksum_type(), filter_contents.data(),
+        filter_contents.size(), compression_type);
+    checksum += ROCKSDB_NAMESPACE::ChecksumModifierForContext(
+        rep->footer.base_context_checksum(), filter_partition_handle.offset());
+    ROCKSDB_NAMESPACE::EncodeFixed32(trailer + 1, checksum);
+  }
+  *filter_block_size = static_cast<uint32_t>(bytes_to_send);
+  *filter_block_found = true;
+
+  ROCKSDB_NAMESPACE::FullFilterBlockReader filter_partition(
+      table, std::move(filter_partition_block));
+  const bool may_match = filter_partition.KeyMayMatch(
+      user_key_without_ts, internal_key_ptr, &get_context, &lookup_context,
+      read_options);
+  return may_match;
 }
 
 std::shared_ptr<BloomEvaluator::CacheEntry> BloomEvaluator::GetOrOpen(

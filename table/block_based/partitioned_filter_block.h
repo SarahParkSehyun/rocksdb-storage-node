@@ -178,6 +178,54 @@ class PartitionedFilterBlockReader
 
   size_t ApproximateMemoryUsage() const override;
 
+  Status GetFilterPartitionHandleForKey(
+      const Slice& internal_key, GetContext* get_context,
+      BlockCacheLookupContext* lookup_context, const ReadOptions& read_options,
+      BlockHandle* filter_handle) const {
+    assert(filter_handle != nullptr);
+    CachableEntry<Block_kFilterPartitionIndex> filter_block;
+    Status s = GetOrReadFilterBlock(get_context, lookup_context, &filter_block,
+                                    read_options);
+    if (!s.ok()) {
+      return s;
+    }
+    if (filter_block.GetValue() == nullptr ||
+        filter_block.GetValue()->size() == 0) {
+      *filter_handle = BlockHandle::NullBlockHandle();
+      return Status::OK();
+    }
+    *filter_handle = GetFilterPartitionHandle(filter_block, internal_key);
+    return Status::OK();
+  }
+
+  Status GetFilterPartitionBlockForKey(
+      const Slice& internal_key, GetContext* get_context,
+      BlockCacheLookupContext* lookup_context, const ReadOptions& read_options,
+      BlockHandle* filter_handle,
+      CachableEntry<ParsedFullFilterBlock>* filter_partition_block) const {
+    assert(filter_handle != nullptr);
+    assert(filter_partition_block != nullptr);
+    CachableEntry<Block_kFilterPartitionIndex> filter_block;
+    Status s = GetOrReadFilterBlock(get_context, lookup_context, &filter_block,
+                                    read_options);
+    if (!s.ok()) {
+      return s;
+    }
+    if (filter_block.GetValue() == nullptr ||
+        filter_block.GetValue()->size() == 0) {
+      *filter_handle = BlockHandle::NullBlockHandle();
+      return Status::OK();
+    }
+    *filter_handle = GetFilterPartitionHandle(filter_block, internal_key);
+    if (filter_handle->IsNull() || filter_handle->size() == 0) {
+      return Status::OK();
+    }
+    return GetFilterPartitionBlock(nullptr /* prefetch_buffer */,
+                                   *filter_handle, get_context,
+                                   lookup_context, read_options,
+                                   filter_partition_block);
+  }
+
  private:
   BlockHandle GetFilterPartitionHandle(
       const CachableEntry<Block_kFilterPartitionIndex>& filter_block,

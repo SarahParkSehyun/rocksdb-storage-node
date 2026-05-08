@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
 #include <iostream>
 
@@ -25,6 +26,13 @@ constexpr uintptr_t kSendWrMask = uintptr_t{1} << (sizeof(uintptr_t) * 8 - 1);
 
 void* SlotAddress(void* base, size_t slot, size_t slot_size) {
   return static_cast<char*>(base) + slot * slot_size;
+}
+
+size_t PruneOffResponseSerializedSize(uint32_t num_filter_blocks) {
+  const uint32_t clamped =
+      std::min(num_filter_blocks, kPruneOffMaxCandidates);
+  return offsetof(PruneOffResponse, filter_blocks) +
+         clamped * sizeof(FilterBlockEntry);
 }
 
 }  // namespace
@@ -320,9 +328,6 @@ bool RDMAServer::InitConnection(
     std::cerr << "posix_memalign for RDMA buffers failed\n";
     return false;
   }
-  std::memset(connection->recv_pool, 0, recv_bytes);
-  std::memset(connection->send_pool, 0, send_bytes);
-
   connection->recv_mr =
       ibv_reg_mr(connection->pd, connection->recv_pool, recv_bytes,
                  IBV_ACCESS_LOCAL_WRITE);
@@ -469,11 +474,16 @@ void RDMAServer::EvaluateAndSend(WorkItem item) {
   auto* response = static_cast<PruneOffResponse*>(
       SlotAddress(item.connection->send_pool, send_slot,
                   sizeof(PruneOffResponse)));
-  *response = PruneOffResponse{};
   response->request_id = request.request_id;
+  response->client_slot = request.client_slot;
+  response->num_positives = 0;
+  response->num_filter_blocks = 0;
+  response->reserved = 0;
 
   if (invalid_request || request.noop == 1) {
-    if (!PostSend(item.connection, send_slot)) {
+    if (!PostSend(item.connection, send_slot,
+                  PruneOffResponseSerializedSize(
+                      response->num_filter_blocks))) {
       ReleaseSendSlot(item.connection, send_slot);
     }
     return;
@@ -482,14 +492,32 @@ void RDMAServer::EvaluateAndSend(WorkItem item) {
   ROCKSDB_NAMESPACE::Slice key(request.key, request.key_len);
   for (uint32_t i = 0; i < request.num_candidates; ++i) {
     const uint64_t file_number = request.sst_file_numbers[i];
-    if (evaluator_.KeyMayMatch(file_number, key) &&
-        response->num_positives < kPruneOffMaxCandidates) {
+    bool may_match = true;
+    if (request.want_filter_blocks == 1 &&
+        response->num_filter_blocks < kPruneOffMaxCandidates) {
+      FilterBlockEntry& filter_block =
+          response->filter_blocks[response->num_filter_blocks];
+      filter_block.sst_file_number = file_number;
+      filter_block.filter_block_size = 0;
+      filter_block._pad = 0;
+      bool filter_block_found = false;
+      may_match = evaluator_.KeyMayMatchAndReadFilterBlock(
+          file_number, key, filter_block.data, kPruneOffMaxFilterBlockSize,
+          &filter_block.filter_block_size, &filter_block_found);
+      if (filter_block_found) {
+        ++response->num_filter_blocks;
+      }
+    } else {
+      may_match = evaluator_.KeyMayMatch(file_number, key);
+    }
+    if (may_match && response->num_positives < kPruneOffMaxCandidates) {
       response->positive_sst_file_numbers[response->num_positives++] =
           file_number;
     }
   }
 
-  if (!PostSend(item.connection, send_slot)) {
+  if (!PostSend(item.connection, send_slot,
+                PruneOffResponseSerializedSize(response->num_filter_blocks))) {
     ReleaseSendSlot(item.connection, send_slot);
   }
 }
@@ -534,11 +562,12 @@ bool RDMAServer::PostRecvBatch(const std::shared_ptr<Connection>& connection,
 }
 
 bool RDMAServer::PostSend(const std::shared_ptr<Connection>& connection,
-                          size_t slot) {
+                          size_t slot, size_t length) {
   ibv_sge sge{};
   sge.addr = reinterpret_cast<uint64_t>(
       SlotAddress(connection->send_pool, slot, sizeof(PruneOffResponse)));
-  sge.length = sizeof(PruneOffResponse);
+  sge.length =
+      static_cast<uint32_t>(std::min(length, sizeof(PruneOffResponse)));
   sge.lkey = connection->send_mr->lkey;
 
   ibv_send_wr wr{};

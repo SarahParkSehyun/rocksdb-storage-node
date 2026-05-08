@@ -25,6 +25,12 @@ class BloomEvaluator {
   // Returns true on Bloom positive. On open/evaluation errors it returns true
   // as the conservative PruneOff fallback: do not prune a candidate SST.
   bool KeyMayMatch(uint64_t file_number, const ROCKSDB_NAMESPACE::Slice& key);
+  bool KeyMayMatchAndReadFilterBlock(uint64_t file_number,
+                                     const ROCKSDB_NAMESPACE::Slice& key,
+                                     uint8_t* filter_block_dst,
+                                     uint32_t filter_block_capacity,
+                                     uint32_t* filter_block_size,
+                                     bool* filter_block_found);
 
  private:
   struct CacheEntry {
