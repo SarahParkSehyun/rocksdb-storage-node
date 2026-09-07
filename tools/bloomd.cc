@@ -2600,10 +2600,12 @@ class BloomCheckServiceImpl {
     bbto.index_type =
         ROCKSDB_NAMESPACE::BlockBasedTableOptions::kTwoLevelIndexSearch;
     bbto.partition_filters = true;
-    bbto.pin_top_level_index_and_filter = false;
+    bbto.pin_top_level_index_and_filter = true;
+    bbto.pin_l0_filter_and_index_blocks_in_cache = false;
     bbto.cache_index_and_filter_blocks = true;
     bbto.block_cache =
-        ROCKSDB_NAMESPACE::HyperClockCacheOptions(1, 0, -1).MakeSharedCache();
+        ROCKSDB_NAMESPACE::HyperClockCacheOptions(68719476736, 0, -1)
+            .MakeSharedCache();
     rocksdb_options_.table_factory.reset(
         ROCKSDB_NAMESPACE::NewBlockBasedTableFactory(bbto));
 
