@@ -2600,7 +2600,9 @@ class BloomCheckServiceImpl {
     bbto.index_type =
         ROCKSDB_NAMESPACE::BlockBasedTableOptions::kTwoLevelIndexSearch;
     bbto.partition_filters = true;
-    bbto.pin_top_level_index_and_filter = false;
+    // top-level filter index를 table reader에 pin: 1-byte cache에서는 RPC마다
+    // top-level(수십 KB)을 direct I/O로 다시 읽어서 md0가 포화됨
+    bbto.pin_top_level_index_and_filter = true;
     bbto.cache_index_and_filter_blocks = true;
     bbto.block_cache =
         ROCKSDB_NAMESPACE::HyperClockCacheOptions(1, 0, -1).MakeSharedCache();
