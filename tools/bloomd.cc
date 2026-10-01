@@ -3099,7 +3099,22 @@ void RunServer(const std::string& server_address, size_t cache_size) {
 
   // Per-CQ worker queue 생성 (각 CQ마다 별도의 worker queue)
   // Lock contention을 줄이기 위해 CQ별로 분리
-  const size_t NUM_WORKER_THREADS_PER_CQ = 8;  // CQ당 worker thread 개수
+  // CQ당 worker thread 개수 (기본 8). worker는 filter partition을 direct I/O로
+  // 읽는 동안 블록되므로 BLOOMD_WORKERS_PER_CQ로 코어 수보다 크게 줄 수 있음.
+  const size_t NUM_WORKER_THREADS_PER_CQ = []() -> size_t {
+    const char* env = std::getenv("BLOOMD_WORKERS_PER_CQ");
+    if (env != nullptr) {
+      long v = std::strtol(env, nullptr, 10);
+      if (v > 0) {
+        return static_cast<size_t>(v);
+      }
+    }
+    return 8;
+  }();
+  std::cerr << "[bloomd] NUM_CQS=" << NUM_CQS
+            << " workers_per_cq=" << NUM_WORKER_THREADS_PER_CQ
+            << " total_workers=" << NUM_CQS * NUM_WORKER_THREADS_PER_CQ
+            << std::endl;
   std::vector<std::unique_ptr<bloomcheck::PerCQWorkerQueue>> worker_queues;
   for (int i = 0; i < NUM_CQS; i++) {
     worker_queues.emplace_back(std::make_unique<bloomcheck::PerCQWorkerQueue>(
