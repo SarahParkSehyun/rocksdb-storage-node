@@ -48,6 +48,16 @@
 
 namespace bloomcheck {
 
+// BLOOMD_DIRECT_READS=0이면 SST를 buffered I/O로 읽음(OS page cache 사용).
+// 미설정 또는 그 외 값이면 기존처럼 direct I/O
+bool UseDirectReads() {
+  static const bool v = []() {
+    const char* env = std::getenv("BLOOMD_DIRECT_READS");
+    return !(env != nullptr && std::string(env) == "0");
+  }();
+  return v;
+}
+
 bool PinCurrentThreadToCpu(int cpu_id) {
   if (cpu_id < 0) {
     return false;
@@ -776,7 +786,7 @@ class TableReaderCache {
 
     // Open using BlockBasedTable directly
     ROCKSDB_NAMESPACE::EnvOptions env_options;
-    env_options.use_direct_reads = true;
+    env_options.use_direct_reads = UseDirectReads();
     ROCKSDB_NAMESPACE::ReadOptions read_options;
     read_options.read_tier =
         ROCKSDB_NAMESPACE::kReadAllTier;  // Allow file reads
@@ -2586,7 +2596,9 @@ class BloomCheckServiceImpl {
         }()) {
     // Configure RocksDB options for filter-only access
     rocksdb_options_.env = ROCKSDB_NAMESPACE::Env::Default();
-    rocksdb_options_.use_direct_reads = true;
+    rocksdb_options_.use_direct_reads = UseDirectReads();
+    std::cerr << "[bloomd] direct_reads=" << (UseDirectReads() ? 1 : 0)
+              << std::endl;
 
     // Disable RocksDB verbose logging (ERROR level only)
     rocksdb_options_.info_log_level =
@@ -2604,8 +2616,17 @@ class BloomCheckServiceImpl {
     // top-level(수십 KB)을 direct I/O로 다시 읽어서 md0가 포화됨
     bbto.pin_top_level_index_and_filter = true;
     bbto.cache_index_and_filter_blocks = true;
-    bbto.block_cache =
-        ROCKSDB_NAMESPACE::HyperClockCacheOptions(1, 0, -1).MakeSharedCache();
+    // BLOOMD_BLOCK_CACHE_MB 미설정 시 기존처럼 1 byte(사실상 캐시 없음).
+    // 설정하면 filter partition / top-level을 서버 메모리에 캐시함
+    size_t block_cache_bytes = 1;
+    if (const char* env = std::getenv("BLOOMD_BLOCK_CACHE_MB")) {
+      block_cache_bytes = static_cast<size_t>(std::stoull(env)) << 20;
+    }
+    std::cerr << "[bloomd] block_cache_bytes=" << block_cache_bytes
+              << std::endl;
+    bbto.block_cache = ROCKSDB_NAMESPACE::HyperClockCacheOptions(
+                           block_cache_bytes, 0, -1)
+                           .MakeSharedCache();
     rocksdb_options_.table_factory.reset(
         ROCKSDB_NAMESPACE::NewBlockBasedTableFactory(bbto));
 
@@ -3058,7 +3079,17 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   // ============================================
 
   // CompletionQueue 생성 (여러 CQ 사용 가능)
-  const int NUM_CQS = 4;  // CQ 개수 (필요에 따라 조정)
+  // CQ 개수 = poller 수 (CQ당 poller 1개). 기본 4, BLOOMD_NUM_CQS로 변경
+  const int NUM_CQS = []() -> int {
+    const char* env = std::getenv("BLOOMD_NUM_CQS");
+    if (env != nullptr) {
+      long v = std::strtol(env, nullptr, 10);
+      if (v > 0) {
+        return static_cast<int>(v);
+      }
+    }
+    return 4;
+  }();
   service.SetNumCqs(static_cast<size_t>(NUM_CQS));
   std::vector<std::unique_ptr<grpc::ServerCompletionQueue>> cqs;
   for (int i = 0; i < NUM_CQS; i++) {
@@ -3128,7 +3159,31 @@ void RunServer(const std::string& server_address, size_t cache_size) {
   // CQ 폴러 스레드 생성 (각 CQ당 1개 스레드)
   // CQ poller threads: 빠른 이벤트 처리만 수행 (bloom filter 체크 안 함)
   const size_t NUM_POLLERS_PER_CQ = 1;
-  const int POLLER_PIN_START_CPU = 16;  // Pin order: 16 -> 17 -> 18 -> 19
+  // poller i는 poller_cpus[i]에 고정. 기본은 NUMA node1(16~31)에서 앞에서부터
+  // CQ 수만큼 (CQ 4개면 16,17,18,19). BLOOMD_POLLER_CPUS="0,1,2,3" 처럼
+  // 쉼표로 CPU 목록을 줄 수 있음
+  std::vector<int> poller_cpus;
+  for (int k = 0; k < NUM_CQS; ++k) {
+    poller_cpus.push_back(16 + (k % 16));
+  }
+  if (const char* env = std::getenv("BLOOMD_POLLER_CPUS")) {
+    std::vector<int> parsed;
+    std::stringstream ss(env);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+      if (!tok.empty()) {
+        parsed.push_back(std::stoi(tok));
+      }
+    }
+    if (!parsed.empty()) {
+      poller_cpus = std::move(parsed);
+    }
+  }
+  std::cerr << "[bloomd] poller_cpus=";
+  for (size_t k = 0; k < poller_cpus.size(); ++k) {
+    std::cerr << (k ? "," : "") << poller_cpus[k];
+  }
+  std::cerr << std::endl;
   std::atomic<int> poller_pin_index{0};
   std::vector<std::thread> cq_threads;
   for (int i = 0; i < NUM_CQS; i++) {
@@ -3136,7 +3191,7 @@ void RunServer(const std::string& server_address, size_t cache_size) {
       cq_threads.emplace_back(std::thread([&, i]() {
         const int pin_idx =
             poller_pin_index.fetch_add(1, std::memory_order_relaxed);
-        const int cpu_id = POLLER_PIN_START_CPU + pin_idx;
+        const int cpu_id = poller_cpus[pin_idx % poller_cpus.size()];
         (void)bloomcheck::PinCurrentThreadToCpu(cpu_id);
         bloomcheck::HandleRpcs(service.service(), cqs[i].get(), &service,
                                worker_queues[i].get(), static_cast<size_t>(i));
